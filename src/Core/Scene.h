@@ -1,0 +1,136 @@
+#pragma once
+
+#include "Core/Math.h"
+
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace vor
+{
+struct Vertex
+{
+    Vec3 position{};
+    Vec3 normal{0.0f, 1.0f, 0.0f};
+    Vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f};
+    Vec2 uv{};
+};
+
+struct Meshlet
+{
+    std::uint32_t vertexOffset{};
+    std::uint32_t triangleOffset{};
+    std::uint32_t vertexCount{};
+    std::uint32_t triangleCount{};
+    Vec4 boundingSphere{};
+    Vec4 normalCone{};
+};
+
+struct MeshLod
+{
+    std::vector<std::uint32_t> indices;
+    std::vector<Meshlet> meshlets;
+    std::vector<std::uint32_t> meshletVertices;
+    std::vector<std::uint8_t> meshletTriangles;
+    float simplificationError{};
+};
+
+struct Mesh
+{
+    std::string name;
+    std::vector<Vertex> vertices;
+    std::vector<MeshLod> lods;
+    std::uint32_t materialIndex{};
+};
+
+enum class AlphaMode : std::uint32_t
+{
+    Opaque,
+    Mask,
+    Blend,
+};
+
+struct TextureReference
+{
+    std::filesystem::path path;
+    bool srgb{};
+};
+
+struct Material
+{
+    std::string name;
+    Vec4 baseColor{1.0f, 1.0f, 1.0f, 1.0f};
+    Vec3 emissive{};
+    float metallic{};
+    float roughness{1.0f};
+    float normalScale{1.0f};
+    float occlusionStrength{1.0f};
+    float alphaCutoff{0.5f};
+    AlphaMode alphaMode{AlphaMode::Opaque};
+    bool doubleSided{};
+    std::int32_t baseColorTexture{-1};
+    std::int32_t normalTexture{-1};
+    std::int32_t metallicRoughnessTexture{-1};
+    std::int32_t occlusionTexture{-1};
+    std::int32_t emissiveTexture{-1};
+};
+
+struct Instance
+{
+    std::string name;
+    std::uint32_t meshIndex{};
+    Mat4 transform{Mat4::identity()};
+    Mat4 previousTransform{Mat4::identity()};
+};
+
+enum class LightType : std::uint32_t
+{
+    Directional,
+    Point,
+    Spot,
+    Area,
+};
+
+struct Light
+{
+    std::string name;
+    LightType type{LightType::Directional};
+    Vec3 color{1.0f, 1.0f, 1.0f};
+    float intensity{3.0f};
+    Vec3 position{};
+    float range{100.0f};
+    Vec3 direction{-0.4f, -1.0f, -0.2f};
+    float innerCone{0.5f};
+    float outerCone{0.7f};
+};
+
+struct Camera
+{
+    Vec3 position{0.0f, 1.5f, 4.0f};
+    Vec3 target{0.0f, 0.5f, 0.0f};
+    Vec3 up{0.0f, 1.0f, 0.0f};
+    float verticalFovDegrees{60.0f};
+    float nearPlane{0.05f};
+    float farPlane{1000.0f};
+};
+
+struct Scene
+{
+    std::string name{"Untitled"};
+    std::filesystem::path sourcePath;
+    std::vector<Mesh> meshes;
+    std::vector<Material> materials;
+    std::vector<TextureReference> textures;
+    std::vector<Instance> instances;
+    std::vector<Light> lights;
+    Camera camera{};
+
+    [[nodiscard]] std::size_t triangleCount() const;
+    [[nodiscard]] std::size_t meshletCount() const;
+    [[nodiscard]] bool empty() const { return meshes.empty(); }
+};
+
+Scene makeDefaultScene();
+} // namespace vor
+

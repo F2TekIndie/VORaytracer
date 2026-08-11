@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><ProjectGuid>{66666666-6666-4666-8666-666666666666}</ProjectGuid><Keyword>MakeFileProj</Keyword><RootNamespace>VORaytracer</RootNamespace></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration"><ConfigurationType>Utility</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(SolutionDir)config\Common.props" />
+  <PropertyGroup><ShaderOutputDir>$(OutDir)Shaders\</ShaderOutputDir><SlangCompiler>G:\CodingLibraries\slang-14.1\bin\slangc.exe</SlangCompiler><SlangCommon>-target spirv -profile spirv_1_6 -emit-spirv-directly -fvk-use-entrypoint-name</SlangCommon></PropertyGroup>
+  <ItemGroup>
+    <CustomBuild Include="$(SolutionDir)shaders\Vulkan\MeshPipeline.slang">
+      <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
+"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry MeshMain -stage mesh -o "$(ShaderOutputDir)Mesh.spv"
+"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry FragmentMain -stage fragment -o "$(ShaderOutputDir)PbrFragment.spv"</Command>
+      <Outputs>$(ShaderOutputDir)Mesh.spv;$(ShaderOutputDir)PbrFragment.spv</Outputs>
+      <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
+    </CustomBuild>
+    <CustomBuild Include="$(SolutionDir)shaders\Vulkan\RayQueryLighting.slang">
+      <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
+"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry ComputeMain -stage compute -o "$(ShaderOutputDir)RayQueryLighting.spv"</Command>
+      <Outputs>$(ShaderOutputDir)RayQueryLighting.spv</Outputs>
+      <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
+    </CustomBuild>
+    <CustomBuild Include="$(SolutionDir)shaders\Vulkan\ToneMap.slang">
+      <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
+"$(SlangCompiler)" "%(FullPath)" $(SlangCommon) -entry ComputeMain -stage compute -o "$(ShaderOutputDir)ToneMap.spv"</Command>
+      <Outputs>$(ShaderOutputDir)ToneMap.spv</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="$(SolutionDir)shaders\Optix\PathTracer.slang">
+      <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
+set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH%"
+"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -I "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include" -target ptx -entry RayGen -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
+      <Outputs>$(ShaderOutputDir)PathTracer.ptx</Outputs>
+      <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="$(SolutionDir)shaders\Vulkan\MeshletTask.slang" />
+    <None Include="$(SolutionDir)shaders\Shared\Pbr.slang" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

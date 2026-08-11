@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><ProjectGuid>{88888888-8888-4888-8888-888888888888}</ProjectGuid><Keyword>Win32Proj</Keyword><RootNamespace>meshoptimizer</RootNamespace></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration"><ConfigurationType>StaticLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(SolutionDir)config\Common.props" />
+  <ItemGroup>
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\allocator.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\clusterizer.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\indexanalyzer.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\indexcodec.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\indexgenerator.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\meshletcodec.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\meshletutils.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\opacitymap.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\overdrawoptimizer.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\partition.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\quantization.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\rasterizer.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\remesher.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\simplifier.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\spatialorder.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\stripifier.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\tangentspace.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\vcacheoptimizer.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\vertexcodec.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\vertexfilter.cpp" />
+    <ClCompile Include="G:\CodingLibraries\meshoptimizer\src\vfetchoptimizer.cpp" />
+  </ItemGroup>
+  <ItemGroup><ClInclude Include="G:\CodingLibraries\meshoptimizer\src\meshoptimizer.h" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><ProjectGuid>{77777777-7777-4777-8777-777777777777}</ProjectGuid><Keyword>Win32Proj</Keyword><RootNamespace>GLFW</RootNamespace></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration"><ConfigurationType>StaticLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(SolutionDir)config\Common.props" />
+  <ItemDefinitionGroup><ClCompile><CompileAs>CompileAsC</CompileAs><DisableSpecificWarnings>4100;4244;%(DisableSpecificWarnings)</DisableSpecificWarnings><PreprocessorDefinitions>_GLFW_WIN32;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>G:\CodingLibraries\glfw-3.5.1\src;G:\CodingLibraries\glfw-3.5.1\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile></ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\context.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\init.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\input.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\monitor.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\platform.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\vulkan.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\window.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\egl_context.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\osmesa_context.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_init.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_monitor.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_window.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_joystick.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_time.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_thread.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_module.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_init.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_joystick.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_monitor.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_window.c" />
+    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\wgl_context.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

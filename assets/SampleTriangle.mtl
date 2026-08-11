@@ -1,0 +1,6 @@
+newmtl Copper
+Kd 0.72 0.20 0.05
+Ks 0.90 0.62 0.28
+Ns 96.0
+d 1.0
+illum 2

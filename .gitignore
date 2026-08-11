@@ -1,0 +1,10 @@
+/bin/
+/obj/
+/build/
+/assets/
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.opendb
+
