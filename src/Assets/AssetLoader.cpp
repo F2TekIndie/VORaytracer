@@ -187,6 +187,8 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
 
     if (scene.lights.empty())
         scene.lights.push_back(Light{.name = "Sun"});
+    if (options.addGroundPlane)
+        appendGroundPlane(scene, options.enableOptionalMeshoptimizerPasses);
 
     log(LogLevel::Info, "Loaded scene '" + scene.name + "' with " + std::to_string(scene.meshes.size()) + " meshes");
     return {.scene = std::move(scene)};
@@ -222,7 +224,94 @@ Scene AssetLoader::createProceduralCube(AssetLoadOptions options) const
     processMesh(mesh, options.enableOptionalMeshoptimizerPasses);
     scene.meshes.push_back(std::move(mesh));
     scene.instances.push_back({"Cube", 0, Mat4::identity(), Mat4::identity()});
+    if (options.addGroundPlane)
+        appendGroundPlane(scene, options.enableOptionalMeshoptimizerPasses);
     return scene;
+}
+
+void AssetLoader::appendGroundPlane(Scene& scene, bool enableOptionalPasses)
+{
+    Vec3 minimum{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                 std::numeric_limits<float>::max()};
+    Vec3 maximum{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
+                 std::numeric_limits<float>::lowest()};
+    bool hasPoint = false;
+    const auto includeMesh = [&](const Mesh& mesh, const Mat4& transform) {
+        if (mesh.isGroundPlane)
+            return;
+        for (const Vertex& vertex : mesh.vertices)
+        {
+            const Vec3& p = vertex.position;
+            const Vec3 world{
+                transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
+                transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
+                transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14],
+            };
+            minimum.x = std::min(minimum.x, world.x);
+            minimum.y = std::min(minimum.y, world.y);
+            minimum.z = std::min(minimum.z, world.z);
+            maximum.x = std::max(maximum.x, world.x);
+            maximum.y = std::max(maximum.y, world.y);
+            maximum.z = std::max(maximum.z, world.z);
+            hasPoint = true;
+        }
+    };
+
+    if (!scene.instances.empty())
+    {
+        for (const Instance& instance : scene.instances)
+        {
+            if (instance.meshIndex < scene.meshes.size())
+                includeMesh(scene.meshes[instance.meshIndex], instance.transform);
+        }
+    }
+    else
+    {
+        for (const Mesh& mesh : scene.meshes)
+            includeMesh(mesh, Mat4::identity());
+    }
+    if (!hasPoint)
+        return;
+
+    const Vec3 extent = maximum - minimum;
+    const Vec3 center = (minimum + maximum) * 0.5f;
+    const float halfExtent = std::max({extent.x, extent.z, extent.y * 0.75f, 1.0f}) * 0.75f;
+    const float verticalOffset = std::max(extent.y * 0.00001f, 0.0001f);
+    const float groundY = minimum.y - verticalOffset;
+
+    const Material defaultPlastic = makeDefaultPlasticMaterial();
+    const auto matchingMaterial = std::find_if(scene.materials.begin(), scene.materials.end(), [&](const Material& material) {
+        return material.name == defaultPlastic.name && material.baseColor.x == defaultPlastic.baseColor.x &&
+               material.baseColor.y == defaultPlastic.baseColor.y && material.baseColor.z == defaultPlastic.baseColor.z &&
+               material.metallic == defaultPlastic.metallic && material.roughness == defaultPlastic.roughness;
+    });
+    std::uint32_t materialIndex = 0;
+    if (matchingMaterial != scene.materials.end())
+        materialIndex = static_cast<std::uint32_t>(std::distance(scene.materials.begin(), matchingMaterial));
+    else
+    {
+        materialIndex = static_cast<std::uint32_t>(scene.materials.size());
+        scene.materials.push_back(defaultPlastic);
+    }
+
+    Mesh ground{};
+    ground.name = "Ground Plane";
+    ground.materialIndex = materialIndex;
+    ground.isGroundPlane = true;
+    ground.vertices = {
+        {{center.x - halfExtent, groundY, center.z - halfExtent}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f}},
+        {{center.x + halfExtent, groundY, center.z - halfExtent}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 0.0f}},
+        {{center.x + halfExtent, groundY, center.z + halfExtent}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+        {{center.x - halfExtent, groundY, center.z + halfExtent}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    };
+    MeshLod lod{};
+    lod.indices = {0, 2, 1, 0, 3, 2};
+    ground.lods.push_back(std::move(lod));
+    processMesh(ground, enableOptionalPasses);
+
+    const std::uint32_t groundMeshIndex = static_cast<std::uint32_t>(scene.meshes.size());
+    scene.meshes.push_back(std::move(ground));
+    scene.instances.push_back({"Ground Plane", groundMeshIndex, Mat4::identity(), Mat4::identity()});
 }
 
 void AssetLoader::processMesh(Mesh& mesh, bool enableOptionalPasses)

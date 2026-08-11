@@ -38,9 +38,11 @@ private:
     OptixRenderer optixRenderer_;
     RenderSettings settings_{};
     BackendKind previousBackend_{BackendKind::VulkanHybrid};
+    Vec3 lightTarget_{};
     std::array<char, 1024> assetPath_{};
     std::string statusMessage_{"Ready"};
     bool meshoptimizerEnabled_{true};
     bool defaultPlasticEnabled_{false};
+    bool groundPlaneEnabled_{true};
 };
 } // namespace vor

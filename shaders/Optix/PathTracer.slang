@@ -4,6 +4,7 @@ struct RadiancePayload
 {
     uint primitiveIndex;
     float2 barycentrics;
+    float hitDistance;
     uint hit;
 };
 
@@ -26,9 +27,13 @@ struct LaunchParameters
     uint maxBounces;
     uint samplesPerFrame;
     uint accumulatedSamples;
+    uint rayTracedShadows;
+    uint3 padding;
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
+    float4 lightPosition;
+    float4 lightColorAndIntensity;
 };
 
 float random01(uint value)
@@ -73,6 +78,7 @@ void RayGen(LaunchParameters parameters)
         RadiancePayload payload;
         payload.primitiveIndex = 0;
         payload.barycentrics = float2(0.0);
+        payload.hitDistance = 0.0;
         payload.hit = 0;
         TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
         if (payload.hit != 0)
@@ -88,8 +94,33 @@ void RayGen(LaunchParameters parameters)
 
             uint materialIndex = parameters.triangleMaterialIndices[payload.primitiveIndex];
             GpuMaterial material = parameters.materials[materialIndex];
-            float3 lightDirection = normalize(float3(-0.45, 0.85, 0.3));
-            float3 radiance = float3(5.0, 4.8, 4.4);
+            float3 worldPosition = ray.Origin + ray.Direction * payload.hitDistance;
+            float3 lightVector = parameters.lightPosition.xyz - worldPosition;
+            float lightDistance = max(length(lightVector), 0.0001);
+            float3 lightDirection = lightVector / lightDistance;
+            float visibility = 1.0;
+            if (parameters.rayTracedShadows != 0)
+            {
+                float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
+                float rayBias = max(0.0001, coordinateScale * 0.00001);
+                RayDesc shadowRay;
+                shadowRay.Origin = worldPosition + normal * rayBias;
+                shadowRay.Direction = lightDirection;
+                shadowRay.TMin = rayBias * 0.5;
+                shadowRay.TMax = max(lightDistance - rayBias, rayBias);
+
+                RadiancePayload shadowPayload;
+                shadowPayload.primitiveIndex = 0;
+                shadowPayload.barycentrics = float2(0.0);
+                shadowPayload.hitDistance = 0.0;
+                shadowPayload.hit = 1;
+                TraceRay(parameters.scene,
+                         RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+                             RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+                         0xff, 0, 1, 0, shadowRay, shadowPayload);
+                visibility = shadowPayload.hit == 0 ? 1.0 : 0.0;
+            }
+            float3 radiance = parameters.lightColorAndIntensity.xyz * parameters.lightColorAndIntensity.w * visibility;
             float3 direct = evaluateMetallicRoughness(material.baseColorAndMetallic.xyz,
                                                       material.baseColorAndMetallic.w,
                                                       material.emissiveAndRoughness.w,
@@ -128,5 +159,6 @@ void ClosestHit(inout RadiancePayload payload,
 {
     payload.primitiveIndex = PrimitiveIndex();
     payload.barycentrics = attributes.barycentrics;
+    payload.hitDistance = RayTCurrent();
     payload.hit = 1;
 }

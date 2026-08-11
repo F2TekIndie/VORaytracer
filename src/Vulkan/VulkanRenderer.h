@@ -60,8 +60,11 @@ private:
         Mat4 viewProjection{Mat4::identity()};
         Mat4 model{Mat4::identity()};
         Vec4 cameraPosition{};
+        Vec4 lightPosition{};
+        Vec4 lightColorAndIntensity{};
         std::uint32_t rayTracedShadows{};
-        std::uint32_t padding[3]{};
+        float exposure{};
+        std::uint32_t padding[2]{};
     };
 
     bool createInstance();
@@ -104,6 +107,11 @@ private:
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainImageViews_;
     std::vector<bool> swapchainImageInitialized_;
+    VkFormat depthFormat_{VK_FORMAT_UNDEFINED};
+    VkImage depthImage_{VK_NULL_HANDLE};
+    VkDeviceMemory depthImageMemory_{VK_NULL_HANDLE};
+    VkImageView depthImageView_{VK_NULL_HANDLE};
+    bool depthImageInitialized_{};
 
     VkCommandPool commandPool_{VK_NULL_HANDLE};
     std::array<FrameResources, kFramesInFlight> frames_{};

@@ -19,6 +19,7 @@ struct AssetLoadOptions
 {
     bool enableOptionalMeshoptimizerPasses{true};
     bool overrideWithDefaultPlastic{false};
+    bool addGroundPlane{false};
 };
 
 class AssetLoader
@@ -28,6 +29,7 @@ public:
     Scene createProceduralCube(AssetLoadOptions options = {}) const;
 
 private:
+    static void appendGroundPlane(Scene& scene, bool enableOptionalPasses);
     static void processMesh(Mesh& mesh, bool enableOptionalPasses);
 };
 } // namespace vor

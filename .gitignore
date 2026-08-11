@@ -2,6 +2,7 @@
 /obj/
 /build/
 /assets/
+/artifacts/
 /.vs/
 *.user
 *.suo

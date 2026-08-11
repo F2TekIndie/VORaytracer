@@ -30,7 +30,10 @@ struct FramePushConstants
     float4x4 viewProjection;
     float4x4 model;
     float4 cameraPosition;
+    float4 lightPosition;
+    float4 lightColorAndIntensity;
     uint rayTracedShadows;
+    float exposure;
 };
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
@@ -79,22 +82,22 @@ void MeshMain(
 {
     GpuMeshlet meshlet = sceneMeshlets[groupIndex.x];
     SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
-    if (threadIndex < meshlet.vertexCount)
+    for (uint outputVertex = threadIndex; outputVertex < meshlet.vertexCount; outputVertex += 32)
     {
-        uint vertexIndex = meshletVertexIndices[meshlet.vertexOffset + threadIndex];
+        uint vertexIndex = meshletVertexIndices[meshlet.vertexOffset + outputVertex];
         GpuVertex source = sceneVertices[vertexIndex];
         float4 worldPosition = mul(frame.model, float4(source.position.xyz, 1.0));
-        vertices[threadIndex].position = mul(frame.viewProjection, worldPosition);
-        vertices[threadIndex].worldPosition = worldPosition.xyz;
-        vertices[threadIndex].worldNormal = normalize(mul((float3x3)frame.model, source.normal.xyz));
-        vertices[threadIndex].uv = source.uv.xy;
-        vertices[threadIndex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
-        vertices[threadIndex].roughness = meshlet.materialParameters.x;
+        vertices[outputVertex].position = mul(frame.viewProjection, worldPosition);
+        vertices[outputVertex].worldPosition = worldPosition.xyz;
+        vertices[outputVertex].worldNormal = normalize(mul((float3x3)frame.model, source.normal.xyz));
+        vertices[outputVertex].uv = source.uv.xy;
+        vertices[outputVertex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
+        vertices[outputVertex].roughness = meshlet.materialParameters.x;
     }
-    if (threadIndex < meshlet.triangleCount)
+    for (uint outputTriangle = threadIndex; outputTriangle < meshlet.triangleCount; outputTriangle += 32)
     {
-        uint packed = meshletTriangleIndices[meshlet.triangleOffset + threadIndex];
-        triangles[threadIndex] = uint3(packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff);
+        uint packed = meshletTriangleIndices[meshlet.triangleOffset + outputTriangle];
+        triangles[outputTriangle] = uint3(packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff);
     }
 }
 
@@ -104,16 +107,22 @@ FragmentOutput FragmentMain(MeshVertex input)
     FragmentOutput output;
     float3 normal = normalize(input.worldNormal);
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
-    float3 lightDirection = normalize(float3(-0.4, 0.8, 0.6));
+    if (dot(normal, viewDirection) < 0.0)
+        normal = -normal;
+    float3 lightVector = frame.lightPosition.xyz - input.worldPosition;
+    float lightDistance = max(length(lightVector), 0.0001);
+    float3 lightDirection = lightVector / lightDistance;
     float3 baseColor = input.baseColorAndMetallic.xyz;
     float visibility = 1.0;
     if (frame.rayTracedShadows != 0)
     {
+        float coordinateScale = max(max(abs(input.worldPosition.x), abs(input.worldPosition.y)), abs(input.worldPosition.z));
+        float rayBias = max(0.0001, coordinateScale * 0.00001);
         RayDesc shadowRay;
-        shadowRay.Origin = input.worldPosition + normal * 0.002;
+        shadowRay.Origin = input.worldPosition + normal * rayBias;
         shadowRay.Direction = lightDirection;
-        shadowRay.TMin = 0.001;
-        shadowRay.TMax = 10000.0;
+        shadowRay.TMin = rayBias * 0.5;
+        shadowRay.TMax = max(lightDistance - rayBias, rayBias);
         RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
         query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, shadowRay);
         query.Proceed();
@@ -121,8 +130,11 @@ FragmentOutput FragmentMain(MeshVertex input)
     }
     float3 color = evaluateMetallicRoughness(baseColor, input.baseColorAndMetallic.w, input.roughness,
                                              normal, viewDirection, lightDirection,
-                                             float3(4.5) * visibility);
+                                             frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility);
     color += baseColor * 0.025;
+    color *= exp2(frame.exposure);
+    color = max(color, 0.0);
+    color = color / (1.0 + color);
     output.color = float4(color, 1.0);
     return output;
 }

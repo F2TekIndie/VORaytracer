@@ -101,8 +101,10 @@ bool Application::initialize()
     const AssetLoadOptions loadOptions{
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
         .overrideWithDefaultPlastic = defaultPlasticEnabled_,
+        .addGroundPlane = groundPlaneEnabled_,
     };
     scene_ = assetLoader_.createProceduralCube(loadOptions);
+    frameCameraToScene();
     if (const char* startupScene = std::getenv("VOR_SCENE"); startupScene && *startupScene)
     {
         AssetLoadResult result = assetLoader_.load(std::filesystem::path(startupScene), loadOptions);
@@ -155,7 +157,8 @@ void Application::drawMainMenu()
         {
             scene_ = assetLoader_.createProceduralCube(
                 {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
-                 .overrideWithDefaultPlastic = defaultPlasticEnabled_});
+                 .overrideWithDefaultPlastic = defaultPlasticEnabled_,
+                 .addGroundPlane = groundPlaneEnabled_});
             frameCameraToScene();
             vulkanRenderer_.setScene(&scene_);
             optixRenderer_.setScene(&scene_);
@@ -217,6 +220,23 @@ void Application::drawScenePanel()
                           "Albedo: 0.75 | Metallic: 0.0 | Roughness: 0.5\n"
                           "Changing it reloads the current model.");
     }
+    const bool previousGroundPlaneState = groundPlaneEnabled_;
+    const ImVec4 groundToggleColor = groundPlaneEnabled_ ? ImVec4(0.16f, 0.52f, 0.24f, 1.0f)
+                                                          : ImVec4(0.42f, 0.18f, 0.18f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, groundToggleColor);
+    if (ImGui::Button(groundPlaneEnabled_ ? "Ground plane: ON" : "Ground plane: OFF", ImVec2(210.0f, 0.0f)))
+    {
+        groundPlaneEnabled_ = !groundPlaneEnabled_;
+        if (!reloadCurrentScene())
+            groundPlaneEnabled_ = previousGroundPlaneState;
+    }
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Adds a model-sized ground plane below the scene.\n"
+                          "Material: Default Plastic (Albedo 0.75, Metallic 0.0, Roughness 0.5).\n"
+                          "Changing it reloads the current model.");
+    }
     if (ImGui::TreeNode("Instances"))
     {
         for (const Instance& instance : scene_.instances)
@@ -252,6 +272,25 @@ void Application::drawRenderPanel()
     ImGui::Checkbox("Denoiser", &settings_.denoiser);
     ImGui::Checkbox("Meshlet debug colors", &settings_.showMeshlets);
 
+    ImGui::SeparatorText("Key light");
+    if (!scene_.lights.empty())
+    {
+        Light& light = scene_.lights.front();
+        bool lightChanged = ImGui::DragFloat3("Light position", &light.position.x, 0.02f);
+        lightChanged |= ImGui::DragFloat3("Light target", &lightTarget_.x, 0.02f);
+        lightChanged |= ImGui::ColorEdit3("Light color", &light.color.x);
+        lightChanged |= ImGui::DragFloat("Light intensity", &light.intensity, 0.05f, 0.0f, 100.0f, "%.2f");
+        if (lightChanged)
+        {
+            light.intensity = std::max(light.intensity, 0.0f);
+            const Vec3 direction = lightTarget_ - light.position;
+            if (length(direction) > 1e-6f)
+                light.direction = normalize(direction);
+            resetCameraAccumulation();
+        }
+    }
+    ImGui::TextDisabled("Shift+LMB: orbit light | Shift+MMB: pan | Shift+wheel: zoom");
+
     ImGui::SeparatorText("Camera");
     bool cameraChanged = ImGui::DragFloat3("Position", &scene_.camera.position.x, 0.02f);
     cameraChanged |= ImGui::DragFloat3("Target", &scene_.camera.target.x, 0.02f);
@@ -261,7 +300,7 @@ void Application::drawRenderPanel()
         frameCameraToScene();
         cameraChanged = true;
     }
-    ImGui::TextDisabled("LMB drag: orbit | MMB drag: pan | wheel: zoom");
+    ImGui::TextDisabled("LMB drag: orbit camera | MMB drag: pan | wheel: zoom");
     if (cameraChanged)
         resetCameraAccumulation();
     ImGui::End();
@@ -294,7 +333,8 @@ void Application::loadSceneFromUi()
     }
     AssetLoadResult result = assetLoader_.load(
         path, {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
-               .overrideWithDefaultPlastic = defaultPlasticEnabled_});
+               .overrideWithDefaultPlastic = defaultPlasticEnabled_,
+               .addGroundPlane = groundPlaneEnabled_});
     if (!result)
     {
         statusMessage_ = "Import failed: " + result.error;
@@ -313,6 +353,7 @@ bool Application::reloadCurrentScene()
     const AssetLoadOptions options{
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
         .overrideWithDefaultPlastic = defaultPlasticEnabled_,
+        .addGroundPlane = groundPlaneEnabled_,
     };
     if (scene_.sourcePath.empty())
         reloadedScene = assetLoader_.createProceduralCube(options);
@@ -332,7 +373,8 @@ bool Application::reloadCurrentScene()
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     statusMessage_ = std::string("Reloaded: meshoptimizer ") + (meshoptimizerEnabled_ ? "ON" : "OFF") +
-                     ", default plastic " + (defaultPlasticEnabled_ ? "ON" : "OFF");
+                     ", default plastic " + (defaultPlasticEnabled_ ? "ON" : "OFF") +
+                     ", ground plane " + (groundPlaneEnabled_ ? "ON" : "OFF");
     return true;
 }
 
@@ -345,6 +387,8 @@ void Application::frameCameraToScene()
     bool hasPoint = false;
 
     const auto includeMesh = [&](const Mesh& mesh, const Mat4& transform) {
+        if (mesh.isGroundPlane)
+            return;
         for (const Vertex& vertex : mesh.vertices)
         {
             const Vec3& p = vertex.position;
@@ -401,6 +445,18 @@ void Application::frameCameraToScene()
     scene_.camera.position = center + viewDirection * distance;
     scene_.camera.nearPlane = std::max(radius * 0.001f, 0.0001f);
     scene_.camera.farPlane = std::max(distance + radius * 4.0f, radius * 20.0f);
+
+    if (scene_.lights.empty())
+        scene_.lights.push_back(Light{.name = "Key Light"});
+    Light& light = scene_.lights.front();
+    lightTarget_ = center;
+    Vec3 lightDirection = normalize(light.direction);
+    if (length(lightDirection) < 0.5f)
+        lightDirection = normalize(Vec3{0.45f, -0.85f, -0.3f});
+    const float lightDistance = radius * 2.5f;
+    light.position = lightTarget_ - lightDirection * lightDistance;
+    light.direction = normalize(lightTarget_ - light.position);
+    light.range = radius * 10.0f;
     resetCameraAccumulation();
 }
 
@@ -411,7 +467,11 @@ void Application::handleCameraNavigation()
         return;
 
     Camera& camera = scene_.camera;
-    Vec3 offset = camera.position - camera.target;
+    const bool moveLight = io.KeyShift && !scene_.lights.empty();
+    Light* light = moveLight ? &scene_.lights.front() : nullptr;
+    Vec3* position = moveLight ? &light->position : &camera.position;
+    Vec3* target = moveLight ? &lightTarget_ : &camera.target;
+    Vec3 offset = *position - *target;
     float distance = length(offset);
     if (distance <= 1e-6f)
     {
@@ -429,14 +489,14 @@ void Application::handleCameraNavigation()
         pitch = std::clamp(pitch + io.MouseDelta.y * 0.005f, -1.5533f, 1.5533f);
         const float horizontal = std::cos(pitch) * distance;
         offset = {std::sin(yaw) * horizontal, std::sin(pitch) * distance, std::cos(yaw) * horizontal};
-        camera.position = camera.target + offset;
+        *position = *target + offset;
         changed = true;
     }
 
     if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) &&
         (std::abs(io.MouseDelta.x) > 0.0f || std::abs(io.MouseDelta.y) > 0.0f))
     {
-        const Vec3 forward = normalize(camera.target - camera.position);
+        const Vec3 forward = normalize(*target - *position);
         const Vec3 right = normalize(cross(forward, camera.up));
         const Vec3 correctedUp = normalize(cross(right, forward));
         int width = 1;
@@ -447,8 +507,8 @@ void Application::handleCameraNavigation()
                                     static_cast<float>(std::max(height, 1));
         const Vec3 translation = right * (-io.MouseDelta.x * worldPerPixel) +
                                  correctedUp * (io.MouseDelta.y * worldPerPixel);
-        camera.position = camera.position + translation;
-        camera.target = camera.target + translation;
+        *position = *position + translation;
+        *target = *target + translation;
         changed = true;
     }
 
@@ -457,15 +517,22 @@ void Application::handleCameraNavigation()
         const float minimumDistance = std::max(camera.nearPlane * 2.0f, 0.0002f);
         const float maximumDistance = std::max(camera.farPlane * 0.9f, minimumDistance * 2.0f);
         distance = std::clamp(distance * std::exp(-io.MouseWheel * 0.16f), minimumDistance, maximumDistance);
-        Vec3 zoomDirection = normalize(camera.position - camera.target);
+        Vec3 zoomDirection = normalize(*position - *target);
         if (length(zoomDirection) < 0.5f)
             zoomDirection = normalize(offset);
-        camera.position = camera.target + zoomDirection * distance;
+        *position = *target + zoomDirection * distance;
         changed = true;
     }
 
     if (changed)
+    {
+        if (light)
+        {
+            light->direction = normalize(lightTarget_ - light->position);
+            light->range = std::max(length(lightTarget_ - light->position) * 4.0f, 1.0f);
+        }
         resetCameraAccumulation();
+    }
 }
 
 void Application::resetCameraAccumulation()

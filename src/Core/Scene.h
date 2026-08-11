@@ -42,6 +42,7 @@ struct Mesh
     std::vector<Vertex> vertices;
     std::vector<MeshLod> lods;
     std::uint32_t materialIndex{};
+    bool isGroundPlane{};
 };
 
 enum class AlphaMode : std::uint32_t
@@ -95,12 +96,12 @@ enum class LightType : std::uint32_t
 struct Light
 {
     std::string name;
-    LightType type{LightType::Directional};
-    Vec3 color{1.0f, 1.0f, 1.0f};
-    float intensity{3.0f};
+    LightType type{LightType::Point};
+    Vec3 color{1.0f, 0.96f, 0.88f};
+    float intensity{5.0f};
     Vec3 position{};
     float range{100.0f};
-    Vec3 direction{-0.4f, -1.0f, -0.2f};
+    Vec3 direction{0.45f, -0.85f, -0.3f};
     float innerCone{0.5f};
     float outerCone{0.7f};
 };
@@ -133,4 +134,3 @@ struct Scene
 
 Scene makeDefaultScene();
 } // namespace vor
-

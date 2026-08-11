@@ -476,7 +476,7 @@ bool OptixRenderer::createPipeline()
         checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 1),
                    "optixPipelineSetStackSize");
 
-        checkCuda(cuMemAlloc(&raygenRecord_, 192), "cuMemAlloc(raygen SBT)");
+        checkCuda(cuMemAlloc(&raygenRecord_, 240), "cuMemAlloc(raygen SBT)");
         checkCuda(cuMemAlloc(&missRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(miss SBT)");
         checkCuda(cuMemAlloc(&hitRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(hit SBT)");
         return true;
@@ -538,9 +538,13 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         std::uint32_t maxBounces;
         std::uint32_t samplesPerFrame;
         std::uint32_t accumulatedSamples;
+        std::uint32_t rayTracedShadows;
+        std::uint32_t padding[3];
         Vec4 cameraPositionAndFov;
         Vec4 cameraTargetAndAspect;
         Vec4 cameraUp;
+        Vec4 lightPosition;
+        Vec4 lightColorAndIntensity;
     };
     struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) RaygenRecord
     {
@@ -551,8 +555,8 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
     {
         std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
     };
-    static_assert(sizeof(LaunchParameters) == 160);
-    static_assert(sizeof(RaygenRecord) == 192);
+    static_assert(sizeof(LaunchParameters) == 208);
+    static_assert(sizeof(RaygenRecord) == 240);
     static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 
     try
@@ -571,11 +575,15 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         record.parameters.maxBounces = settings.maxBounces;
         record.parameters.samplesPerFrame = settings.samplesPerFrame;
         record.parameters.accumulatedSamples = static_cast<std::uint32_t>(stats_.accumulatedSamples);
+        record.parameters.rayTracedShadows = settings.rayTracedShadows ? 1u : 0u;
         record.parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
                                                   camera.verticalFovDegrees * kPi / 180.0f};
         record.parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
                                                    static_cast<float>(width_) / static_cast<float>(std::max(height_, 1u))};
         record.parameters.cameraUp = {camera.up.x, camera.up.y, camera.up.z, 0.0f};
+        const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
+        record.parameters.lightPosition = {light.position.x, light.position.y, light.position.z, 1.0f};
+        record.parameters.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
 
         EmptyRecord missRecord{};
         EmptyRecord hitRecord{};

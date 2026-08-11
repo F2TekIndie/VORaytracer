@@ -107,6 +107,24 @@ int main()
             require(importedMesh.materialIndex == 0, "default plastic assigned to every mesh");
     }
 
+    AssetLoadResult importedWithGroundPlane = assetLoader.load(
+        projectRoot / "assets" / "SampleTriangle.obj",
+        {.enableOptionalMeshoptimizerPasses = true, .overrideWithDefaultPlastic = false, .addGroundPlane = true});
+    require(static_cast<bool>(importedWithGroundPlane), "Assimp import with ground plane");
+    if (importedWithGroundPlane)
+    {
+        require(importedWithGroundPlane.scene.meshes.size() == 2, "ground plane mesh added");
+        require(importedWithGroundPlane.scene.instances.size() == 2, "ground plane instance added");
+        require(importedWithGroundPlane.scene.triangleCount() == 3, "ground plane triangle count");
+        const Mesh& ground = importedWithGroundPlane.scene.meshes.back();
+        require(ground.isGroundPlane, "ground plane marker");
+        require(ground.lods.front().meshlets.size() == 1, "ground plane mandatory meshlet");
+        const Material& groundMaterial = importedWithGroundPlane.scene.materials[ground.materialIndex];
+        require(groundMaterial.name == "Default Plastic", "ground plane default plastic material");
+        require(groundMaterial.baseColor.x == 0.75f && groundMaterial.metallic == 0.0f && groundMaterial.roughness == 0.5f,
+                "ground plane PBR values");
+    }
+
     const std::filesystem::path fbxPath = projectRoot / "assets" / "SampleObject.fbx";
     if (std::filesystem::exists(fbxPath))
     {
