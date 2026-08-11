@@ -19,10 +19,21 @@ struct GpuMeshlet
     uint triangleOffset;
     uint vertexCount;
     uint triangleCount;
+    uint instanceIndex;
+    uint padding0;
+    uint padding1;
+    uint padding2;
     float4 boundingSphere;
     float4 normalCone;
     float4 baseColorAndMetallic;
     float4 materialParameters;
+};
+
+struct GpuInstance
+{
+    float4x4 transform;
+    float4x4 normalTransform;
+    float4 scaleAndFlags;
 };
 
 struct FramePushConstants
@@ -35,6 +46,7 @@ struct FramePushConstants
     uint rayTracedShadows;
     float exposure;
     uint meshletCount;
+    uint instanceCount;
 };
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
@@ -42,6 +54,7 @@ struct FramePushConstants
 [[vk::binding(2, 0)]] StructuredBuffer<uint> meshletVertexIndices;
 [[vk::binding(3, 0)]] StructuredBuffer<uint> meshletTriangleIndices;
 [[vk::binding(4, 0)]] RaytracingAccelerationStructure sceneTlas;
+[[vk::binding(5, 0)]] StructuredBuffer<GpuInstance> sceneInstances;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -70,27 +83,35 @@ void TaskMain(
     if (visible)
     {
         GpuMeshlet meshlet = sceneMeshlets[meshletIndex];
-        if (meshlet.boundingSphere.w > 0.0)
+        visible = meshlet.vertexCount <= 64 && meshlet.triangleCount <= 124 &&
+                  meshlet.instanceIndex < frame.instanceCount;
+        if (visible)
         {
-            float4 center = float4(meshlet.boundingSphere.xyz, 1.0);
-            float4 clipCenter = mul(frame.viewProjection, center);
-            float radius = meshlet.boundingSphere.w;
-            float radiusX = radius * length(float3(frame.viewProjection[0][0], frame.viewProjection[0][1], frame.viewProjection[0][2]));
-            float radiusY = radius * length(float3(frame.viewProjection[1][0], frame.viewProjection[1][1], frame.viewProjection[1][2]));
-            float radiusZ = radius * length(float3(frame.viewProjection[2][0], frame.viewProjection[2][1], frame.viewProjection[2][2]));
-            float radiusW = radius * length(float3(frame.viewProjection[3][0], frame.viewProjection[3][1], frame.viewProjection[3][2]));
-            visible = clipCenter.x + radiusX + radiusW >= -clipCenter.w &&
-                      clipCenter.x - radiusX - radiusW <= clipCenter.w &&
-                      clipCenter.y + radiusY + radiusW >= -clipCenter.w &&
-                      clipCenter.y - radiusY - radiusW <= clipCenter.w &&
-                      clipCenter.z + radiusZ >= 0.0 &&
-                      clipCenter.z - radiusZ - radiusW <= clipCenter.w;
-
-            float coneLength = length(meshlet.normalCone.xyz);
-            if (visible && coneLength > 0.5 && meshlet.normalCone.w <= 1.0)
+            GpuInstance instance = sceneInstances[meshlet.instanceIndex];
+            if (meshlet.boundingSphere.w > 0.0)
             {
-                float3 cameraToMeshlet = normalize(meshlet.boundingSphere.xyz - frame.cameraPosition.xyz);
-                visible = dot(normalize(meshlet.normalCone.xyz), cameraToMeshlet) < meshlet.normalCone.w;
+                float3 worldCenter = mul(instance.transform, float4(meshlet.boundingSphere.xyz, 1.0)).xyz;
+                float4 clipCenter = mul(frame.viewProjection, float4(worldCenter, 1.0));
+                float radius = meshlet.boundingSphere.w * instance.scaleAndFlags.x;
+                float radiusX = radius * length(float3(frame.viewProjection[0][0], frame.viewProjection[0][1], frame.viewProjection[0][2]));
+                float radiusY = radius * length(float3(frame.viewProjection[1][0], frame.viewProjection[1][1], frame.viewProjection[1][2]));
+                float radiusZ = radius * length(float3(frame.viewProjection[2][0], frame.viewProjection[2][1], frame.viewProjection[2][2]));
+                float radiusW = radius * length(float3(frame.viewProjection[3][0], frame.viewProjection[3][1], frame.viewProjection[3][2]));
+                visible = clipCenter.x + radiusX + radiusW >= -clipCenter.w &&
+                          clipCenter.x - radiusX - radiusW <= clipCenter.w &&
+                          clipCenter.y + radiusY + radiusW >= -clipCenter.w &&
+                          clipCenter.y - radiusY - radiusW <= clipCenter.w &&
+                          clipCenter.z + radiusZ >= 0.0 &&
+                          clipCenter.z - radiusZ - radiusW <= clipCenter.w;
+
+                float coneLength = length(meshlet.normalCone.xyz);
+                if (visible && coneLength > 0.5 && meshlet.normalCone.w <= 1.0 &&
+                    instance.scaleAndFlags.y >= instance.scaleAndFlags.x * 0.999)
+                {
+                    float3 cameraToMeshlet = normalize(worldCenter - frame.cameraPosition.xyz);
+                    float3 worldConeAxis = normalize(mul((float3x3)instance.normalTransform, meshlet.normalCone.xyz));
+                    visible = dot(worldConeAxis, cameraToMeshlet) < meshlet.normalCone.w;
+                }
             }
         }
     }
@@ -110,15 +131,16 @@ void MeshMain(
     out indices uint3 triangles[124])
 {
     GpuMeshlet meshlet = sceneMeshlets[taskPayload.meshletIndex];
+    GpuInstance instance = sceneInstances[meshlet.instanceIndex];
     SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
     for (uint outputVertex = threadIndex; outputVertex < meshlet.vertexCount; outputVertex += 32)
     {
         uint vertexIndex = meshletVertexIndices[meshlet.vertexOffset + outputVertex];
         GpuVertex source = sceneVertices[vertexIndex];
-        float4 worldPosition = mul(frame.model, float4(source.position.xyz, 1.0));
+        float4 worldPosition = mul(instance.transform, float4(source.position.xyz, 1.0));
         vertices[outputVertex].position = mul(frame.viewProjection, worldPosition);
         vertices[outputVertex].worldPosition = worldPosition.xyz;
-        vertices[outputVertex].worldNormal = normalize(mul((float3x3)frame.model, source.normal.xyz));
+        vertices[outputVertex].worldNormal = normalize(mul((float3x3)instance.normalTransform, source.normal.xyz));
         vertices[outputVertex].uv = source.uv.xy;
         vertices[outputVertex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
         vertices[outputVertex].roughness = meshlet.materialParameters.x;

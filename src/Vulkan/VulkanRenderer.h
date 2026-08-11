@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -49,7 +50,6 @@ private:
     {
         VkCommandBuffer commandBuffer{VK_NULL_HANDLE};
         VkSemaphore imageAvailable{VK_NULL_HANDLE};
-        VkSemaphore renderFinished{VK_NULL_HANDLE};
         VkFence inFlight{VK_NULL_HANDLE};
     };
 
@@ -58,6 +58,33 @@ private:
         VkBuffer buffer{VK_NULL_HANDLE};
         VkDeviceMemory memory{VK_NULL_HANDLE};
         VkDeviceSize size{};
+    };
+
+    struct BufferUpload
+    {
+        GpuBuffer* destination{};
+        const void* data{};
+        VkDeviceSize size{};
+    };
+
+    struct UploadedGeometry
+    {
+        std::uint32_t vertexOffset{};
+        std::uint32_t vertexCount{};
+        std::uint32_t indexOffset{};
+        std::uint32_t indexCount{};
+    };
+
+    struct UploadedInstance
+    {
+        std::uint32_t geometryIndex{};
+        Mat4 transform{Mat4::identity()};
+    };
+
+    struct BlasResource
+    {
+        GpuBuffer storage{};
+        VkAccelerationStructureKHR handle{VK_NULL_HANDLE};
     };
 
     struct FramePushConstants
@@ -70,7 +97,7 @@ private:
         std::uint32_t rayTracedShadows{};
         float exposure{};
         std::uint32_t meshletCount{};
-        std::uint32_t padding{};
+        std::uint32_t instanceCount{};
     };
 
     bool createInstance();
@@ -90,7 +117,8 @@ private:
     bool uploadSceneResources();
     bool buildAccelerationStructures();
     void destroyAccelerationStructures();
-    GpuBuffer createUploadBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage) const;
+    GpuBuffer createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
+    bool uploadDeviceLocalBuffers(std::span<const BufferUpload> uploads);
     std::uint32_t findMemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags properties) const;
     void recordCommands(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, const GpuBuffer* externalBuffer);
     GpuBuffer createExternalBuffer(VkDeviceSize byteSize, VkDeviceSize& allocationSize, HANDLE& memoryHandle) const;
@@ -113,6 +141,7 @@ private:
     VkExtent2D swapchainExtent_{};
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainImageViews_;
+    std::vector<VkSemaphore> renderFinishedSemaphores_;
     std::vector<bool> swapchainImageInitialized_;
     VkFormat depthFormat_{VK_FORMAT_UNDEFINED};
     VkImage depthImage_{VK_NULL_HANDLE};
@@ -135,10 +164,12 @@ private:
     GpuBuffer meshletVertexBuffer_{};
     GpuBuffer meshletTriangleBuffer_{};
     GpuBuffer geometryIndexBuffer_{};
-    GpuBuffer blasStorage_{};
+    GpuBuffer sceneInstanceBuffer_{};
     GpuBuffer tlasStorage_{};
-    GpuBuffer instanceBuffer_{};
-    VkAccelerationStructureKHR blas_{VK_NULL_HANDLE};
+    GpuBuffer accelerationInstanceBuffer_{};
+    std::vector<BlasResource> blases_;
+    std::vector<UploadedGeometry> uploadedGeometries_;
+    std::vector<UploadedInstance> uploadedInstances_;
     VkAccelerationStructureKHR tlas_{VK_NULL_HANDLE};
     PFN_vkCreateAccelerationStructureKHR createAccelerationStructure_{};
     PFN_vkDestroyAccelerationStructureKHR destroyAccelerationStructure_{};
