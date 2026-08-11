@@ -245,15 +245,9 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         const Mat4 projection = perspective(camera.verticalFovDegrees * kPi / 180.0f, aspect, camera.nearPlane, camera.farPlane);
         const Mat4 view = lookAt(camera.position, camera.target, camera.up);
         framePushConstants_.viewProjection = projection * view;
-        framePushConstants_.model = scene_ && !scene_->instances.empty() ? scene_->instances.front().transform : Mat4::identity();
+        framePushConstants_.model = Mat4::identity();
         framePushConstants_.cameraPosition = {camera.position.x, camera.position.y, camera.position.z, 1.0f};
         framePushConstants_.rayTracedShadows = settings.rayTracedShadows && tlas_ ? 1u : 0u;
-        Material material{};
-        if (scene_ && !scene_->meshes.empty() && scene_->meshes.front().materialIndex < scene_->materials.size())
-            material = scene_->materials[scene_->meshes.front().materialIndex];
-        framePushConstants_.baseColorAndMetallic = {material.baseColor.x, material.baseColor.y, material.baseColor.z,
-                                                    material.metallic};
-        framePushConstants_.materialParameters = {material.roughness, 0.0f, 0.0f, 0.0f};
 
         ImGui::Render();
         FrameResources& frame = frames_[frameSlot_];
@@ -859,6 +853,8 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(meshletTriangleBuffer_);
     destroyBuffer(geometryIndexBuffer_);
     uploadedMeshletCount_ = 0;
+    uploadedVertexCount_ = 0;
+    uploadedTriangleCount_ = 0;
     sceneDescriptorSet_ = VK_NULL_HANDLE;
     if (sceneDescriptorPool_)
         vkResetDescriptorPool(device_, sceneDescriptorPool_, 0);
@@ -870,7 +866,7 @@ bool VulkanRenderer::uploadSceneResources()
         return false;
     vkDeviceWaitIdle(device_);
     destroySceneResources();
-    if (!scene_ || scene_->meshes.empty() || scene_->meshes.front().lods.empty())
+    if (!scene_ || scene_->meshes.empty())
         return true;
 
     struct alignas(16) GpuVertex
@@ -888,52 +884,98 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t triangleCount;
         Vec4 boundingSphere;
         Vec4 normalCone;
+        Vec4 baseColorAndMetallic;
+        Vec4 materialParameters;
     };
 
-    const Mesh& mesh = scene_->meshes.front();
-    const MeshLod& lod = mesh.lods.front();
-    if (mesh.vertices.empty() || lod.meshlets.empty())
-        return true;
-
     std::vector<GpuVertex> vertices;
-    vertices.reserve(mesh.vertices.size());
-    for (const Vertex& vertex : mesh.vertices)
-    {
-        vertices.push_back({{vertex.position.x, vertex.position.y, vertex.position.z, 1.0f},
-                            {vertex.normal.x, vertex.normal.y, vertex.normal.z, 0.0f},
-                            vertex.tangent,
-                            {vertex.uv.x, vertex.uv.y, 0.0f, 0.0f}});
-    }
-
     std::vector<GpuMeshlet> meshlets;
+    std::vector<std::uint32_t> meshletVertices;
     std::vector<std::uint32_t> packedTriangles;
-    meshlets.reserve(lod.meshlets.size());
-    packedTriangles.reserve(lod.indices.size() / 3);
-    for (const Meshlet& meshlet : lod.meshlets)
-    {
-        const std::uint32_t triangleOffset = static_cast<std::uint32_t>(packedTriangles.size());
-        for (std::uint32_t triangle = 0; triangle < meshlet.triangleCount; ++triangle)
+    std::vector<std::uint32_t> geometryIndices;
+
+    const auto appendInstance = [&](const Mesh& mesh, const Mat4& transform) {
+        if (mesh.vertices.empty() || mesh.lods.empty() || mesh.lods.front().meshlets.empty())
+            return;
+        const MeshLod& lod = mesh.lods.front();
+        const std::uint32_t vertexBase = static_cast<std::uint32_t>(vertices.size());
+        for (const Vertex& vertex : mesh.vertices)
         {
-            const std::size_t byteOffset = static_cast<std::size_t>(meshlet.triangleOffset) + triangle * 3;
-            const std::uint32_t packed = static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset]) |
-                                         (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 1]) << 8) |
-                                         (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 2]) << 16);
-            packedTriangles.push_back(packed);
+            const Vec3& p = vertex.position;
+            const Vec3 worldPosition{
+                transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
+                transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
+                transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14],
+            };
+            const Vec3& n = vertex.normal;
+            const Vec3 worldNormal = normalize({transform.m[0] * n.x + transform.m[4] * n.y + transform.m[8] * n.z,
+                                                transform.m[1] * n.x + transform.m[5] * n.y + transform.m[9] * n.z,
+                                                transform.m[2] * n.x + transform.m[6] * n.y + transform.m[10] * n.z});
+            const Vec3 tangentSource{vertex.tangent.x, vertex.tangent.y, vertex.tangent.z};
+            const Vec3 worldTangent = normalize({transform.m[0] * tangentSource.x + transform.m[4] * tangentSource.y + transform.m[8] * tangentSource.z,
+                                                 transform.m[1] * tangentSource.x + transform.m[5] * tangentSource.y + transform.m[9] * tangentSource.z,
+                                                 transform.m[2] * tangentSource.x + transform.m[6] * tangentSource.y + transform.m[10] * tangentSource.z});
+            vertices.push_back({{worldPosition.x, worldPosition.y, worldPosition.z, 1.0f},
+                                {worldNormal.x, worldNormal.y, worldNormal.z, 0.0f},
+                                {worldTangent.x, worldTangent.y, worldTangent.z, vertex.tangent.w},
+                                {vertex.uv.x, vertex.uv.y, 0.0f, 0.0f}});
         }
-        meshlets.push_back({meshlet.vertexOffset, triangleOffset, meshlet.vertexCount, meshlet.triangleCount,
-                            meshlet.boundingSphere, meshlet.normalCone});
+
+        Material material{};
+        if (mesh.materialIndex < scene_->materials.size())
+            material = scene_->materials[mesh.materialIndex];
+        for (const Meshlet& meshlet : lod.meshlets)
+        {
+            const std::uint32_t meshletVertexOffset = static_cast<std::uint32_t>(meshletVertices.size());
+            for (std::uint32_t index = 0; index < meshlet.vertexCount; ++index)
+                meshletVertices.push_back(vertexBase + lod.meshletVertices[meshlet.vertexOffset + index]);
+            const std::uint32_t triangleOffset = static_cast<std::uint32_t>(packedTriangles.size());
+            for (std::uint32_t triangle = 0; triangle < meshlet.triangleCount; ++triangle)
+            {
+                const std::size_t byteOffset = static_cast<std::size_t>(meshlet.triangleOffset) + triangle * 3;
+                const std::uint32_t packed = static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset]) |
+                                             (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 1]) << 8) |
+                                             (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 2]) << 16);
+                packedTriangles.push_back(packed);
+            }
+            meshlets.push_back({meshletVertexOffset, triangleOffset, meshlet.vertexCount, meshlet.triangleCount,
+                                meshlet.boundingSphere, meshlet.normalCone,
+                                {material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
+                                {material.roughness, 0.0f, 0.0f, 0.0f}});
+        }
+        for (std::uint32_t index : lod.indices)
+            geometryIndices.push_back(vertexBase + index);
+    };
+
+    if (!scene_->instances.empty())
+    {
+        for (const Instance& instance : scene_->instances)
+        {
+            if (instance.meshIndex < scene_->meshes.size())
+                appendInstance(scene_->meshes[instance.meshIndex], instance.transform);
+        }
     }
+    else
+    {
+        const Mat4 identity = Mat4::identity();
+        for (const Mesh& mesh : scene_->meshes)
+            appendInstance(mesh, identity);
+    }
+    if (vertices.empty() || meshlets.empty() || geometryIndices.empty())
+        return true;
 
     vertexBuffer_ = createUploadBuffer(vertices.data(), vertices.size() * sizeof(GpuVertex),
                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     meshletBuffer_ = createUploadBuffer(meshlets.data(), meshlets.size() * sizeof(GpuMeshlet), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    meshletVertexBuffer_ = createUploadBuffer(lod.meshletVertices.data(), lod.meshletVertices.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    meshletVertexBuffer_ = createUploadBuffer(meshletVertices.data(), meshletVertices.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     meshletTriangleBuffer_ = createUploadBuffer(packedTriangles.data(), packedTriangles.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    geometryIndexBuffer_ = createUploadBuffer(lod.indices.data(), lod.indices.size() * sizeof(std::uint32_t),
+    geometryIndexBuffer_ = createUploadBuffer(geometryIndices.data(), geometryIndices.size() * sizeof(std::uint32_t),
                                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                                                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    uploadedVertexCount_ = static_cast<std::uint32_t>(vertices.size());
+    uploadedTriangleCount_ = static_cast<std::uint32_t>(geometryIndices.size() / 3);
     if (!buildAccelerationStructures())
         throw std::runtime_error("Failed to build Vulkan BLAS/TLAS");
 
@@ -971,6 +1013,9 @@ bool VulkanRenderer::uploadSceneResources()
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
+    log(LogLevel::Info, "Vulkan scene upload: " + std::to_string(uploadedVertexCount_) + " vertices, " +
+                            std::to_string(uploadedTriangleCount_) + " triangles, " +
+                            std::to_string(uploadedMeshletCount_) + " meshlets");
     return true;
 }
 
@@ -979,11 +1024,9 @@ bool VulkanRenderer::buildAccelerationStructures()
     try
     {
         destroyAccelerationStructures();
-        if (!scene_ || scene_->meshes.empty() || scene_->meshes.front().lods.empty())
+        if (uploadedVertexCount_ == 0 || uploadedTriangleCount_ == 0)
             return false;
-        const Mesh& mesh = scene_->meshes.front();
-        const MeshLod& lod = mesh.lods.front();
-        const std::uint32_t primitiveCount = static_cast<std::uint32_t>(lod.indices.size() / 3);
+        const std::uint32_t primitiveCount = uploadedTriangleCount_;
         if (primitiveCount == 0)
             return false;
 
@@ -1046,7 +1089,7 @@ bool VulkanRenderer::buildAccelerationStructures()
         triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
         triangles.vertexData.deviceAddress = deviceAddress(vertexBuffer_.buffer);
         triangles.vertexStride = sizeof(Vec4) * 4;
-        triangles.maxVertex = static_cast<std::uint32_t>(mesh.vertices.size() - 1);
+        triangles.maxVertex = uploadedVertexCount_ - 1;
         triangles.indexType = VK_INDEX_TYPE_UINT32;
         triangles.indexData.deviceAddress = deviceAddress(geometryIndexBuffer_.buffer);
         VkAccelerationStructureGeometryKHR blasGeometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
@@ -1085,7 +1128,7 @@ bool VulkanRenderer::buildAccelerationStructures()
             VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
         blasAddressInfo.accelerationStructure = blas_;
         VkAccelerationStructureInstanceKHR instance{};
-        Mat4 transform = scene_->instances.empty() ? Mat4::identity() : scene_->instances.front().transform;
+        Mat4 transform = Mat4::identity();
         instance.transform.matrix[0][0] = transform.m[0];
         instance.transform.matrix[0][1] = transform.m[4];
         instance.transform.matrix[0][2] = transform.m[8];

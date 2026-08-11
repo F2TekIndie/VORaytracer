@@ -62,8 +62,6 @@ private:
         Vec4 cameraPosition{};
         std::uint32_t rayTracedShadows{};
         std::uint32_t padding[3]{};
-        Vec4 baseColorAndMetallic{1.0f, 1.0f, 1.0f, 0.0f};
-        Vec4 materialParameters{1.0f, 0.0f, 0.0f, 0.0f};
     };
 
     bool createInstance();
@@ -133,6 +131,8 @@ private:
     PFN_vkCmdBuildAccelerationStructuresKHR cmdBuildAccelerationStructures_{};
     PFN_vkGetAccelerationStructureDeviceAddressKHR getAccelerationStructureDeviceAddress_{};
     std::uint32_t uploadedMeshletCount_{};
+    std::uint32_t uploadedVertexCount_{};
+    std::uint32_t uploadedTriangleCount_{};
     FramePushConstants framePushConstants_{};
     std::array<GpuBuffer, kFramesInFlight> externalImageBuffers_{};
     std::vector<std::uint32_t> externalImagePixels_;

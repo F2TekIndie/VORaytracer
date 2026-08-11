@@ -21,6 +21,8 @@ struct GpuMeshlet
     uint triangleCount;
     float4 boundingSphere;
     float4 normalCone;
+    float4 baseColorAndMetallic;
+    float4 materialParameters;
 };
 
 struct FramePushConstants
@@ -29,8 +31,6 @@ struct FramePushConstants
     float4x4 model;
     float4 cameraPosition;
     uint rayTracedShadows;
-    float4 baseColorAndMetallic;
-    float4 materialParameters;
 };
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
@@ -46,6 +46,8 @@ struct MeshVertex
     float3 worldNormal : NORMAL0;
     float3 worldPosition : POSITION0;
     float2 uv : TEXCOORD0;
+    nointerpolation float4 baseColorAndMetallic : TEXCOORD1;
+    nointerpolation float roughness : TEXCOORD2;
 };
 
 struct FragmentOutput
@@ -86,6 +88,8 @@ void MeshMain(
         vertices[threadIndex].worldPosition = worldPosition.xyz;
         vertices[threadIndex].worldNormal = normalize(mul((float3x3)frame.model, source.normal.xyz));
         vertices[threadIndex].uv = source.uv.xy;
+        vertices[threadIndex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
+        vertices[threadIndex].roughness = meshlet.materialParameters.x;
     }
     if (threadIndex < meshlet.triangleCount)
     {
@@ -101,7 +105,7 @@ FragmentOutput FragmentMain(MeshVertex input)
     float3 normal = normalize(input.worldNormal);
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
     float3 lightDirection = normalize(float3(-0.4, 0.8, 0.6));
-    float3 baseColor = frame.baseColorAndMetallic.xyz;
+    float3 baseColor = input.baseColorAndMetallic.xyz;
     float visibility = 1.0;
     if (frame.rayTracedShadows != 0)
     {
@@ -115,7 +119,7 @@ FragmentOutput FragmentMain(MeshVertex input)
         query.Proceed();
         visibility = query.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
     }
-    float3 color = evaluateMetallicRoughness(baseColor, frame.baseColorAndMetallic.w, frame.materialParameters.x,
+    float3 color = evaluateMetallicRoughness(baseColor, input.baseColorAndMetallic.w, input.roughness,
                                              normal, viewDirection, lightDirection,
                                              float3(4.5) * visibility);
     color += baseColor * 0.025;

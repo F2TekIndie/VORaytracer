@@ -223,35 +223,48 @@ bool OptixRenderer::buildSceneAcceleration()
     {
         checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
         destroySceneAcceleration();
-        if (!scene_ || scene_->meshes.empty() || scene_->meshes.front().lods.empty())
+        if (!scene_ || scene_->meshes.empty())
             throw std::runtime_error("Scene contains no geometry for OptiX");
 
-        const Mesh& mesh = scene_->meshes.front();
-        const MeshLod& lod = mesh.lods.front();
-        if (mesh.vertices.empty() || lod.indices.size() < 3)
-            throw std::runtime_error("First scene mesh contains no indexed triangles");
-
-        Mat4 transform = Mat4::identity();
-        const auto instance = std::ranges::find_if(scene_->instances, [](const Instance& value) { return value.meshIndex == 0; });
-        if (instance != scene_->instances.end())
-            transform = instance->transform;
-
         std::vector<Vec3> positions;
-        positions.reserve(mesh.vertices.size());
-        for (const Vertex& vertex : mesh.vertices)
+        std::vector<std::uint32_t> indices;
+        const auto appendInstance = [&](const Mesh& mesh, const Mat4& transform) {
+            if (mesh.vertices.empty() || mesh.lods.empty() || mesh.lods.front().indices.empty())
+                return;
+            const std::uint32_t vertexBase = static_cast<std::uint32_t>(positions.size());
+            for (const Vertex& vertex : mesh.vertices)
+            {
+                const Vec3& p = vertex.position;
+                positions.push_back({transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
+                                     transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
+                                     transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14]});
+            }
+            for (std::uint32_t index : mesh.lods.front().indices)
+                indices.push_back(vertexBase + index);
+        };
+        if (!scene_->instances.empty())
         {
-            const Vec3& p = vertex.position;
-            positions.push_back({transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
-                                 transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
-                                 transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14]});
+            for (const Instance& instance : scene_->instances)
+            {
+                if (instance.meshIndex < scene_->meshes.size())
+                    appendInstance(scene_->meshes[instance.meshIndex], instance.transform);
+            }
         }
+        else
+        {
+            const Mat4 identity = Mat4::identity();
+            for (const Mesh& mesh : scene_->meshes)
+                appendInstance(mesh, identity);
+        }
+        if (positions.empty() || indices.size() < 3)
+            throw std::runtime_error("Scene contains no indexed triangles for OptiX");
 
         const std::size_t vertexBytes = positions.size() * sizeof(Vec3);
-        const std::size_t indexBytes = lod.indices.size() * sizeof(std::uint32_t);
+        const std::size_t indexBytes = indices.size() * sizeof(std::uint32_t);
         checkCuda(cuMemAlloc(&vertexBuffer_, vertexBytes), "cuMemAlloc(OptiX vertices)");
         checkCuda(cuMemAlloc(&indexBuffer_, indexBytes), "cuMemAlloc(OptiX indices)");
         checkCuda(cuMemcpyHtoD(vertexBuffer_, positions.data(), vertexBytes), "cuMemcpyHtoD(OptiX vertices)");
-        checkCuda(cuMemcpyHtoD(indexBuffer_, lod.indices.data(), indexBytes), "cuMemcpyHtoD(OptiX indices)");
+        checkCuda(cuMemcpyHtoD(indexBuffer_, indices.data(), indexBytes), "cuMemcpyHtoD(OptiX indices)");
 
         const std::uint32_t geometryFlags = OPTIX_GEOMETRY_FLAG_NONE;
         CUdeviceptr vertexBuffers[] = {vertexBuffer_};
@@ -263,7 +276,7 @@ bool OptixRenderer::buildSceneAcceleration()
         buildInput.triangleArray.vertexBuffers = vertexBuffers;
         buildInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
         buildInput.triangleArray.indexStrideInBytes = 3 * sizeof(std::uint32_t);
-        buildInput.triangleArray.numIndexTriplets = static_cast<std::uint32_t>(lod.indices.size() / 3);
+        buildInput.triangleArray.numIndexTriplets = static_cast<std::uint32_t>(indices.size() / 3);
         buildInput.triangleArray.indexBuffer = indexBuffer_;
         buildInput.triangleArray.flags = &geometryFlags;
         buildInput.triangleArray.numSbtRecords = 1;
@@ -284,6 +297,8 @@ bool OptixRenderer::buildSceneAcceleration()
         cuMemFree(temporaryBuffer);
         checkOptix(buildResult, "optixAccelBuild");
         checkCuda(cuCtxSynchronize(), "cuCtxSynchronize(OptiX GAS)");
+        log(LogLevel::Info, "OptiX scene GAS: " + std::to_string(positions.size()) + " vertices, " +
+                                std::to_string(indices.size() / 3) + " triangles");
         return true;
     }
     catch (const std::exception& error)

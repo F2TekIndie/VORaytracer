@@ -75,6 +75,24 @@ int main()
         require(!imported.scene.materials.empty(), "imported material count");
     }
 
+    const std::filesystem::path fbxPath = projectRoot / "assets" / "SampleObject.fbx";
+    if (std::filesystem::exists(fbxPath))
+    {
+        AssetLoadResult importedFbx = assetLoader.load(fbxPath);
+        require(static_cast<bool>(importedFbx), "Assimp FBX sample import");
+        if (importedFbx)
+        {
+            require(!importedFbx.scene.meshes.empty(), "FBX mesh count");
+            require(!importedFbx.scene.instances.empty(), "FBX instance count");
+            require(importedFbx.scene.triangleCount() > 0, "FBX triangle count");
+            require(importedFbx.scene.meshletCount() > 0, "FBX meshlet count");
+            std::cout << "FBX diagnostic: " << importedFbx.scene.meshes.size() << " meshes, "
+                      << importedFbx.scene.instances.size() << " instances, "
+                      << importedFbx.scene.triangleCount() << " triangles, "
+                      << importedFbx.scene.meshletCount() << " meshlets\n";
+        }
+    }
+
     if (failures == 0)
         std::cout << "VORaytracer CPU and asset tests passed\n";
     return failures == 0 ? 0 : 1;

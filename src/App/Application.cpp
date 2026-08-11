@@ -99,6 +99,18 @@ bool Application::initialize()
     }
 
     scene_ = assetLoader_.createProceduralCube();
+    if (const char* startupScene = std::getenv("VOR_SCENE"); startupScene && *startupScene)
+    {
+        AssetLoadResult result = assetLoader_.load(std::filesystem::path(startupScene));
+        if (result)
+        {
+            scene_ = std::move(result.scene);
+            frameCameraToScene();
+            statusMessage_ = std::string("Loaded and framed ") + startupScene;
+        }
+        else
+            statusMessage_ = "Startup import failed: " + result.error;
+    }
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     return true;
