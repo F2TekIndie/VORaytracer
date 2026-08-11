@@ -42,6 +42,24 @@ struct RendererStats
     std::uint64_t tracedRays{};
 };
 
+struct GpuInteropSurface
+{
+    void* memoryHandle{};
+    void* cudaReadySemaphoreHandle{};
+    void* vulkanCompleteSemaphoreHandle{};
+    std::uint64_t allocationSize{};
+    std::uint64_t pixelByteSize{};
+    std::uint64_t generation{};
+    std::uint32_t width{};
+    std::uint32_t height{};
+    bool bgra{};
+
+    [[nodiscard]] explicit operator bool() const
+    {
+        return memoryHandle && cudaReadySemaphoreHandle && vulkanCompleteSemaphoreHandle && pixelByteSize > 0;
+    }
+};
+
 class IRenderBackend
 {
 public:
@@ -57,4 +75,3 @@ public:
     [[nodiscard]] virtual const RendererStats& stats() const = 0;
 };
 } // namespace vor
-

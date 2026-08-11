@@ -13,9 +13,10 @@
   <ItemGroup>
     <CustomBuild Include="$(SolutionDir)shaders\Vulkan\MeshPipeline.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
+"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry TaskMain -stage amplification -o "$(ShaderOutputDir)Task.spv"
 "$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry MeshMain -stage mesh -o "$(ShaderOutputDir)Mesh.spv"
 "$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry FragmentMain -stage fragment -o "$(ShaderOutputDir)PbrFragment.spv"</Command>
-      <Outputs>$(ShaderOutputDir)Mesh.spv;$(ShaderOutputDir)PbrFragment.spv</Outputs>
+      <Outputs>$(ShaderOutputDir)Task.spv;$(ShaderOutputDir)Mesh.spv;$(ShaderOutputDir)PbrFragment.spv</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
     </CustomBuild>
     <CustomBuild Include="$(SolutionDir)shaders\Vulkan\RayQueryLighting.slang">

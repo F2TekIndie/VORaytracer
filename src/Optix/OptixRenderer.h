@@ -6,9 +6,7 @@
 #include <optix.h>
 
 #include <cstdint>
-#include <span>
 #include <string>
-#include <vector>
 
 namespace vor
 {
@@ -30,7 +28,9 @@ public:
     [[nodiscard]] bool available() const override { return available_; }
     [[nodiscard]] const char* unavailableReason() const override { return unavailableReason_.c_str(); }
     [[nodiscard]] const RendererStats& stats() const override { return stats_; }
-    [[nodiscard]] std::span<const std::uint32_t> displayPixels() const { return displayPixels_; }
+    bool setGpuInteropSurface(const GpuInteropSurface& surface);
+    void clearGpuInteropSurface();
+    [[nodiscard]] bool hasGpuInteropSurface() const { return interopOutputBuffer_ != 0; }
     [[nodiscard]] std::uint32_t outputWidth() const { return width_; }
     [[nodiscard]] std::uint32_t outputHeight() const { return height_; }
 
@@ -47,6 +47,8 @@ private:
     const Scene* scene_{};
     CUdevice cudaDevice_{};
     CUcontext cudaContext_{};
+    CUstream cudaStream_{};
+    CUevent launchParameterCopyComplete_{};
     OptixDeviceContext optixContext_{};
     OptixModule module_{};
     OptixProgramGroup raygenProgramGroup_{};
@@ -54,6 +56,10 @@ private:
     OptixProgramGroup hitProgramGroup_{};
     OptixPipeline pipeline_{};
     CUdeviceptr outputBuffer_{};
+    CUdeviceptr interopOutputBuffer_{};
+    CUexternalMemory externalMemory_{};
+    CUexternalSemaphore cudaReadySemaphore_{};
+    CUexternalSemaphore vulkanCompleteSemaphore_{};
     CUdeviceptr raygenRecord_{};
     CUdeviceptr missRecord_{};
     CUdeviceptr hitRecord_{};
@@ -67,8 +73,11 @@ private:
     std::size_t materialCount_{};
     CUdeviceptr gasBuffer_{};
     OptixTraversableHandle gasHandle_{};
-    std::vector<float> hostOutput_;
-    std::vector<std::uint32_t> displayPixels_;
+    void* launchParametersHost_{};
+    std::uint64_t interopGeneration_{};
+    bool firstInteropLaunch_{true};
+    bool launchParameterCopyPending_{};
+    bool interopBgra_{true};
     std::uint32_t width_{1};
     std::uint32_t height_{1};
     bool available_{};

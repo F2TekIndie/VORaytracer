@@ -34,6 +34,7 @@ struct FramePushConstants
     float4 lightColorAndIntensity;
     uint rayTracedShadows;
     float exposure;
+    uint meshletCount;
 };
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
@@ -61,14 +62,41 @@ struct FragmentOutput
 [shader("amplification")]
 [numthreads(1, 1, 1)]
 void TaskMain(
-    uint threadIndex : SV_GroupThreadID,
-    out payload TaskPayload taskPayload)
+    uint3 groupIndex : SV_GroupID)
 {
-    if (threadIndex == 0)
+    TaskPayload taskPayload;
+    uint meshletIndex = groupIndex.x;
+    bool visible = meshletIndex < frame.meshletCount;
+    if (visible)
     {
-        taskPayload.meshletIndex = 0;
-        DispatchMesh(1, 1, 1, taskPayload);
+        GpuMeshlet meshlet = sceneMeshlets[meshletIndex];
+        if (meshlet.boundingSphere.w > 0.0)
+        {
+            float4 center = float4(meshlet.boundingSphere.xyz, 1.0);
+            float4 clipCenter = mul(frame.viewProjection, center);
+            float radius = meshlet.boundingSphere.w;
+            float radiusX = radius * length(float3(frame.viewProjection[0][0], frame.viewProjection[0][1], frame.viewProjection[0][2]));
+            float radiusY = radius * length(float3(frame.viewProjection[1][0], frame.viewProjection[1][1], frame.viewProjection[1][2]));
+            float radiusZ = radius * length(float3(frame.viewProjection[2][0], frame.viewProjection[2][1], frame.viewProjection[2][2]));
+            float radiusW = radius * length(float3(frame.viewProjection[3][0], frame.viewProjection[3][1], frame.viewProjection[3][2]));
+            visible = clipCenter.x + radiusX + radiusW >= -clipCenter.w &&
+                      clipCenter.x - radiusX - radiusW <= clipCenter.w &&
+                      clipCenter.y + radiusY + radiusW >= -clipCenter.w &&
+                      clipCenter.y - radiusY - radiusW <= clipCenter.w &&
+                      clipCenter.z + radiusZ >= 0.0 &&
+                      clipCenter.z - radiusZ - radiusW <= clipCenter.w;
+
+            float coneLength = length(meshlet.normalCone.xyz);
+            if (visible && coneLength > 0.5 && meshlet.normalCone.w <= 1.0)
+            {
+                float3 cameraToMeshlet = normalize(meshlet.boundingSphere.xyz - frame.cameraPosition.xyz);
+                visible = dot(normalize(meshlet.normalCone.xyz), cameraToMeshlet) < meshlet.normalCone.w;
+            }
+        }
     }
+
+    taskPayload.meshletIndex = meshletIndex;
+    DispatchMesh(visible ? 1 : 0, 1, 1, taskPayload);
 }
 
 [shader("mesh")]
@@ -77,10 +105,11 @@ void TaskMain(
 void MeshMain(
     uint3 groupIndex : SV_GroupID,
     uint threadIndex : SV_GroupThreadID,
+    in payload TaskPayload taskPayload,
     out vertices MeshVertex vertices[64],
     out indices uint3 triangles[124])
 {
-    GpuMeshlet meshlet = sceneMeshlets[groupIndex.x];
+    GpuMeshlet meshlet = sceneMeshlets[taskPayload.meshletIndex];
     SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
     for (uint outputVertex = threadIndex; outputVertex < meshlet.vertexCount; outputVertex += 32)
     {

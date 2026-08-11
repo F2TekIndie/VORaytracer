@@ -75,6 +75,53 @@ Vec3 transformNormal(const Mat4& transform, Vec3 normal)
                       (c10 * normal.x + c11 * normal.y + c12 * normal.z) / determinant,
                       (c20 * normal.x + c21 * normal.y + c22 * normal.z) / determinant});
 }
+
+struct SlangStructuredBuffer
+{
+    CUdeviceptr data;
+    std::size_t count;
+};
+
+struct LaunchParameters
+{
+    SlangStructuredBuffer output;
+    SlangStructuredBuffer displayOutput;
+    SlangStructuredBuffer normals;
+    SlangStructuredBuffer indices;
+    SlangStructuredBuffer triangleMaterialIndices;
+    SlangStructuredBuffer materials;
+    OptixTraversableHandle scene;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t frameIndex;
+    std::uint32_t maxBounces;
+    std::uint32_t samplesPerFrame;
+    std::uint32_t accumulatedSamples;
+    std::uint32_t rayTracedShadows;
+    std::uint32_t displayBgra;
+    float exposure;
+    std::uint32_t padding;
+    Vec4 cameraPositionAndFov;
+    Vec4 cameraTargetAndAspect;
+    Vec4 cameraUp;
+    Vec4 lightPosition;
+    Vec4 lightColorAndIntensity;
+};
+
+struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) RaygenRecord
+{
+    std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
+    LaunchParameters parameters{};
+};
+
+struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) EmptyRecord
+{
+    std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
+};
+
+static_assert(sizeof(LaunchParameters) == 224);
+static_assert(sizeof(RaygenRecord) == 256);
+static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 } // namespace
 
 OptixRenderer::~OptixRenderer()
@@ -93,6 +140,10 @@ bool OptixRenderer::initialize(GLFWwindow*)
             throw std::runtime_error("No CUDA device found");
         checkCuda(cuDeviceGet(&cudaDevice_, 0), "cuDeviceGet");
         checkCuda(cuCtxCreate(&cudaContext_, nullptr, 0, cudaDevice_), "cuCtxCreate");
+        checkCuda(cuStreamCreate(&cudaStream_, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+        checkCuda(cuEventCreate(&launchParameterCopyComplete_, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        checkCuda(cuMemHostAlloc(&launchParametersHost_, sizeof(LaunchParameters), CU_MEMHOSTALLOC_PORTABLE),
+                  "cuMemHostAlloc(launch parameters)");
         checkOptix(optixInit(), "optixInit");
 
         OptixDeviceContextOptions options{};
@@ -126,6 +177,11 @@ bool OptixRenderer::initialize(GLFWwindow*)
 
 void OptixRenderer::shutdown()
 {
+    if (cudaContext_)
+        cuCtxSetCurrent(cudaContext_);
+    if (cudaStream_)
+        cuStreamSynchronize(cudaStream_);
+    clearGpuInteropSurface();
     destroySceneAcceleration();
     destroyPipeline();
     if (outputBuffer_)
@@ -134,6 +190,15 @@ void OptixRenderer::shutdown()
     if (optixContext_)
         optixDeviceContextDestroy(optixContext_);
     optixContext_ = nullptr;
+    if (launchParametersHost_)
+        cuMemFreeHost(launchParametersHost_);
+    launchParametersHost_ = nullptr;
+    if (launchParameterCopyComplete_)
+        cuEventDestroy(launchParameterCopyComplete_);
+    launchParameterCopyComplete_ = nullptr;
+    if (cudaStream_)
+        cuStreamDestroy(cudaStream_);
+    cudaStream_ = nullptr;
     if (cudaContext_)
         cuCtxDestroy(cudaContext_);
     cudaContext_ = nullptr;
@@ -151,10 +216,76 @@ void OptixRenderer::setScene(const Scene* scene)
 
 void OptixRenderer::resize(std::uint32_t width, std::uint32_t height)
 {
-    width_ = std::max(width, 1u);
-    height_ = std::max(height, 1u);
+    const std::uint32_t newWidth = std::max(width, 1u);
+    const std::uint32_t newHeight = std::max(height, 1u);
+    if (width_ == newWidth && height_ == newHeight)
+        return;
+    width_ = newWidth;
+    height_ = newHeight;
     if (available_)
         resizeOutput();
+}
+
+bool OptixRenderer::setGpuInteropSurface(const GpuInteropSurface& surface)
+{
+    if (!surface || !cudaContext_)
+        return false;
+    if (interopGeneration_ == surface.generation && interopOutputBuffer_)
+        return true;
+    try
+    {
+        checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
+        clearGpuInteropSurface();
+
+        CUDA_EXTERNAL_MEMORY_HANDLE_DESC memoryDesc{};
+        memoryDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32;
+        memoryDesc.handle.win32.handle = surface.memoryHandle;
+        memoryDesc.size = surface.allocationSize;
+        checkCuda(cuImportExternalMemory(&externalMemory_, &memoryDesc), "cuImportExternalMemory(Vulkan)");
+        CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufferDesc{};
+        bufferDesc.size = surface.pixelByteSize;
+        checkCuda(cuExternalMemoryGetMappedBuffer(&interopOutputBuffer_, externalMemory_, &bufferDesc),
+                  "cuExternalMemoryGetMappedBuffer(Vulkan)");
+
+        const auto importSemaphore = [](void* handle, CUexternalSemaphore& semaphore) {
+            CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC semaphoreDesc{};
+            semaphoreDesc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32;
+            semaphoreDesc.handle.win32.handle = handle;
+            checkCuda(cuImportExternalSemaphore(&semaphore, &semaphoreDesc), "cuImportExternalSemaphore(Vulkan)");
+        };
+        importSemaphore(surface.cudaReadySemaphoreHandle, cudaReadySemaphore_);
+        importSemaphore(surface.vulkanCompleteSemaphoreHandle, vulkanCompleteSemaphore_);
+        interopGeneration_ = surface.generation;
+        interopBgra_ = surface.bgra;
+        firstInteropLaunch_ = true;
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        clearGpuInteropSurface();
+        return false;
+    }
+}
+
+void OptixRenderer::clearGpuInteropSurface()
+{
+    if (cudaStream_)
+        cuStreamSynchronize(cudaStream_);
+    if (interopOutputBuffer_)
+        cuMemFree(interopOutputBuffer_);
+    interopOutputBuffer_ = 0;
+    if (cudaReadySemaphore_)
+        cuDestroyExternalSemaphore(cudaReadySemaphore_);
+    if (vulkanCompleteSemaphore_)
+        cuDestroyExternalSemaphore(vulkanCompleteSemaphore_);
+    cudaReadySemaphore_ = nullptr;
+    vulkanCompleteSemaphore_ = nullptr;
+    if (externalMemory_)
+        cuDestroyExternalMemory(externalMemory_);
+    externalMemory_ = nullptr;
+    interopGeneration_ = 0;
+    firstInteropLaunch_ = true;
 }
 
 void OptixRenderer::resetAccumulation()
@@ -164,7 +295,7 @@ void OptixRenderer::resetAccumulation()
 
 bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
 {
-    if (!available_ || !gasHandle_)
+    if (!available_ || !gasHandle_ || !interopOutputBuffer_)
         return false;
     const auto begin = std::chrono::steady_clock::now();
     try
@@ -180,25 +311,17 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         shaderBindingTable.hitgroupRecordBase = hitRecord_;
         shaderBindingTable.hitgroupRecordStrideInBytes = OPTIX_SBT_RECORD_HEADER_SIZE;
         shaderBindingTable.hitgroupRecordCount = 1;
-        checkOptix(optixLaunch(pipeline_, nullptr, 0, 0, &shaderBindingTable, width_, height_, 1), "optixLaunch");
-        checkCuda(cuCtxSynchronize(), "cuCtxSynchronize");
-        checkCuda(cuMemcpyDtoH(hostOutput_.data(), outputBuffer_, hostOutput_.size() * sizeof(float)),
-                  "cuMemcpyDtoH(OptiX output)");
-
-        const float exposure = std::exp2(settings.exposure);
-        const auto toSrgb8 = [exposure](float value) -> std::uint32_t {
-            value = std::max(value * exposure, 0.0f);
-            value = value / (1.0f + value);
-            value = value <= 0.0031308f ? 12.92f * value : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
-            return static_cast<std::uint32_t>(std::clamp(value * 255.0f + 0.5f, 0.0f, 255.0f));
-        };
-        for (std::size_t pixel = 0; pixel < displayPixels_.size(); ++pixel)
+        if (!firstInteropLaunch_)
         {
-            const std::uint32_t r = toSrgb8(hostOutput_[pixel * 4 + 0]);
-            const std::uint32_t g = toSrgb8(hostOutput_[pixel * 4 + 1]);
-            const std::uint32_t b = toSrgb8(hostOutput_[pixel * 4 + 2]);
-            displayPixels_[pixel] = r | (g << 8u) | (b << 16u) | 0xff000000u;
+            CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS waitParams{};
+            checkCuda(cuWaitExternalSemaphoresAsync(&vulkanCompleteSemaphore_, &waitParams, 1, cudaStream_),
+                      "cuWaitExternalSemaphoresAsync(Vulkan complete)");
         }
+        checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &shaderBindingTable, width_, height_, 1), "optixLaunch");
+        CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
+        checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
+                  "cuSignalExternalSemaphoresAsync(CUDA ready)");
+        firstInteropLaunch_ = false;
         ++stats_.frameIndex;
         stats_.accumulatedSamples += settings.samplesPerFrame;
         stats_.tracedRays = static_cast<std::uint64_t>(width_) * height_ * settings.samplesPerFrame;
@@ -227,8 +350,6 @@ bool OptixRenderer::resizeOutput()
         outputBuffer_ = 0;
         const std::size_t byteCount = static_cast<std::size_t>(width_) * height_ * 4 * sizeof(float);
         checkCuda(cuMemAlloc(&outputBuffer_, byteCount), "cuMemAlloc");
-        hostOutput_.resize(static_cast<std::size_t>(width_) * height_ * 4);
-        displayPixels_.resize(static_cast<std::size_t>(width_) * height_);
         resetAccumulation();
         return true;
     }
@@ -476,9 +597,18 @@ bool OptixRenderer::createPipeline()
         checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 1),
                    "optixPipelineSetStackSize");
 
-        checkCuda(cuMemAlloc(&raygenRecord_, 240), "cuMemAlloc(raygen SBT)");
+        checkCuda(cuMemAlloc(&raygenRecord_, sizeof(RaygenRecord)), "cuMemAlloc(raygen SBT)");
         checkCuda(cuMemAlloc(&missRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(miss SBT)");
         checkCuda(cuMemAlloc(&hitRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(hit SBT)");
+        RaygenRecord raygenRecord{};
+        EmptyRecord missRecord{};
+        EmptyRecord hitRecord{};
+        checkOptix(optixSbtRecordPackHeader(raygenProgramGroup_, &raygenRecord), "optixSbtRecordPackHeader(raygen)");
+        checkOptix(optixSbtRecordPackHeader(missProgramGroup_, &missRecord), "optixSbtRecordPackHeader(miss)");
+        checkOptix(optixSbtRecordPackHeader(hitProgramGroup_, &hitRecord), "optixSbtRecordPackHeader(hit)");
+        checkCuda(cuMemcpyHtoD(raygenRecord_, &raygenRecord, sizeof(raygenRecord)), "cuMemcpyHtoD(raygen SBT)");
+        checkCuda(cuMemcpyHtoD(missRecord_, &missRecord, sizeof(missRecord)), "cuMemcpyHtoD(miss SBT)");
+        checkCuda(cuMemcpyHtoD(hitRecord_, &hitRecord, sizeof(hitRecord)), "cuMemcpyHtoD(hit SBT)");
         return true;
     }
     catch (const std::exception& error)
@@ -519,79 +649,42 @@ void OptixRenderer::destroyPipeline()
 
 bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderSettings& settings)
 {
-    struct SlangStructuredBuffer
-    {
-        CUdeviceptr data;
-        std::size_t count;
-    };
-    struct LaunchParameters
-    {
-        SlangStructuredBuffer output;
-        SlangStructuredBuffer normals;
-        SlangStructuredBuffer indices;
-        SlangStructuredBuffer triangleMaterialIndices;
-        SlangStructuredBuffer materials;
-        OptixTraversableHandle scene;
-        std::uint32_t width;
-        std::uint32_t height;
-        std::uint32_t frameIndex;
-        std::uint32_t maxBounces;
-        std::uint32_t samplesPerFrame;
-        std::uint32_t accumulatedSamples;
-        std::uint32_t rayTracedShadows;
-        std::uint32_t padding[3];
-        Vec4 cameraPositionAndFov;
-        Vec4 cameraTargetAndAspect;
-        Vec4 cameraUp;
-        Vec4 lightPosition;
-        Vec4 lightColorAndIntensity;
-    };
-    struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) RaygenRecord
-    {
-        std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
-        LaunchParameters parameters{};
-    };
-    struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) EmptyRecord
-    {
-        std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
-    };
-    static_assert(sizeof(LaunchParameters) == 208);
-    static_assert(sizeof(RaygenRecord) == 240);
-    static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
-
     try
     {
-        RaygenRecord record{};
-        checkOptix(optixSbtRecordPackHeader(raygenProgramGroup_, &record), "optixSbtRecordPackHeader");
-        record.parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
-        record.parameters.normals = {normalBuffer_, vertexCount_};
-        record.parameters.indices = {indexBuffer_, triangleCount_};
-        record.parameters.triangleMaterialIndices = {triangleMaterialIndexBuffer_, triangleCount_};
-        record.parameters.materials = {materialBuffer_, materialCount_};
-        record.parameters.scene = gasHandle_;
-        record.parameters.width = width_;
-        record.parameters.height = height_;
-        record.parameters.frameIndex = static_cast<std::uint32_t>(stats_.frameIndex);
-        record.parameters.maxBounces = settings.maxBounces;
-        record.parameters.samplesPerFrame = settings.samplesPerFrame;
-        record.parameters.accumulatedSamples = static_cast<std::uint32_t>(stats_.accumulatedSamples);
-        record.parameters.rayTracedShadows = settings.rayTracedShadows ? 1u : 0u;
-        record.parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
-                                                  camera.verticalFovDegrees * kPi / 180.0f};
-        record.parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
-                                                   static_cast<float>(width_) / static_cast<float>(std::max(height_, 1u))};
-        record.parameters.cameraUp = {camera.up.x, camera.up.y, camera.up.z, 0.0f};
+        if (launchParameterCopyPending_)
+            checkCuda(cuEventSynchronize(launchParameterCopyComplete_), "cuEventSynchronize(launch parameter copy)");
+        auto& parameters = *static_cast<LaunchParameters*>(launchParametersHost_);
+        parameters = {};
+        parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.normals = {normalBuffer_, vertexCount_};
+        parameters.indices = {indexBuffer_, triangleCount_};
+        parameters.triangleMaterialIndices = {triangleMaterialIndexBuffer_, triangleCount_};
+        parameters.materials = {materialBuffer_, materialCount_};
+        parameters.scene = gasHandle_;
+        parameters.width = width_;
+        parameters.height = height_;
+        parameters.frameIndex = static_cast<std::uint32_t>(stats_.frameIndex);
+        parameters.maxBounces = settings.maxBounces;
+        parameters.samplesPerFrame = settings.samplesPerFrame;
+        parameters.accumulatedSamples = static_cast<std::uint32_t>(stats_.accumulatedSamples);
+        parameters.rayTracedShadows = settings.rayTracedShadows ? 1u : 0u;
+        parameters.displayBgra = interopBgra_ ? 1u : 0u;
+        parameters.exposure = settings.exposure;
+        parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
+                                           camera.verticalFovDegrees * kPi / 180.0f};
+        parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
+                                            static_cast<float>(width_) / static_cast<float>(std::max(height_, 1u))};
+        parameters.cameraUp = {camera.up.x, camera.up.y, camera.up.z, 0.0f};
         const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
-        record.parameters.lightPosition = {light.position.x, light.position.y, light.position.z, 1.0f};
-        record.parameters.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
+        parameters.lightPosition = {light.position.x, light.position.y, light.position.z, 1.0f};
+        parameters.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
 
-        EmptyRecord missRecord{};
-        EmptyRecord hitRecord{};
-        checkOptix(optixSbtRecordPackHeader(missProgramGroup_, &missRecord), "optixSbtRecordPackHeader(miss)");
-        checkOptix(optixSbtRecordPackHeader(hitProgramGroup_, &hitRecord), "optixSbtRecordPackHeader(hit)");
-        checkCuda(cuMemcpyHtoD(raygenRecord_, &record, sizeof(record)), "cuMemcpyHtoD(raygen SBT)");
-        checkCuda(cuMemcpyHtoD(missRecord_, &missRecord, sizeof(missRecord)), "cuMemcpyHtoD(miss SBT)");
-        checkCuda(cuMemcpyHtoD(hitRecord_, &hitRecord, sizeof(hitRecord)), "cuMemcpyHtoD(hit SBT)");
+        checkCuda(cuMemcpyHtoDAsync(raygenRecord_ + offsetof(RaygenRecord, parameters), &parameters,
+                                    sizeof(parameters), cudaStream_),
+                  "cuMemcpyHtoDAsync(launch parameters)");
+        checkCuda(cuEventRecord(launchParameterCopyComplete_, cudaStream_), "cuEventRecord(launch parameter copy)");
+        launchParameterCopyPending_ = true;
         return true;
     }
     catch (const std::exception& error)

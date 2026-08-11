@@ -2,11 +2,13 @@
 
 #include "Core/Renderer.h"
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 #include <array>
 #include <cstdint>
-#include <span>
 #include <string>
 #include <vector>
 
@@ -32,8 +34,11 @@ public:
     [[nodiscard]] const RendererStats& stats() const override { return stats_; }
 
     void beginUiFrame();
-    void setExternalImage(std::span<const std::uint32_t> rgbaPixels, std::uint32_t width, std::uint32_t height);
     void clearExternalImage();
+    bool createGpuInteropSurface(std::uint32_t width, std::uint32_t height);
+    void destroyGpuInteropSurface();
+    [[nodiscard]] const GpuInteropSurface& gpuInteropSurface() const { return gpuInteropSurfaceInfo_; }
+    void setGpuInteropFrameReady(bool ready) { gpuInteropFrameReady_ = ready; }
     [[nodiscard]] bool rayQueryAvailable() const { return rayQueryAvailable_; }
     [[nodiscard]] bool taskShaderAvailable() const { return taskShaderAvailable_; }
 
@@ -64,7 +69,8 @@ private:
         Vec4 lightColorAndIntensity{};
         std::uint32_t rayTracedShadows{};
         float exposure{};
-        std::uint32_t padding[2]{};
+        std::uint32_t meshletCount{};
+        std::uint32_t padding{};
     };
 
     bool createInstance();
@@ -87,7 +93,8 @@ private:
     GpuBuffer createUploadBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage) const;
     std::uint32_t findMemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags properties) const;
     void recordCommands(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, const GpuBuffer* externalBuffer);
-    bool updateExternalBuffer(std::uint32_t frameIndex);
+    GpuBuffer createExternalBuffer(VkDeviceSize byteSize, VkDeviceSize& allocationSize, HANDLE& memoryHandle) const;
+    VkSemaphore createExternalSemaphore(HANDLE& semaphoreHandle) const;
     VkShaderModule loadShaderModule(const wchar_t* relativePath) const;
     void setError(std::string message);
 
@@ -142,11 +149,12 @@ private:
     std::uint32_t uploadedVertexCount_{};
     std::uint32_t uploadedTriangleCount_{};
     FramePushConstants framePushConstants_{};
-    std::array<GpuBuffer, kFramesInFlight> externalImageBuffers_{};
-    std::vector<std::uint32_t> externalImagePixels_;
-    std::uint32_t externalImageWidth_{};
-    std::uint32_t externalImageHeight_{};
-    bool useExternalImage_{};
+    GpuBuffer gpuInteropBuffer_{};
+    VkSemaphore cudaReadySemaphore_{VK_NULL_HANDLE};
+    VkSemaphore vulkanCompleteSemaphore_{VK_NULL_HANDLE};
+    GpuInteropSurface gpuInteropSurfaceInfo_{};
+    bool gpuInteropFrameReady_{};
+    std::uint64_t gpuInteropGeneration_{};
 
     bool initialized_{};
     bool imguiInitialized_{};

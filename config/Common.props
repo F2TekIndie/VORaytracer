@@ -14,7 +14,7 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;VK_USE_PLATFORM_WIN32_KHR;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(SolutionDir)src;G:\CodingLibraries\VulkanSDK\Include;G:\CodingLibraries\slang-14.1\include;G:\CodingLibraries\assimp\include;$(SolutionDir)build\assimp\include;G:\CodingLibraries\glfw-3.5.1\include;G:\CodingLibraries\imgui;G:\CodingLibraries\imgui\backends;G:\CodingLibraries\meshoptimizer\src;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\include;C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>

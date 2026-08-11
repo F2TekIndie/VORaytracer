@@ -44,5 +44,7 @@ private:
     bool meshoptimizerEnabled_{true};
     bool defaultPlasticEnabled_{false};
     bool groundPlaneEnabled_{true};
+    std::uint32_t interopWidth_{};
+    std::uint32_t interopHeight_{};
 };
 } // namespace vor

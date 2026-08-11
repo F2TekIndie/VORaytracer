@@ -34,8 +34,20 @@ int Application::run()
             continue;
         }
 
-        vulkanRenderer_.resize(static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
-        optixRenderer_.resize(static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
+        const auto framebufferWidth = static_cast<std::uint32_t>(width);
+        const auto framebufferHeight = static_cast<std::uint32_t>(height);
+        vulkanRenderer_.resize(framebufferWidth, framebufferHeight);
+        optixRenderer_.resize(framebufferWidth, framebufferHeight);
+        if (interopWidth_ != framebufferWidth || interopHeight_ != framebufferHeight)
+        {
+            optixRenderer_.clearGpuInteropSurface();
+            if (vulkanRenderer_.createGpuInteropSurface(framebufferWidth, framebufferHeight) &&
+                optixRenderer_.setGpuInteropSurface(vulkanRenderer_.gpuInteropSurface()))
+            {
+                interopWidth_ = framebufferWidth;
+                interopHeight_ = framebufferHeight;
+            }
+        }
         vulkanRenderer_.beginUiFrame();
         handleCameraNavigation();
         drawUi();
@@ -50,8 +62,7 @@ int Application::run()
         if (settings_.backend == BackendKind::Optix && optixRenderer_.available())
         {
             if (optixRenderer_.render(scene_.camera, settings_))
-                vulkanRenderer_.setExternalImage(optixRenderer_.displayPixels(), optixRenderer_.outputWidth(),
-                                                 optixRenderer_.outputHeight());
+                vulkanRenderer_.setGpuInteropFrameReady(true);
         }
         else
             vulkanRenderer_.clearExternalImage();

@@ -17,6 +17,7 @@ struct GpuMaterial
 struct LaunchParameters
 {
     RWStructuredBuffer<float4> output;
+    RWStructuredBuffer<uint> displayOutput;
     StructuredBuffer<float3> normals;
     StructuredBuffer<uint3> indices;
     StructuredBuffer<uint> triangleMaterialIndices;
@@ -28,7 +29,9 @@ struct LaunchParameters
     uint samplesPerFrame;
     uint accumulatedSamples;
     uint rayTracedShadows;
-    uint3 padding;
+    uint displayBgra;
+    float exposure;
+    uint padding;
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
@@ -145,6 +148,15 @@ void RayGen(LaunchParameters parameters)
         current = lerp(previous, current, weight);
     }
     parameters.output[linearIndex] = float4(current, 1.0);
+    float3 mapped = max(current * exp2(parameters.exposure), 0.0);
+    mapped = mapped / (1.0f + mapped);
+    mapped = float3(mapped.x <= 0.0031308f ? 12.92f * mapped.x : 1.055f * pow(mapped.x, 0.41666667f) - 0.055f,
+                    mapped.y <= 0.0031308f ? 12.92f * mapped.y : 1.055f * pow(mapped.y, 0.41666667f) - 0.055f,
+                    mapped.z <= 0.0031308f ? 12.92f * mapped.z : 1.055f * pow(mapped.z, 0.41666667f) - 0.055f);
+    uint3 rgb = uint3(clamp(mapped * 255.0f + 0.5f, 0.0f, 255.0f));
+    parameters.displayOutput[linearIndex] = parameters.displayBgra != 0
+                                                ? rgb.z | (rgb.y << 8) | (rgb.x << 16) | 0xff000000
+                                                : rgb.x | (rgb.y << 8) | (rgb.z << 16) | 0xff000000;
 }
 
 [shader("miss")]

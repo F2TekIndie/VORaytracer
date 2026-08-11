@@ -139,14 +139,7 @@ void VulkanRenderer::shutdown()
     destroyMeshPipeline();
     if (device_ != VK_NULL_HANDLE)
     {
-        for (GpuBuffer& buffer : externalImageBuffers_)
-        {
-            if (buffer.buffer)
-                vkDestroyBuffer(device_, buffer.buffer, nullptr);
-            if (buffer.memory)
-                vkFreeMemory(device_, buffer.memory, nullptr);
-            buffer = {};
-        }
+        destroyGpuInteropSurface();
         destroySceneResources();
         if (sceneDescriptorPool_)
             vkDestroyDescriptorPool(device_, sceneDescriptorPool_, nullptr);
@@ -205,9 +198,14 @@ void VulkanRenderer::setScene(const Scene* scene)
 
 void VulkanRenderer::resize(std::uint32_t width, std::uint32_t height)
 {
+    if (width == 0 || height == 0)
+        return;
+    if ((!resizePending_ && swapchainExtent_.width == width && swapchainExtent_.height == height) ||
+        (resizePending_ && requestedWidth_ == width && requestedHeight_ == height))
+        return;
     requestedWidth_ = width;
     requestedHeight_ = height;
-    resizePending_ = width > 0 && height > 0;
+    resizePending_ = true;
 }
 
 void VulkanRenderer::resetAccumulation()
@@ -224,33 +222,103 @@ void VulkanRenderer::beginUiFrame()
     ImGui::NewFrame();
 }
 
-void VulkanRenderer::setExternalImage(std::span<const std::uint32_t> rgbaPixels,
-                                      std::uint32_t width,
-                                      std::uint32_t height)
-{
-    if (rgbaPixels.size() != static_cast<std::size_t>(width) * height || rgbaPixels.empty())
-    {
-        clearExternalImage();
-        return;
-    }
-    externalImagePixels_.assign(rgbaPixels.begin(), rgbaPixels.end());
-    if (swapchainFormat_ == VK_FORMAT_B8G8R8A8_SRGB || swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM)
-    {
-        for (std::uint32_t& pixel : externalImagePixels_)
-        {
-            const std::uint32_t red = pixel & 0xffu;
-            const std::uint32_t blue = (pixel >> 16u) & 0xffu;
-            pixel = (pixel & 0xff00ff00u) | (red << 16u) | blue;
-        }
-    }
-    externalImageWidth_ = width;
-    externalImageHeight_ = height;
-    useExternalImage_ = true;
-}
-
 void VulkanRenderer::clearExternalImage()
 {
-    useExternalImage_ = false;
+    gpuInteropFrameReady_ = false;
+}
+
+bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t height)
+{
+    width = std::max(width, 1u);
+    height = std::max(height, 1u);
+    if (gpuInteropSurfaceInfo_ && gpuInteropSurfaceInfo_.width == width && gpuInteropSurfaceInfo_.height == height)
+        return true;
+    try
+    {
+        check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(interoperability resize)");
+        destroyGpuInteropSurface();
+        const VkDeviceSize pixelByteSize = static_cast<VkDeviceSize>(width) * height * sizeof(std::uint32_t);
+        VkDeviceSize allocationSize = 0;
+        HANDLE memoryHandle = nullptr;
+        gpuInteropBuffer_ = createExternalBuffer(pixelByteSize, allocationSize, memoryHandle);
+        gpuInteropSurfaceInfo_.memoryHandle = memoryHandle;
+        HANDLE cudaReadyHandle = nullptr;
+        HANDLE vulkanCompleteHandle = nullptr;
+        cudaReadySemaphore_ = createExternalSemaphore(cudaReadyHandle);
+        gpuInteropSurfaceInfo_.cudaReadySemaphoreHandle = cudaReadyHandle;
+        vulkanCompleteSemaphore_ = createExternalSemaphore(vulkanCompleteHandle);
+        gpuInteropSurfaceInfo_.vulkanCompleteSemaphoreHandle = vulkanCompleteHandle;
+
+        VkCommandBuffer ownershipCommand = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        commandInfo.commandPool = commandPool_;
+        commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandInfo.commandBufferCount = 1;
+        check(vkAllocateCommandBuffers(device_, &commandInfo, &ownershipCommand),
+              "vkAllocateCommandBuffers(CUDA ownership)");
+        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(ownershipCommand, &beginInfo), "vkBeginCommandBuffer(CUDA ownership)");
+        VkBufferMemoryBarrier2 releaseBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        releaseBarrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        releaseBarrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        releaseBarrier.srcQueueFamilyIndex = graphicsQueueFamily_;
+        releaseBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        releaseBarrier.buffer = gpuInteropBuffer_.buffer;
+        releaseBarrier.size = gpuInteropBuffer_.size;
+        VkDependencyInfo releaseDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        releaseDependency.bufferMemoryBarrierCount = 1;
+        releaseDependency.pBufferMemoryBarriers = &releaseBarrier;
+        vkCmdPipelineBarrier2(ownershipCommand, &releaseDependency);
+        check(vkEndCommandBuffer(ownershipCommand), "vkEndCommandBuffer(CUDA ownership)");
+        VkSubmitInfo ownershipSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        ownershipSubmit.commandBufferCount = 1;
+        ownershipSubmit.pCommandBuffers = &ownershipCommand;
+        check(vkQueueSubmit(graphicsQueue_, 1, &ownershipSubmit, VK_NULL_HANDLE), "vkQueueSubmit(CUDA ownership)");
+        check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(CUDA ownership)");
+        vkFreeCommandBuffers(device_, commandPool_, 1, &ownershipCommand);
+
+        gpuInteropSurfaceInfo_.allocationSize = allocationSize;
+        gpuInteropSurfaceInfo_.pixelByteSize = pixelByteSize;
+        gpuInteropSurfaceInfo_.generation = ++gpuInteropGeneration_;
+        gpuInteropSurfaceInfo_.width = width;
+        gpuInteropSurfaceInfo_.height = height;
+        gpuInteropSurfaceInfo_.bgra = swapchainFormat_ == VK_FORMAT_B8G8R8A8_SRGB ||
+                                      swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM;
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        destroyGpuInteropSurface();
+        return false;
+    }
+}
+
+void VulkanRenderer::destroyGpuInteropSurface()
+{
+    gpuInteropFrameReady_ = false;
+    if (device_)
+    {
+        if (cudaReadySemaphore_)
+            vkDestroySemaphore(device_, cudaReadySemaphore_, nullptr);
+        if (vulkanCompleteSemaphore_)
+            vkDestroySemaphore(device_, vulkanCompleteSemaphore_, nullptr);
+        if (gpuInteropBuffer_.buffer)
+            vkDestroyBuffer(device_, gpuInteropBuffer_.buffer, nullptr);
+        if (gpuInteropBuffer_.memory)
+            vkFreeMemory(device_, gpuInteropBuffer_.memory, nullptr);
+    }
+    if (gpuInteropSurfaceInfo_.memoryHandle)
+        CloseHandle(static_cast<HANDLE>(gpuInteropSurfaceInfo_.memoryHandle));
+    if (gpuInteropSurfaceInfo_.cudaReadySemaphoreHandle)
+        CloseHandle(static_cast<HANDLE>(gpuInteropSurfaceInfo_.cudaReadySemaphoreHandle));
+    if (gpuInteropSurfaceInfo_.vulkanCompleteSemaphoreHandle)
+        CloseHandle(static_cast<HANDLE>(gpuInteropSurfaceInfo_.vulkanCompleteSemaphoreHandle));
+    cudaReadySemaphore_ = VK_NULL_HANDLE;
+    vulkanCompleteSemaphore_ = VK_NULL_HANDLE;
+    gpuInteropBuffer_ = {};
+    gpuInteropSurfaceInfo_ = {};
 }
 
 bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings)
@@ -275,6 +343,7 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         framePushConstants_.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
         framePushConstants_.rayTracedShadows = settings.rayTracedShadows && tlas_ ? 1u : 0u;
         framePushConstants_.exposure = settings.exposure;
+        framePushConstants_.meshletCount = uploadedMeshletCount_;
 
         ImGui::Render();
         FrameResources& frame = frames_[frameSlot_];
@@ -290,28 +359,31 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
             check(acquireResult, "vkAcquireNextImageKHR");
 
-        const bool externalImageMatches = useExternalImage_ && externalImageWidth_ == swapchainExtent_.width &&
-                                          externalImageHeight_ == swapchainExtent_.height;
+        const bool gpuInteropMatches = gpuInteropFrameReady_ && gpuInteropSurfaceInfo_ &&
+                                       gpuInteropSurfaceInfo_.width == swapchainExtent_.width &&
+                                       gpuInteropSurfaceInfo_.height == swapchainExtent_.height;
         const GpuBuffer* externalBuffer = nullptr;
-        if (externalImageMatches && updateExternalBuffer(frameSlot_))
-            externalBuffer = &externalImageBuffers_[frameSlot_];
+        if (gpuInteropMatches)
+            externalBuffer = &gpuInteropBuffer_;
 
         check(vkResetFences(device_, 1, &frame.inFlight), "vkResetFences");
         check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
         recordCommands(frame.commandBuffer, imageIndex, externalBuffer);
 
-        const VkPipelineStageFlags waitStage = externalBuffer
-                                                   ? VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                                                   : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        std::array<VkSemaphore, 2> waitSemaphores{frame.imageAvailable, cudaReadySemaphore_};
+        std::array<VkPipelineStageFlags, 2> waitStages{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                       VK_PIPELINE_STAGE_TRANSFER_BIT};
+        std::array<VkSemaphore, 2> signalSemaphores{frame.renderFinished, vulkanCompleteSemaphore_};
         VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &frame.imageAvailable;
-        submitInfo.pWaitDstStageMask = &waitStage;
+        submitInfo.waitSemaphoreCount = gpuInteropMatches ? 2u : 1u;
+        submitInfo.pWaitSemaphores = waitSemaphores.data();
+        submitInfo.pWaitDstStageMask = waitStages.data();
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &frame.commandBuffer;
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &frame.renderFinished;
+        submitInfo.signalSemaphoreCount = gpuInteropMatches ? 2u : 1u;
+        submitInfo.pSignalSemaphores = signalSemaphores.data();
         check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, frame.inFlight), "vkQueueSubmit");
+        gpuInteropFrameReady_ = false;
 
         VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         presentInfo.waitSemaphoreCount = 1;
@@ -340,28 +412,6 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         setError(error.what());
         return false;
     }
-}
-
-bool VulkanRenderer::updateExternalBuffer(std::uint32_t frameIndex)
-{
-    if (frameIndex >= externalImageBuffers_.size() || externalImagePixels_.empty())
-        return false;
-    const VkDeviceSize byteCount = externalImagePixels_.size() * sizeof(std::uint32_t);
-    GpuBuffer& buffer = externalImageBuffers_[frameIndex];
-    if (buffer.size != byteCount)
-    {
-        if (buffer.buffer)
-            vkDestroyBuffer(device_, buffer.buffer, nullptr);
-        if (buffer.memory)
-            vkFreeMemory(device_, buffer.memory, nullptr);
-        buffer = createUploadBuffer(externalImagePixels_.data(), byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        return true;
-    }
-    void* mapped = nullptr;
-    check(vkMapMemory(device_, buffer.memory, 0, byteCount, 0, &mapped), "vkMapMemory(OptiX display)");
-    std::memcpy(mapped, externalImagePixels_.data(), static_cast<std::size_t>(byteCount));
-    vkUnmapMemory(device_, buffer.memory);
-    return true;
 }
 
 bool VulkanRenderer::createInstance()
@@ -437,7 +487,10 @@ bool VulkanRenderer::selectPhysicalDevice()
         vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, nullptr);
         std::vector<VkExtensionProperties> extensions(extensionCount);
         vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, extensions.data());
-        if (!hasExtension(extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME) || !hasExtension(extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME))
+        if (!hasExtension(extensions, VK_KHR_SWAPCHAIN_EXTENSION_NAME) ||
+            !hasExtension(extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME) ||
+            !hasExtension(extensions, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) ||
+            !hasExtension(extensions, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME))
             continue;
 
         std::uint32_t queueCount = 0;
@@ -462,7 +515,7 @@ bool VulkanRenderer::selectPhysicalDevice()
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &meshFeatures;
         vkGetPhysicalDeviceFeatures2(candidate, &features);
-        if (!meshFeatures.meshShader)
+        if (!meshFeatures.meshShader || !meshFeatures.taskShader)
             continue;
 
         const int score = properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 1000 : 100;
@@ -475,7 +528,7 @@ bool VulkanRenderer::selectPhysicalDevice()
     }
 
     if (!physicalDevice_)
-        throw std::runtime_error("No Vulkan device with VK_EXT_mesh_shader and presentation support found");
+        throw std::runtime_error("No Vulkan device with task/mesh shader and presentation support found");
 
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physicalDevice_, &properties);
@@ -518,15 +571,23 @@ bool VulkanRenderer::createDevice()
     }
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &available);
 
-    if (!available13.dynamicRendering || !available13.synchronization2 || !availableMesh.meshShader)
-        throw std::runtime_error("Required Vulkan 1.3 dynamic rendering/synchronization or mesh shader features are missing");
-    taskShaderAvailable_ = availableMesh.taskShader == VK_TRUE;
+    if (!available13.dynamicRendering || !available13.synchronization2 || !availableMesh.meshShader ||
+        !availableMesh.taskShader)
+        throw std::runtime_error("Required Vulkan 1.3 dynamic rendering/synchronization or task/mesh shader features are missing");
+    taskShaderAvailable_ = true;
     rayQueryAvailable_ = rayQueryExtensions && availableBufferAddress.bufferDeviceAddress &&
                          availableAcceleration.accelerationStructure && availableRayQuery.rayQuery;
     if (!rayQueryAvailable_)
         throw std::runtime_error("The Vulkan backend requires acceleration structures and VK_KHR_ray_query");
 
-    std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_MESH_SHADER_EXTENSION_NAME};
+    std::vector<const char*> extensions{
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        VK_EXT_MESH_SHADER_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+    };
     if (rayQueryAvailable_)
     {
         extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
@@ -737,7 +798,7 @@ bool VulkanRenderer::createSceneDescriptors()
         bindings[index].binding = index;
         bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[index].descriptorCount = 1;
-        bindings[index].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+        bindings[index].stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
     }
     bindings[4].binding = 4;
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -762,9 +823,11 @@ bool VulkanRenderer::createSceneDescriptors()
 
 bool VulkanRenderer::createMeshPipeline()
 {
+    const VkShaderModule taskModule = loadShaderModule(L"Shaders\\Task.spv");
     const VkShaderModule meshModule = loadShaderModule(L"Shaders\\Mesh.spv");
     const VkShaderModule fragmentModule = loadShaderModule(L"Shaders\\PbrFragment.spv");
     const std::array stages{
+        VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_TASK_BIT_EXT, taskModule, "TaskMain", nullptr},
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshModule, "MeshMain", nullptr},
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, "FragmentMain", nullptr},
     };
@@ -772,7 +835,7 @@ bool VulkanRenderer::createMeshPipeline()
     try
     {
         VkPushConstantRange pushConstantRange{};
-        pushConstantRange.stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pushConstantRange.offset = 0;
         pushConstantRange.size = sizeof(FramePushConstants);
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -826,10 +889,12 @@ bool VulkanRenderer::createMeshPipeline()
     {
         vkDestroyShaderModule(device_, fragmentModule, nullptr);
         vkDestroyShaderModule(device_, meshModule, nullptr);
+        vkDestroyShaderModule(device_, taskModule, nullptr);
         throw;
     }
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
     vkDestroyShaderModule(device_, meshModule, nullptr);
+    vkDestroyShaderModule(device_, taskModule, nullptr);
     return true;
 }
 
@@ -1025,8 +1090,33 @@ bool VulkanRenderer::uploadSceneResources()
                                              (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 2]) << 16);
                 packedTriangles.push_back(packed);
             }
+            Vec4 worldSphere{};
+            Vec4 worldCone{};
+            if (meshlet.boundingSphere.w > 0.0f)
+            {
+                const Vec3 center{meshlet.boundingSphere.x, meshlet.boundingSphere.y, meshlet.boundingSphere.z};
+                worldSphere = {
+                    transform.m[0] * center.x + transform.m[4] * center.y + transform.m[8] * center.z + transform.m[12],
+                    transform.m[1] * center.x + transform.m[5] * center.y + transform.m[9] * center.z + transform.m[13],
+                    transform.m[2] * center.x + transform.m[6] * center.y + transform.m[10] * center.z + transform.m[14],
+                    0.0f,
+                };
+                const float scaleX = length(Vec3{transform.m[0], transform.m[1], transform.m[2]});
+                const float scaleY = length(Vec3{transform.m[4], transform.m[5], transform.m[6]});
+                const float scaleZ = length(Vec3{transform.m[8], transform.m[9], transform.m[10]});
+                const float maxScale = std::max({scaleX, scaleY, scaleZ});
+                const float minScale = std::min({scaleX, scaleY, scaleZ});
+                worldSphere.w = meshlet.boundingSphere.w * maxScale;
+                const Vec3 sourceAxis{meshlet.normalCone.x, meshlet.normalCone.y, meshlet.normalCone.z};
+                if (length(sourceAxis) > 0.5f)
+                {
+                    const Vec3 axis = transformNormal(transform, sourceAxis);
+                    worldCone = {axis.x, axis.y, axis.z,
+                                 minScale >= maxScale * 0.999f ? meshlet.normalCone.w : 2.0f};
+                }
+            }
             meshlets.push_back({meshletVertexOffset, triangleOffset, meshlet.vertexCount, meshlet.triangleCount,
-                                meshlet.boundingSphere, meshlet.normalCone,
+                                worldSphere, worldCone,
                                 {material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
                                 {material.roughness, 0.0f, 0.0f, 0.0f}});
         }
@@ -1303,6 +1393,90 @@ void VulkanRenderer::destroyAccelerationStructures()
     destroyBuffer(blasStorage_);
 }
 
+VulkanRenderer::GpuBuffer VulkanRenderer::createExternalBuffer(
+    VkDeviceSize byteSize,
+    VkDeviceSize& allocationSize,
+    HANDLE& memoryHandle) const
+{
+    GpuBuffer result{};
+    try
+    {
+        result.size = byteSize;
+        VkExternalMemoryBufferCreateInfo externalInfo{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufferInfo.pNext = &externalInfo;
+        bufferInfo.size = byteSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        check(vkCreateBuffer(device_, &bufferInfo, nullptr, &result.buffer), "vkCreateBuffer(CUDA interop)");
+
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+        allocationSize = requirements.size;
+        VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        VkMemoryAllocateInfo allocationInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocationInfo.pNext = &exportInfo;
+        allocationInfo.allocationSize = requirements.size;
+        allocationInfo.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device_, &allocationInfo, nullptr, &result.memory), "vkAllocateMemory(CUDA interop)");
+        check(vkBindBufferMemory(device_, result.buffer, result.memory, 0), "vkBindBufferMemory(CUDA interop)");
+
+        const auto getMemoryHandle = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetMemoryWin32HandleKHR"));
+        if (!getMemoryHandle)
+            throw std::runtime_error("vkGetMemoryWin32HandleKHR is unavailable");
+        VkMemoryGetWin32HandleInfoKHR handleInfo{VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR};
+        handleInfo.memory = result.memory;
+        handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        check(getMemoryHandle(device_, &handleInfo, &memoryHandle), "vkGetMemoryWin32HandleKHR");
+        return result;
+    }
+    catch (...)
+    {
+        if (memoryHandle)
+            CloseHandle(memoryHandle);
+        memoryHandle = nullptr;
+        if (result.memory)
+            vkFreeMemory(device_, result.memory, nullptr);
+        if (result.buffer)
+            vkDestroyBuffer(device_, result.buffer, nullptr);
+        throw;
+    }
+}
+
+VkSemaphore VulkanRenderer::createExternalSemaphore(HANDLE& semaphoreHandle) const
+{
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    try
+    {
+        VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
+        exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        VkSemaphoreCreateInfo createInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        createInfo.pNext = &exportInfo;
+        check(vkCreateSemaphore(device_, &createInfo, nullptr, &semaphore), "vkCreateSemaphore(CUDA interop)");
+        const auto getSemaphoreHandle = reinterpret_cast<PFN_vkGetSemaphoreWin32HandleKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetSemaphoreWin32HandleKHR"));
+        if (!getSemaphoreHandle)
+            throw std::runtime_error("vkGetSemaphoreWin32HandleKHR is unavailable");
+        VkSemaphoreGetWin32HandleInfoKHR handleInfo{VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR};
+        handleInfo.semaphore = semaphore;
+        handleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        check(getSemaphoreHandle(device_, &handleInfo, &semaphoreHandle), "vkGetSemaphoreWin32HandleKHR");
+        return semaphore;
+    }
+    catch (...)
+    {
+        if (semaphoreHandle)
+            CloseHandle(semaphoreHandle);
+        semaphoreHandle = nullptr;
+        if (semaphore)
+            vkDestroySemaphore(device_, semaphore, nullptr);
+        throw;
+    }
+}
+
 VulkanRenderer::GpuBuffer VulkanRenderer::createUploadBuffer(
     const void* data,
     VkDeviceSize size,
@@ -1395,6 +1569,19 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
 
     if (externalBuffer)
     {
+        VkBufferMemoryBarrier2 acquireInterop{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        acquireInterop.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        acquireInterop.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        acquireInterop.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        acquireInterop.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        acquireInterop.dstQueueFamilyIndex = graphicsQueueFamily_;
+        acquireInterop.buffer = externalBuffer->buffer;
+        acquireInterop.size = externalBuffer->size;
+        VkDependencyInfo acquireDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        acquireDependency.bufferMemoryBarrierCount = 1;
+        acquireDependency.pBufferMemoryBarriers = &acquireInterop;
+        vkCmdPipelineBarrier2(commandBuffer, &acquireDependency);
+
         VkBufferImageCopy copy{};
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
@@ -1411,9 +1598,21 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         toAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         toAttachment.image = swapchainImages_[imageIndex];
         toAttachment.subresourceRange = toTarget.subresourceRange;
+        VkBufferMemoryBarrier2 releaseInterop{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        releaseInterop.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        releaseInterop.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        releaseInterop.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        releaseInterop.srcQueueFamilyIndex = graphicsQueueFamily_;
+        releaseInterop.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        releaseInterop.buffer = externalBuffer->buffer;
+        releaseInterop.size = externalBuffer->size;
         dependency.imageMemoryBarrierCount = 1;
         dependency.pImageMemoryBarriers = &toAttachment;
+        dependency.bufferMemoryBarrierCount = 1;
+        dependency.pBufferMemoryBarriers = &releaseInterop;
         vkCmdPipelineBarrier2(commandBuffer, &dependency);
+        dependency.bufferMemoryBarrierCount = 0;
+        dependency.pBufferMemoryBarriers = nullptr;
     }
 
     VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1449,7 +1648,8 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                                 &sceneDescriptorSet_, 0, nullptr);
-        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        vkCmdPushConstants(commandBuffer, meshPipelineLayout_,
+                           VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(FramePushConstants), &framePushConstants_);
         cmdDrawMeshTasks_(commandBuffer, uploadedMeshletCount_, 1, 1);
     }
