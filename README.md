@@ -58,6 +58,8 @@ Alternativ kann die Solution nach dem ersten Assimp-Build direkt in Visual Studi
 
 Im Scene-Fenster kann ein von Assimp unterstütztes Modell über seinen Dateipfad geladen werden. Ohne Datei startet die Anwendung mit einem prozeduralen Würfel, der durch meshoptimizer verarbeitet und als Meshlets gerendert wird.
 
+Nach einem erfolgreichen Dateiimport wird die Kamera automatisch auf die Welt-Bounds aller geladenen Instanzen ausgerichtet. Die Navigation funktioniert außerhalb der ImGui-Fenster mit linker Maustaste zum Orbitieren, mittlerer Maustaste zum Verschieben und dem Mausrad zum Zoomen. Über „Frame model“ im Renderer-Fenster lässt sich die automatische Einpassung erneut ausführen.
+
 Für einen automatisierten Start mit vorgewähltem OptiX-Backend kann vor dem Aufruf `VOR_BACKEND=optix` als Umgebungsvariable gesetzt werden. Im normalen Betrieb erfolgt der Wechsel über die Radio-Buttons im ImGui-Fenster „Renderer“.
 
 ## Tests

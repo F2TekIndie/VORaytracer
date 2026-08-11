@@ -26,6 +26,9 @@ private:
     void drawRenderPanel();
     void drawStatsPanel();
     void loadSceneFromUi();
+    void frameCameraToScene();
+    void handleCameraNavigation();
+    void resetCameraAccumulation();
 
     GLFWwindow* window_{};
     AssetLoader assetLoader_;
@@ -38,4 +41,3 @@ private:
     std::string statusMessage_{"Ready"};
 };
 } // namespace vor
-

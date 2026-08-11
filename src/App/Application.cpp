@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <limits>
 
 namespace vor
 {
@@ -36,6 +37,7 @@ int Application::run()
         vulkanRenderer_.resize(static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
         optixRenderer_.resize(static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
         vulkanRenderer_.beginUiFrame();
+        handleCameraNavigation();
         drawUi();
 
         if (settings_.backend != previousBackend_)
@@ -136,6 +138,7 @@ void Application::drawMainMenu()
         if (ImGui::MenuItem("Procedural cube"))
         {
             scene_ = assetLoader_.createProceduralCube();
+            frameCameraToScene();
             vulkanRenderer_.setScene(&scene_);
             optixRenderer_.setScene(&scene_);
             statusMessage_ = "Loaded procedural cube";
@@ -197,9 +200,17 @@ void Application::drawRenderPanel()
     ImGui::Checkbox("Meshlet debug colors", &settings_.showMeshlets);
 
     ImGui::SeparatorText("Camera");
-    ImGui::DragFloat3("Position", &scene_.camera.position.x, 0.02f);
-    ImGui::DragFloat3("Target", &scene_.camera.target.x, 0.02f);
-    ImGui::SliderFloat("Vertical FOV", &scene_.camera.verticalFovDegrees, 20.0f, 100.0f);
+    bool cameraChanged = ImGui::DragFloat3("Position", &scene_.camera.position.x, 0.02f);
+    cameraChanged |= ImGui::DragFloat3("Target", &scene_.camera.target.x, 0.02f);
+    cameraChanged |= ImGui::SliderFloat("Vertical FOV", &scene_.camera.verticalFovDegrees, 20.0f, 100.0f);
+    if (ImGui::Button("Frame model"))
+    {
+        frameCameraToScene();
+        cameraChanged = true;
+    }
+    ImGui::TextDisabled("LMB drag: orbit | MMB drag: pan | wheel: zoom");
+    if (cameraChanged)
+        resetCameraAccumulation();
     ImGui::End();
 }
 
@@ -235,8 +246,147 @@ void Application::loadSceneFromUi()
         return;
     }
     scene_ = std::move(result.scene);
+    frameCameraToScene();
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
-    statusMessage_ = "Loaded " + path.string();
+    statusMessage_ = "Loaded and framed " + path.string();
+}
+
+void Application::frameCameraToScene()
+{
+    Vec3 minimum{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                 std::numeric_limits<float>::max()};
+    Vec3 maximum{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
+                 std::numeric_limits<float>::lowest()};
+    bool hasPoint = false;
+
+    const auto includeMesh = [&](const Mesh& mesh, const Mat4& transform) {
+        for (const Vertex& vertex : mesh.vertices)
+        {
+            const Vec3& p = vertex.position;
+            const Vec3 world{
+                transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
+                transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
+                transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14],
+            };
+            minimum.x = std::min(minimum.x, world.x);
+            minimum.y = std::min(minimum.y, world.y);
+            minimum.z = std::min(minimum.z, world.z);
+            maximum.x = std::max(maximum.x, world.x);
+            maximum.y = std::max(maximum.y, world.y);
+            maximum.z = std::max(maximum.z, world.z);
+            hasPoint = true;
+        }
+    };
+
+    if (!scene_.instances.empty())
+    {
+        for (const Instance& instance : scene_.instances)
+        {
+            if (instance.meshIndex < scene_.meshes.size())
+                includeMesh(scene_.meshes[instance.meshIndex], instance.transform);
+        }
+    }
+    else
+    {
+        const Mat4 identity = Mat4::identity();
+        for (const Mesh& mesh : scene_.meshes)
+            includeMesh(mesh, identity);
+    }
+    if (!hasPoint)
+        return;
+
+    const Vec3 center = (minimum + maximum) * 0.5f;
+    float radius = length(maximum - minimum) * 0.5f;
+    radius = std::max(radius, 0.001f);
+
+    int framebufferWidth = 1;
+    int framebufferHeight = 1;
+    glfwGetFramebufferSize(window_, &framebufferWidth, &framebufferHeight);
+    const float aspect = static_cast<float>(std::max(framebufferWidth, 1)) /
+                         static_cast<float>(std::max(framebufferHeight, 1));
+    const float verticalFov = scene_.camera.verticalFovDegrees * kPi / 180.0f;
+    const float horizontalFov = 2.0f * std::atan(std::tan(verticalFov * 0.5f) * aspect);
+    const float fittingFov = std::min(verticalFov, horizontalFov);
+    const float distance = radius / std::max(std::sin(fittingFov * 0.5f), 0.01f) * 1.15f;
+
+    Vec3 viewDirection = normalize(scene_.camera.position - scene_.camera.target);
+    if (length(viewDirection) < 0.5f)
+        viewDirection = normalize(Vec3{0.65f, 0.35f, 1.0f});
+    scene_.camera.target = center;
+    scene_.camera.position = center + viewDirection * distance;
+    scene_.camera.nearPlane = std::max(radius * 0.001f, 0.0001f);
+    scene_.camera.farPlane = std::max(distance + radius * 4.0f, radius * 20.0f);
+    resetCameraAccumulation();
+}
+
+void Application::handleCameraNavigation()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse)
+        return;
+
+    Camera& camera = scene_.camera;
+    Vec3 offset = camera.position - camera.target;
+    float distance = length(offset);
+    if (distance <= 1e-6f)
+    {
+        offset = {0.0f, 0.0f, 1.0f};
+        distance = 1.0f;
+    }
+    bool changed = false;
+
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        (std::abs(io.MouseDelta.x) > 0.0f || std::abs(io.MouseDelta.y) > 0.0f))
+    {
+        float yaw = std::atan2(offset.x, offset.z);
+        float pitch = std::asin(std::clamp(offset.y / distance, -1.0f, 1.0f));
+        yaw -= io.MouseDelta.x * 0.005f;
+        pitch = std::clamp(pitch + io.MouseDelta.y * 0.005f, -1.5533f, 1.5533f);
+        const float horizontal = std::cos(pitch) * distance;
+        offset = {std::sin(yaw) * horizontal, std::sin(pitch) * distance, std::cos(yaw) * horizontal};
+        camera.position = camera.target + offset;
+        changed = true;
+    }
+
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) &&
+        (std::abs(io.MouseDelta.x) > 0.0f || std::abs(io.MouseDelta.y) > 0.0f))
+    {
+        const Vec3 forward = normalize(camera.target - camera.position);
+        const Vec3 right = normalize(cross(forward, camera.up));
+        const Vec3 correctedUp = normalize(cross(right, forward));
+        int width = 1;
+        int height = 1;
+        glfwGetFramebufferSize(window_, &width, &height);
+        const float worldPerPixel = 2.0f * distance *
+                                    std::tan(camera.verticalFovDegrees * kPi / 360.0f) /
+                                    static_cast<float>(std::max(height, 1));
+        const Vec3 translation = right * (-io.MouseDelta.x * worldPerPixel) +
+                                 correctedUp * (io.MouseDelta.y * worldPerPixel);
+        camera.position = camera.position + translation;
+        camera.target = camera.target + translation;
+        changed = true;
+    }
+
+    if (std::abs(io.MouseWheel) > 0.0f)
+    {
+        const float minimumDistance = std::max(camera.nearPlane * 2.0f, 0.0002f);
+        const float maximumDistance = std::max(camera.farPlane * 0.9f, minimumDistance * 2.0f);
+        distance = std::clamp(distance * std::exp(-io.MouseWheel * 0.16f), minimumDistance, maximumDistance);
+        Vec3 zoomDirection = normalize(camera.position - camera.target);
+        if (length(zoomDirection) < 0.5f)
+            zoomDirection = normalize(offset);
+        camera.position = camera.target + zoomDirection * distance;
+        changed = true;
+    }
+
+    if (changed)
+        resetCameraAccumulation();
+}
+
+void Application::resetCameraAccumulation()
+{
+    vulkanRenderer_.resetAccumulation();
+    optixRenderer_.resetAccumulation();
 }
 } // namespace vor
