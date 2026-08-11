@@ -75,6 +75,38 @@ int main()
         require(!imported.scene.materials.empty(), "imported material count");
     }
 
+    AssetLoadResult importedWithoutOptionalPasses = assetLoader.load(
+        projectRoot / "assets" / "SampleTriangle.obj",
+        {.enableOptionalMeshoptimizerPasses = false});
+    require(static_cast<bool>(importedWithoutOptionalPasses), "Assimp import without optional meshoptimizer passes");
+    if (importedWithoutOptionalPasses)
+    {
+        require(importedWithoutOptionalPasses.scene.meshletCount() == 1,
+                "mandatory meshlet generation when optional passes are disabled");
+        require(importedWithoutOptionalPasses.scene.meshes.front().lods.size() == 1,
+                "optional LOD generation disabled");
+        require(importedWithoutOptionalPasses.scene.meshes.front().lods.front().meshlets.front().boundingSphere.w == 0.0f,
+                "optional meshlet bounds disabled");
+    }
+
+    AssetLoadResult importedWithDefaultPlastic = assetLoader.load(
+        projectRoot / "assets" / "SampleTriangle.obj",
+        {.enableOptionalMeshoptimizerPasses = true, .overrideWithDefaultPlastic = true});
+    require(static_cast<bool>(importedWithDefaultPlastic), "Assimp import with default plastic override");
+    if (importedWithDefaultPlastic)
+    {
+        require(importedWithDefaultPlastic.scene.materials.size() == 1, "single default plastic material");
+        const Material& plastic = importedWithDefaultPlastic.scene.materials.front();
+        require(plastic.name == "Default Plastic", "default plastic name");
+        require(plastic.baseColor.x == 0.75f && plastic.baseColor.y == 0.75f && plastic.baseColor.z == 0.75f,
+                "default plastic light-gray albedo");
+        require(plastic.metallic == 0.0f, "default plastic metallic");
+        require(plastic.roughness == 0.5f, "default plastic roughness");
+        require(importedWithDefaultPlastic.scene.textures.empty(), "default plastic removes imported textures");
+        for (const Mesh& importedMesh : importedWithDefaultPlastic.scene.meshes)
+            require(importedMesh.materialIndex == 0, "default plastic assigned to every mesh");
+    }
+
     const std::filesystem::path fbxPath = projectRoot / "assets" / "SampleObject.fbx";
     if (std::filesystem::exists(fbxPath))
     {

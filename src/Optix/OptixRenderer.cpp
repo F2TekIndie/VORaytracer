@@ -53,6 +53,28 @@ std::string readTextFile(const std::filesystem::path& path)
         throw std::runtime_error("Cannot open OptiX PTX: " + path.string());
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
+
+Vec3 transformNormal(const Mat4& transform, Vec3 normal)
+{
+    const float a00 = transform.m[0], a01 = transform.m[4], a02 = transform.m[8];
+    const float a10 = transform.m[1], a11 = transform.m[5], a12 = transform.m[9];
+    const float a20 = transform.m[2], a21 = transform.m[6], a22 = transform.m[10];
+    const float c00 = a11 * a22 - a12 * a21;
+    const float c01 = a12 * a20 - a10 * a22;
+    const float c02 = a10 * a21 - a11 * a20;
+    const float c10 = a02 * a21 - a01 * a22;
+    const float c11 = a00 * a22 - a02 * a20;
+    const float c12 = a01 * a20 - a00 * a21;
+    const float c20 = a01 * a12 - a02 * a11;
+    const float c21 = a02 * a10 - a00 * a12;
+    const float c22 = a00 * a11 - a01 * a10;
+    const float determinant = a00 * c00 + a01 * c01 + a02 * c02;
+    if (std::abs(determinant) < 1e-8f)
+        return normalize(normal);
+    return normalize({(c00 * normal.x + c01 * normal.y + c02 * normal.z) / determinant,
+                      (c10 * normal.x + c11 * normal.y + c12 * normal.z) / determinant,
+                      (c20 * normal.x + c21 * normal.y + c22 * normal.z) / determinant});
+}
 } // namespace
 
 OptixRenderer::~OptixRenderer()
@@ -227,7 +249,9 @@ bool OptixRenderer::buildSceneAcceleration()
             throw std::runtime_error("Scene contains no geometry for OptiX");
 
         std::vector<Vec3> positions;
+        std::vector<Vec3> normals;
         std::vector<std::uint32_t> indices;
+        std::vector<std::uint32_t> triangleMaterialIndices;
         const auto appendInstance = [&](const Mesh& mesh, const Mat4& transform) {
             if (mesh.vertices.empty() || mesh.lods.empty() || mesh.lods.front().indices.empty())
                 return;
@@ -238,9 +262,13 @@ bool OptixRenderer::buildSceneAcceleration()
                 positions.push_back({transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
                                      transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
                                      transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14]});
+                normals.push_back(transformNormal(transform, vertex.normal));
             }
             for (std::uint32_t index : mesh.lods.front().indices)
                 indices.push_back(vertexBase + index);
+            const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
+            triangleMaterialIndices.insert(triangleMaterialIndices.end(), mesh.lods.front().indices.size() / 3,
+                                           materialIndex);
         };
         if (!scene_->instances.empty())
         {
@@ -260,11 +288,42 @@ bool OptixRenderer::buildSceneAcceleration()
             throw std::runtime_error("Scene contains no indexed triangles for OptiX");
 
         const std::size_t vertexBytes = positions.size() * sizeof(Vec3);
+        const std::size_t normalBytes = normals.size() * sizeof(Vec3);
         const std::size_t indexBytes = indices.size() * sizeof(std::uint32_t);
+        const std::size_t triangleMaterialBytes = triangleMaterialIndices.size() * sizeof(std::uint32_t);
+        struct alignas(16) GpuMaterial
+        {
+            Vec4 baseColorAndMetallic;
+            Vec4 emissiveAndRoughness;
+        };
+        std::vector<GpuMaterial> materials;
+        materials.reserve(std::max<std::size_t>(scene_->materials.size(), 1));
+        if (scene_->materials.empty())
+            materials.push_back({{1.0f, 1.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f}});
+        else
+        {
+            for (const Material& material : scene_->materials)
+            {
+                materials.push_back({{material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
+                                     {material.emissive.x, material.emissive.y, material.emissive.z, material.roughness}});
+            }
+        }
+        const std::size_t materialBytes = materials.size() * sizeof(GpuMaterial);
         checkCuda(cuMemAlloc(&vertexBuffer_, vertexBytes), "cuMemAlloc(OptiX vertices)");
+        checkCuda(cuMemAlloc(&normalBuffer_, normalBytes), "cuMemAlloc(OptiX normals)");
         checkCuda(cuMemAlloc(&indexBuffer_, indexBytes), "cuMemAlloc(OptiX indices)");
+        checkCuda(cuMemAlloc(&triangleMaterialIndexBuffer_, triangleMaterialBytes),
+                  "cuMemAlloc(OptiX triangle materials)");
+        checkCuda(cuMemAlloc(&materialBuffer_, materialBytes), "cuMemAlloc(OptiX materials)");
         checkCuda(cuMemcpyHtoD(vertexBuffer_, positions.data(), vertexBytes), "cuMemcpyHtoD(OptiX vertices)");
+        checkCuda(cuMemcpyHtoD(normalBuffer_, normals.data(), normalBytes), "cuMemcpyHtoD(OptiX normals)");
         checkCuda(cuMemcpyHtoD(indexBuffer_, indices.data(), indexBytes), "cuMemcpyHtoD(OptiX indices)");
+        checkCuda(cuMemcpyHtoD(triangleMaterialIndexBuffer_, triangleMaterialIndices.data(), triangleMaterialBytes),
+                  "cuMemcpyHtoD(OptiX triangle materials)");
+        checkCuda(cuMemcpyHtoD(materialBuffer_, materials.data(), materialBytes), "cuMemcpyHtoD(OptiX materials)");
+        vertexCount_ = positions.size();
+        triangleCount_ = indices.size() / 3;
+        materialCount_ = materials.size();
 
         const std::uint32_t geometryFlags = OPTIX_GEOMETRY_FLAG_NONE;
         CUdeviceptr vertexBuffers[] = {vertexBuffer_};
@@ -315,11 +374,23 @@ void OptixRenderer::destroySceneAcceleration()
         cuMemFree(gasBuffer_);
     if (indexBuffer_)
         cuMemFree(indexBuffer_);
+    if (materialBuffer_)
+        cuMemFree(materialBuffer_);
+    if (triangleMaterialIndexBuffer_)
+        cuMemFree(triangleMaterialIndexBuffer_);
+    if (normalBuffer_)
+        cuMemFree(normalBuffer_);
     if (vertexBuffer_)
         cuMemFree(vertexBuffer_);
     gasBuffer_ = 0;
     indexBuffer_ = 0;
+    materialBuffer_ = 0;
+    triangleMaterialIndexBuffer_ = 0;
+    normalBuffer_ = 0;
     vertexBuffer_ = 0;
+    vertexCount_ = 0;
+    triangleCount_ = 0;
+    materialCount_ = 0;
     gasHandle_ = 0;
 }
 
@@ -339,7 +410,8 @@ bool OptixRenderer::createPipeline()
         OptixPipelineCompileOptions pipelineOptions{};
         pipelineOptions.usesMotionBlur = false;
         pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-        pipelineOptions.numPayloadValues = 8;
+        // Slang lowers the payload struct to six OptiX registers because float2 keeps its CUDA alignment.
+        pipelineOptions.numPayloadValues = 6;
         pipelineOptions.numAttributeValues = 2;
         pipelineOptions.exceptionFlags = VOR_DEBUG ? OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW : OPTIX_EXCEPTION_FLAG_NONE;
         pipelineOptions.pipelineLaunchParamsVariableName = nullptr;
@@ -404,7 +476,7 @@ bool OptixRenderer::createPipeline()
         checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 1),
                    "optixPipelineSetStackSize");
 
-        checkCuda(cuMemAlloc(&raygenRecord_, 160), "cuMemAlloc(raygen SBT)");
+        checkCuda(cuMemAlloc(&raygenRecord_, 192), "cuMemAlloc(raygen SBT)");
         checkCuda(cuMemAlloc(&missRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(miss SBT)");
         checkCuda(cuMemAlloc(&hitRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(hit SBT)");
         return true;
@@ -455,6 +527,10 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
     struct LaunchParameters
     {
         SlangStructuredBuffer output;
+        SlangStructuredBuffer normals;
+        SlangStructuredBuffer indices;
+        SlangStructuredBuffer triangleMaterialIndices;
+        SlangStructuredBuffer materials;
         OptixTraversableHandle scene;
         std::uint32_t width;
         std::uint32_t height;
@@ -465,9 +541,6 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         Vec4 cameraPositionAndFov;
         Vec4 cameraTargetAndAspect;
         Vec4 cameraUp;
-        Vec4 baseColorAndMetallic;
-        float roughness{};
-        float materialPadding[3]{};
     };
     struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) RaygenRecord
     {
@@ -478,8 +551,8 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
     {
         std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
     };
-    static_assert(sizeof(LaunchParameters) == 128);
-    static_assert(sizeof(RaygenRecord) == 160);
+    static_assert(sizeof(LaunchParameters) == 160);
+    static_assert(sizeof(RaygenRecord) == 192);
     static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 
     try
@@ -487,6 +560,10 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         RaygenRecord record{};
         checkOptix(optixSbtRecordPackHeader(raygenProgramGroup_, &record), "optixSbtRecordPackHeader");
         record.parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
+        record.parameters.normals = {normalBuffer_, vertexCount_};
+        record.parameters.indices = {indexBuffer_, triangleCount_};
+        record.parameters.triangleMaterialIndices = {triangleMaterialIndexBuffer_, triangleCount_};
+        record.parameters.materials = {materialBuffer_, materialCount_};
         record.parameters.scene = gasHandle_;
         record.parameters.width = width_;
         record.parameters.height = height_;
@@ -499,12 +576,6 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         record.parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
                                                    static_cast<float>(width_) / static_cast<float>(std::max(height_, 1u))};
         record.parameters.cameraUp = {camera.up.x, camera.up.y, camera.up.z, 0.0f};
-        Material material{};
-        if (scene_ && !scene_->meshes.empty() && scene_->meshes.front().materialIndex < scene_->materials.size())
-            material = scene_->materials[scene_->meshes.front().materialIndex];
-        record.parameters.baseColorAndMetallic = {material.baseColor.x, material.baseColor.y, material.baseColor.z,
-                                                  material.metallic};
-        record.parameters.roughness = material.roughness;
 
         EmptyRecord missRecord{};
         EmptyRecord hitRecord{};

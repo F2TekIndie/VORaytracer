@@ -58,7 +58,13 @@ private:
     CUdeviceptr missRecord_{};
     CUdeviceptr hitRecord_{};
     CUdeviceptr vertexBuffer_{};
+    CUdeviceptr normalBuffer_{};
     CUdeviceptr indexBuffer_{};
+    CUdeviceptr triangleMaterialIndexBuffer_{};
+    CUdeviceptr materialBuffer_{};
+    std::size_t vertexCount_{};
+    std::size_t triangleCount_{};
+    std::size_t materialCount_{};
     CUdeviceptr gasBuffer_{};
     OptixTraversableHandle gasHandle_{};
     std::vector<float> hostOutput_;

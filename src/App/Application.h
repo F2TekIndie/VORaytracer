@@ -26,6 +26,7 @@ private:
     void drawRenderPanel();
     void drawStatsPanel();
     void loadSceneFromUi();
+    bool reloadCurrentScene();
     void frameCameraToScene();
     void handleCameraNavigation();
     void resetCameraAccumulation();
@@ -39,5 +40,7 @@ private:
     BackendKind previousBackend_{BackendKind::VulkanHybrid};
     std::array<char, 1024> assetPath_{};
     std::string statusMessage_{"Ready"};
+    bool meshoptimizerEnabled_{true};
+    bool defaultPlasticEnabled_{false};
 };
 } // namespace vor

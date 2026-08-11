@@ -35,6 +35,16 @@ Vec4 toColor(const aiColor4D& color)
     return {color.r, color.g, color.b, color.a};
 }
 
+Material makeDefaultPlasticMaterial()
+{
+    Material material{};
+    material.name = "Default Plastic";
+    material.baseColor = {0.75f, 0.75f, 0.75f, 1.0f};
+    material.metallic = 0.0f;
+    material.roughness = 0.5f;
+    return material;
+}
+
 std::int32_t addTexture(Scene& scene, const std::filesystem::path& basePath, aiMaterial* material, aiTextureType type, bool srgb)
 {
     aiString texturePath;
@@ -56,7 +66,7 @@ std::int32_t addTexture(Scene& scene, const std::filesystem::path& basePath, aiM
 }
 } // namespace
 
-AssetLoadResult AssetLoader::load(const std::filesystem::path& path) const
+AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOptions options) const
 {
     Assimp::Importer importer;
     const unsigned flags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_ImproveCacheLocality |
@@ -113,6 +123,12 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path) const
         material.emissiveTexture = addTexture(scene, basePath, source, aiTextureType_EMISSIVE, true);
         scene.materials.push_back(std::move(material));
     }
+    if (options.overrideWithDefaultPlastic)
+    {
+        scene.materials.clear();
+        scene.materials.push_back(makeDefaultPlasticMaterial());
+        scene.textures.clear();
+    }
 
     scene.meshes.reserve(imported->mNumMeshes);
     for (unsigned meshIndex = 0; meshIndex < imported->mNumMeshes; ++meshIndex)
@@ -120,7 +136,7 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path) const
         const aiMesh* source = imported->mMeshes[meshIndex];
         Mesh mesh{};
         mesh.name = source->mName.C_Str();
-        mesh.materialIndex = source->mMaterialIndex;
+        mesh.materialIndex = options.overrideWithDefaultPlastic ? 0u : source->mMaterialIndex;
         mesh.vertices.resize(source->mNumVertices);
         for (unsigned vertexIndex = 0; vertexIndex < source->mNumVertices; ++vertexIndex)
         {
@@ -153,7 +169,7 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path) const
                 baseLod.indices.insert(baseLod.indices.end(), face.mIndices, face.mIndices + 3);
         }
         mesh.lods.push_back(std::move(baseLod));
-        optimizeMesh(mesh);
+        processMesh(mesh, options.enableOptionalMeshoptimizerPasses);
         scene.meshes.push_back(std::move(mesh));
     }
 
@@ -176,9 +192,15 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path) const
     return {.scene = std::move(scene)};
 }
 
-Scene AssetLoader::createProceduralCube() const
+Scene AssetLoader::createProceduralCube(AssetLoadOptions options) const
 {
     Scene scene = makeDefaultScene();
+    if (options.overrideWithDefaultPlastic)
+    {
+        scene.materials.clear();
+        scene.materials.push_back(makeDefaultPlasticMaterial());
+        scene.textures.clear();
+    }
     Mesh mesh{};
     mesh.name = "Cube";
     mesh.materialIndex = 0;
@@ -197,34 +219,37 @@ Scene AssetLoader::createProceduralCube() const
         0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
     };
     mesh.lods.push_back(std::move(lod));
-    optimizeMesh(mesh);
+    processMesh(mesh, options.enableOptionalMeshoptimizerPasses);
     scene.meshes.push_back(std::move(mesh));
     scene.instances.push_back({"Cube", 0, Mat4::identity(), Mat4::identity()});
     return scene;
 }
 
-void AssetLoader::optimizeMesh(Mesh& mesh)
+void AssetLoader::processMesh(Mesh& mesh, bool enableOptionalPasses)
 {
     if (mesh.vertices.empty() || mesh.lods.empty() || mesh.lods.front().indices.empty())
         return;
 
     MeshLod& base = mesh.lods.front();
-    std::vector<unsigned int> remap(mesh.vertices.size());
-    const std::size_t uniqueVertices = meshopt_generateVertexRemap(
-        remap.data(), base.indices.data(), base.indices.size(), mesh.vertices.data(), mesh.vertices.size(), sizeof(Vertex));
+    if (enableOptionalPasses)
+    {
+        std::vector<unsigned int> remap(mesh.vertices.size());
+        const std::size_t uniqueVertices = meshopt_generateVertexRemap(
+            remap.data(), base.indices.data(), base.indices.size(), mesh.vertices.data(), mesh.vertices.size(), sizeof(Vertex));
 
-    std::vector<Vertex> remappedVertices(uniqueVertices);
-    std::vector<std::uint32_t> remappedIndices(base.indices.size());
-    meshopt_remapVertexBuffer(remappedVertices.data(), mesh.vertices.data(), mesh.vertices.size(), sizeof(Vertex), remap.data());
-    meshopt_remapIndexBuffer(remappedIndices.data(), base.indices.data(), base.indices.size(), remap.data());
-    mesh.vertices = std::move(remappedVertices);
-    base.indices = std::move(remappedIndices);
+        std::vector<Vertex> remappedVertices(uniqueVertices);
+        std::vector<std::uint32_t> remappedIndices(base.indices.size());
+        meshopt_remapVertexBuffer(remappedVertices.data(), mesh.vertices.data(), mesh.vertices.size(), sizeof(Vertex), remap.data());
+        meshopt_remapIndexBuffer(remappedIndices.data(), base.indices.data(), base.indices.size(), remap.data());
+        mesh.vertices = std::move(remappedVertices);
+        base.indices = std::move(remappedIndices);
 
-    meshopt_optimizeVertexCache(base.indices.data(), base.indices.data(), base.indices.size(), mesh.vertices.size());
-    meshopt_optimizeOverdraw(base.indices.data(), base.indices.data(), base.indices.size(), &mesh.vertices[0].position.x,
-                             mesh.vertices.size(), sizeof(Vertex), 1.05f);
-    meshopt_optimizeVertexFetch(mesh.vertices.data(), base.indices.data(), base.indices.size(), mesh.vertices.data(),
-                                mesh.vertices.size(), sizeof(Vertex));
+        meshopt_optimizeVertexCache(base.indices.data(), base.indices.data(), base.indices.size(), mesh.vertices.size());
+        meshopt_optimizeOverdraw(base.indices.data(), base.indices.data(), base.indices.size(), &mesh.vertices[0].position.x,
+                                 mesh.vertices.size(), sizeof(Vertex), 1.05f);
+        meshopt_optimizeVertexFetch(mesh.vertices.data(), base.indices.data(), base.indices.size(), mesh.vertices.data(),
+                                    mesh.vertices.size(), sizeof(Vertex));
+    }
 
     constexpr std::size_t kMaxVertices = 64;
     constexpr std::size_t kMaxTriangles = 124;
@@ -239,16 +264,20 @@ void AssetLoader::optimizeMesh(Mesh& mesh)
     base.meshlets.reserve(meshletCount);
     for (const meshopt_Meshlet& native : nativeMeshlets)
     {
-        const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
-            base.meshletVertices.data() + native.vertex_offset,
-            base.meshletTriangles.data() + native.triangle_offset,
-            native.triangle_count, &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex));
-        base.meshlets.push_back({native.vertex_offset, native.triangle_offset, native.vertex_count, native.triangle_count,
-                                 {bounds.center[0], bounds.center[1], bounds.center[2], bounds.radius},
-                                 {static_cast<float>(bounds.cone_axis_s8[0]) / 127.0f,
+        Meshlet meshlet{native.vertex_offset, native.triangle_offset, native.vertex_count, native.triangle_count};
+        if (enableOptionalPasses)
+        {
+            const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
+                base.meshletVertices.data() + native.vertex_offset,
+                base.meshletTriangles.data() + native.triangle_offset,
+                native.triangle_count, &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex));
+            meshlet.boundingSphere = {bounds.center[0], bounds.center[1], bounds.center[2], bounds.radius};
+            meshlet.normalCone = {static_cast<float>(bounds.cone_axis_s8[0]) / 127.0f,
                                   static_cast<float>(bounds.cone_axis_s8[1]) / 127.0f,
                                   static_cast<float>(bounds.cone_axis_s8[2]) / 127.0f,
-                                  static_cast<float>(bounds.cone_cutoff_s8) / 127.0f}});
+                                  static_cast<float>(bounds.cone_cutoff_s8) / 127.0f};
+        }
+        base.meshlets.push_back(meshlet);
     }
 
     if (!nativeMeshlets.empty())
@@ -257,6 +286,9 @@ void AssetLoader::optimizeMesh(Mesh& mesh)
         base.meshletVertices.resize(last.vertex_offset + last.vertex_count);
         base.meshletTriangles.resize(last.triangle_offset + ((last.triangle_count * 3 + 3) & ~3u));
     }
+
+    if (!enableOptionalPasses)
+        return;
 
     constexpr std::array<float, 2> lodRatios{0.5f, 0.25f};
     const std::vector<std::uint32_t> sourceIndices = base.indices;

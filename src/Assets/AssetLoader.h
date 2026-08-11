@@ -15,14 +15,19 @@ struct AssetLoadResult
     [[nodiscard]] explicit operator bool() const { return error.empty(); }
 };
 
+struct AssetLoadOptions
+{
+    bool enableOptionalMeshoptimizerPasses{true};
+    bool overrideWithDefaultPlastic{false};
+};
+
 class AssetLoader
 {
 public:
-    AssetLoadResult load(const std::filesystem::path& path) const;
-    Scene createProceduralCube() const;
+    AssetLoadResult load(const std::filesystem::path& path, AssetLoadOptions options = {}) const;
+    Scene createProceduralCube(AssetLoadOptions options = {}) const;
 
 private:
-    static void optimizeMesh(Mesh& mesh);
+    static void processMesh(Mesh& mesh, bool enableOptionalPasses);
 };
 } // namespace vor
-

@@ -98,10 +98,14 @@ bool Application::initialize()
         previousBackend_ = BackendKind::Optix;
     }
 
-    scene_ = assetLoader_.createProceduralCube();
+    const AssetLoadOptions loadOptions{
+        .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
+        .overrideWithDefaultPlastic = defaultPlasticEnabled_,
+    };
+    scene_ = assetLoader_.createProceduralCube(loadOptions);
     if (const char* startupScene = std::getenv("VOR_SCENE"); startupScene && *startupScene)
     {
-        AssetLoadResult result = assetLoader_.load(std::filesystem::path(startupScene));
+        AssetLoadResult result = assetLoader_.load(std::filesystem::path(startupScene), loadOptions);
         if (result)
         {
             scene_ = std::move(result.scene);
@@ -149,7 +153,9 @@ void Application::drawMainMenu()
             loadSceneFromUi();
         if (ImGui::MenuItem("Procedural cube"))
         {
-            scene_ = assetLoader_.createProceduralCube();
+            scene_ = assetLoader_.createProceduralCube(
+                {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
+                 .overrideWithDefaultPlastic = defaultPlasticEnabled_});
             frameCameraToScene();
             vulkanRenderer_.setScene(&scene_);
             optixRenderer_.setScene(&scene_);
@@ -176,6 +182,41 @@ void Application::drawScenePanel()
     ImGui::Text("Materials: %zu", scene_.materials.size());
     ImGui::Text("Triangles: %zu", scene_.triangleCount());
     ImGui::Text("Meshlets: %zu", scene_.meshletCount());
+    const bool previousMeshoptimizerState = meshoptimizerEnabled_;
+    const ImVec4 toggleColor = meshoptimizerEnabled_ ? ImVec4(0.16f, 0.52f, 0.24f, 1.0f)
+                                                      : ImVec4(0.42f, 0.18f, 0.18f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, toggleColor);
+    if (ImGui::Button(meshoptimizerEnabled_ ? "meshoptimizer: ON" : "meshoptimizer: OFF", ImVec2(210.0f, 0.0f)))
+    {
+        meshoptimizerEnabled_ = !meshoptimizerEnabled_;
+        if (!reloadCurrentScene())
+            meshoptimizerEnabled_ = previousMeshoptimizerState;
+    }
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Always active: meshlet partitioning required by the mesh shader.\n"
+                          "Toggle controls remap, cache, overdraw, vertex fetch, bounds and LOD simplification.\n"
+                          "Changing it reloads the current model.");
+    }
+    const bool previousDefaultPlasticState = defaultPlasticEnabled_;
+    const ImVec4 plasticToggleColor = defaultPlasticEnabled_ ? ImVec4(0.16f, 0.52f, 0.24f, 1.0f)
+                                                              : ImVec4(0.42f, 0.18f, 0.18f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, plasticToggleColor);
+    if (ImGui::Button(defaultPlasticEnabled_ ? "Default plastic: ON" : "Default plastic: OFF",
+                      ImVec2(210.0f, 0.0f)))
+    {
+        defaultPlasticEnabled_ = !defaultPlasticEnabled_;
+        if (!reloadCurrentScene())
+            defaultPlasticEnabled_ = previousDefaultPlasticState;
+    }
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Overrides every loaded mesh with one light-gray plastic material.\n"
+                          "Albedo: 0.75 | Metallic: 0.0 | Roughness: 0.5\n"
+                          "Changing it reloads the current model.");
+    }
     if (ImGui::TreeNode("Instances"))
     {
         for (const Instance& instance : scene_.instances)
@@ -251,7 +292,9 @@ void Application::loadSceneFromUi()
         statusMessage_ = "Enter an asset path first";
         return;
     }
-    AssetLoadResult result = assetLoader_.load(path);
+    AssetLoadResult result = assetLoader_.load(
+        path, {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
+               .overrideWithDefaultPlastic = defaultPlasticEnabled_});
     if (!result)
     {
         statusMessage_ = "Import failed: " + result.error;
@@ -262,6 +305,35 @@ void Application::loadSceneFromUi()
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     statusMessage_ = "Loaded and framed " + path.string();
+}
+
+bool Application::reloadCurrentScene()
+{
+    Scene reloadedScene;
+    const AssetLoadOptions options{
+        .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
+        .overrideWithDefaultPlastic = defaultPlasticEnabled_,
+    };
+    if (scene_.sourcePath.empty())
+        reloadedScene = assetLoader_.createProceduralCube(options);
+    else
+    {
+        AssetLoadResult result = assetLoader_.load(scene_.sourcePath, options);
+        if (!result)
+        {
+            statusMessage_ = "Reload failed: " + result.error;
+            return false;
+        }
+        reloadedScene = std::move(result.scene);
+    }
+
+    scene_ = std::move(reloadedScene);
+    frameCameraToScene();
+    vulkanRenderer_.setScene(&scene_);
+    optixRenderer_.setScene(&scene_);
+    statusMessage_ = std::string("Reloaded: meshoptimizer ") + (meshoptimizerEnabled_ ? "ON" : "OFF") +
+                     ", default plastic " + (defaultPlasticEnabled_ ? "ON" : "OFF");
+    return true;
 }
 
 void Application::frameCameraToScene()

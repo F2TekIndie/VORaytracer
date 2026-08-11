@@ -4,7 +4,7 @@
 
 Der ausführbare vertikale Schnitt ist erstellt und in Debug sowie Release getestet. Umgesetzt sind Visual-Studio-/C++20-Projekte, Assimp-Import, meshoptimizer-LODs/Meshlets, Vulkan-Meshshader, Metallic-Roughness-PBR, Vulkan-BLAS/TLAS mit aktivem Ray-Query-Schatten, ImGui sowie ein umschaltbares OptiX-Backend mit Slang-PTX, Triangle-GAS, SBT, Raygen/Miss/Closest-Hit, progressiver Abtastung und sichtbarer Ausgabe im Vulkan-Fenster.
 
-Der aktuelle Schnitt verarbeitet alle Mesh-Instanzen mit ihren Node-Transformationen und Basis-LODs als zusammengeführte Weltgeometrie. Als weiterer Produktionsausbau bleiben insbesondere separate GPU-IAS-Instanzen, OptiX-Materialzuordnung pro Hit, Textur-Residency, vollständige Reflexions-/GI-Pässe, rekursive OptiX-Bounces, Denoising und GPU-direktes Vulkan/CUDA-External-Memory-Interop offen. Die folgenden Abschnitte beschreiben weiterhin das vollständige Zielbild.
+Der aktuelle Schnitt verarbeitet alle Mesh-Instanzen mit ihren Node-Transformationen und Basis-LODs als zusammengeführte Weltgeometrie. OptiX löst pro getroffenem Dreieck die Material-ID auf und interpoliert transformierte Vertexnormalen. Als weiterer Produktionsausbau bleiben insbesondere separate GPU-IAS-Instanzen, Textur-Residency, vollständige Reflexions-/GI-Pässe, rekursive OptiX-Bounces, Denoising und GPU-direktes Vulkan/CUDA-External-Memory-Interop offen. Die folgenden Abschnitte beschreiben weiterhin das vollständige Zielbild.
 
 ## 1. Ziel
 

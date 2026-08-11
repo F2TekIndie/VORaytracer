@@ -2,15 +2,24 @@ import Pbr;
 
 struct RadiancePayload
 {
-    float3 color;
-    float3 baseColor;
-    float metallic;
-    float roughness;
+    uint primitiveIndex;
+    float2 barycentrics;
+    uint hit;
+};
+
+struct GpuMaterial
+{
+    float4 baseColorAndMetallic;
+    float4 emissiveAndRoughness;
 };
 
 struct LaunchParameters
 {
     RWStructuredBuffer<float4> output;
+    StructuredBuffer<float3> normals;
+    StructuredBuffer<uint3> indices;
+    StructuredBuffer<uint> triangleMaterialIndices;
+    StructuredBuffer<GpuMaterial> materials;
     RaytracingAccelerationStructure scene;
     uint2 outputSize;
     uint frameIndex;
@@ -20,9 +29,6 @@ struct LaunchParameters
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
-    float4 baseColorAndMetallic;
-    float roughness;
-    float3 materialPadding;
 };
 
 float random01(uint value)
@@ -65,12 +71,39 @@ void RayGen(LaunchParameters parameters)
         ray.TMax = 10000.0;
 
         RadiancePayload payload;
-        payload.color = float3(0.0);
-        payload.baseColor = parameters.baseColorAndMetallic.xyz;
-        payload.metallic = parameters.baseColorAndMetallic.w;
-        payload.roughness = parameters.roughness;
+        payload.primitiveIndex = 0;
+        payload.barycentrics = float2(0.0);
+        payload.hit = 0;
         TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
-        sampleSum += payload.color;
+        if (payload.hit != 0)
+        {
+            uint3 triangle = parameters.indices[payload.primitiveIndex];
+            float barycentric0 = 1.0 - payload.barycentrics.x - payload.barycentrics.y;
+            float3 normal = normalize(parameters.normals[triangle.x] * barycentric0 +
+                                      parameters.normals[triangle.y] * payload.barycentrics.x +
+                                      parameters.normals[triangle.z] * payload.barycentrics.y);
+            float3 viewDirection = normalize(-ray.Direction);
+            if (dot(normal, viewDirection) < 0.0)
+                normal = -normal;
+
+            uint materialIndex = parameters.triangleMaterialIndices[payload.primitiveIndex];
+            GpuMaterial material = parameters.materials[materialIndex];
+            float3 lightDirection = normalize(float3(-0.45, 0.85, 0.3));
+            float3 radiance = float3(5.0, 4.8, 4.4);
+            float3 direct = evaluateMetallicRoughness(material.baseColorAndMetallic.xyz,
+                                                      material.baseColorAndMetallic.w,
+                                                      material.emissiveAndRoughness.w,
+                                                      normal,
+                                                      viewDirection,
+                                                      lightDirection,
+                                                      radiance);
+            sampleSum += direct + material.baseColorAndMetallic.xyz * 0.025 + material.emissiveAndRoughness.xyz;
+        }
+        else
+        {
+            float skyFactor = saturate(ray.Direction.y * 0.5 + 0.5);
+            sampleSum += lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
+        }
     }
 
     float3 current = sampleSum / float(sampleCount);
@@ -86,30 +119,14 @@ void RayGen(LaunchParameters parameters)
 [shader("miss")]
 void Miss(inout RadiancePayload payload)
 {
-    float3 direction = normalize(WorldRayDirection());
-    float skyFactor = saturate(direction.y * 0.5 + 0.5);
-    payload.color = lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
+    payload.hit = 0;
 }
 
 [shader("closesthit")]
 void ClosestHit(inout RadiancePayload payload,
                 BuiltInTriangleIntersectionAttributes attributes)
 {
-    float3 viewDirection = normalize(-WorldRayDirection());
-    float3 barycentric = float3(attributes.barycentrics,
-                                1.0 - attributes.barycentrics.x - attributes.barycentrics.y);
-    float3 normal = normalize(barycentric * 2.0 - 1.0);
-    if (dot(normal, viewDirection) < 0.0)
-        normal = -normal;
-
-    float3 lightDirection = normalize(float3(-0.45, 0.85, 0.3));
-    float3 radiance = float3(5.0, 4.8, 4.4);
-    float3 direct = evaluateMetallicRoughness(payload.baseColor,
-                                              payload.metallic,
-                                              payload.roughness,
-                                              normal,
-                                              viewDirection,
-                                              lightDirection,
-                                              radiance);
-    payload.color = direct + payload.baseColor * 0.025;
+    payload.primitiveIndex = PrimitiveIndex();
+    payload.barycentrics = attributes.barycentrics;
+    payload.hit = 1;
 }

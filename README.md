@@ -17,13 +17,14 @@ Der ausführliche technische Plan steht in [IMPLEMENTIERUNGSPLAN.md](IMPLEMENTIE
 - Slang-zu-SPIR-V-Build für Mesh-, PBR-/Ray-Query-Fragment-, Compute-Ray-Query- und Tone-Mapping-Shader
 - Slang-zu-PTX-Build mit OptiX-Raygen-, Miss- und Closest-Hit-Programmen
 - OptiX-Triangle-GAS, SBT, progressiver Multi-Sample-Launch und gemeinsamer Metallic-Roughness-BRDF
+- OptiX-Materialtabellen pro Dreieck mit baryzentrisch interpolierten, korrekt transformierten Vertexnormalen
 - sichtbare OptiX-Ausgabe im Vulkan-Swapchain-Bild mit ImGui-Overlay
 - UI-Schalter zwischen Vulkan und OptiX sowie Kamera-/PBR-/Raytracing-Parameter
 - CPU-/Asset-Tests für Mat4, Scene-Statistiken, meshoptimizer und echten Assimp-Import
 
 Der aktuelle vertikale Schnitt führt alle geladenen Mesh-Instanzen mit ihren Node-Transformationen zu einer GPU-Szene zusammen. Vulkan rendert deren Basis-LODs samt Materialdaten als Meshlets und baut dafür BLAS/TLAS. OptiX baut aus derselben vollständigen Geometrie ein GAS und führt echte Primärstrahlen mit direkter PBR-Beleuchtung aus. Die OptiX-Ausgabe wird zurzeit zur einfachen Diagnose über CUDA→CPU→Vulkan kopiert.
 
-Noch nicht als Produktionsausbau umgesetzt sind separate GPU-IAS-Instanzen statt zusammengeführter Weltgeometrie, OptiX-Materialzuordnung pro Hit, GPU-Textur-Uploads, rekursive OptiX-Bounces, Reflexions-/GI-Ray-Queries, Denoising sowie Vulkan/CUDA External-Memory- und Semaphore-Interop. Diese Punkte bleiben im Implementierungsplan als nächste Ausbaustufen erhalten.
+Noch nicht als Produktionsausbau umgesetzt sind separate GPU-IAS-Instanzen statt zusammengeführter Weltgeometrie, GPU-Textur-Uploads, rekursive OptiX-Bounces, Reflexions-/GI-Ray-Queries, Denoising sowie Vulkan/CUDA External-Memory- und Semaphore-Interop. Diese Punkte bleiben im Implementierungsplan als nächste Ausbaustufen erhalten.
 
 Der installierte Slang-Compiler 2026.14.1 kompiliert Mesh-Shader korrekt, hängt aber reproduzierbar bei einem Amplification-/Task-Shader mit `out payload`. Deshalb verwendet der aktuelle lauffähige Pfad eine zulässige Mesh-Shader-Pipeline ohne die optionale Task-Stufe. Die isolierte Task-Shader-Quelle liegt unter `shaders/Vulkan/MeshletTask.slang`.
 
@@ -59,6 +60,10 @@ Alternativ kann die Solution nach dem ersten Assimp-Build direkt in Visual Studi
 Im Scene-Fenster kann ein von Assimp unterstütztes Modell über seinen Dateipfad geladen werden. Ohne Datei startet die Anwendung mit einem prozeduralen Würfel, der durch meshoptimizer verarbeitet und als Meshlets gerendert wird.
 
 Nach einem erfolgreichen Dateiimport wird die Kamera automatisch auf die Welt-Bounds aller geladenen Instanzen ausgerichtet. Die Navigation funktioniert außerhalb der ImGui-Fenster mit linker Maustaste zum Orbitieren, mittlerer Maustaste zum Verschieben und dem Mausrad zum Zoomen. Über „Frame model“ im Renderer-Fenster lässt sich die automatische Einpassung erneut ausführen.
+
+Im Scene-Fenster schaltet der Button „meshoptimizer: ON/OFF“ Remapping, Cache-/Overdraw-/Vertex-Fetch-Optimierung, Meshlet-Bounds und LOD-Simplifizierung gemeinsam ein oder aus. Beim Umschalten wird das aktuelle Modell neu geladen. Nur die für die Meshshader-Ausgabe zwingende Meshlet-Partitionierung bleibt immer aktiv.
+
+Der Button „Default plastic: ON/OFF“ ersetzt beim Laden sämtliche importierten Materialien und Texturreferenzen durch ein gemeinsames hellgraues Kunststoffmaterial (`Albedo 0.75`, `Metallic 0.0`, `Roughness 0.5`) und weist es jedem Mesh zu. Auch dieser Schalter lädt die aktuelle Szene unmittelbar neu.
 
 Für einen automatisierten Start mit vorgewähltem OptiX-Backend kann vor dem Aufruf `VOR_BACKEND=optix` als Umgebungsvariable gesetzt werden. Im normalen Betrieb erfolgt der Wechsel über die Radio-Buttons im ImGui-Fenster „Renderer“.
 
