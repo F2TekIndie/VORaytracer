@@ -715,7 +715,7 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
 
         frameSlot_ = (frameSlot_ + 1) % kFramesInFlight;
         ++stats_.frameIndex;
-        stats_.accumulatedSamples += settings.samplesPerFrame;
+        stats_.accumulatedSamples = 0;
         stats_.visibleMeshlets = stats_.totalMeshlets;
         const std::uint64_t raysPerPixel = (settings.rayTracedShadows ? 1u : 0u) +
                                            (settings.rayTracedReflections ? 1u : 0u) +

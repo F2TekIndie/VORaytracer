@@ -308,9 +308,15 @@ void Application::drawRenderPanel()
     }
 
     ImGui::SeparatorText("PBR / Ray tracing");
+    if (settings_.backend != BackendKind::Optix)
+        ImGui::BeginDisabled();
     ImGui::SliderInt("Samples/frame", reinterpret_cast<int*>(&settings_.samplesPerFrame), 1, 16);
     if (ImGui::SliderInt("Max bounces", reinterpret_cast<int*>(&settings_.maxBounces), 1, 16))
         optixRenderer_.resetAccumulation();
+    if (settings_.backend != BackendKind::Optix)
+        ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("OptiX path-tracing setting. Vulkan uses a fixed real-time Ray Query budget.");
     ImGui::SliderFloat("Exposure", &settings_.exposure, -8.0f, 8.0f);
     ImGui::Checkbox("Ray-traced shadows", &settings_.rayTracedShadows);
     if (ImGui::Checkbox("Ray-traced reflections", &settings_.rayTracedReflections))
@@ -423,7 +429,10 @@ void Application::drawStatsPanel()
     ImGui::Text("Device: %s", stats.deviceName.c_str());
     ImGui::Text("CPU frame: %.3f ms", stats.frameMilliseconds);
     ImGui::Text("Frame: %llu", static_cast<unsigned long long>(stats.frameIndex));
-    ImGui::Text("Accumulated samples: %llu", static_cast<unsigned long long>(stats.accumulatedSamples));
+    if (settings_.backend == BackendKind::Optix)
+        ImGui::Text("Accumulated samples: %llu", static_cast<unsigned long long>(stats.accumulatedSamples));
+    else
+        ImGui::TextDisabled("Accumulated samples: n/a (real-time Vulkan)");
     ImGui::Text("Meshlets: %u / %u", stats.visibleMeshlets, stats.totalMeshlets);
     ImGui::Text("Rays: %llu", static_cast<unsigned long long>(stats.tracedRays));
     ImGui::Text("Ray Query feature: %s", vulkanRenderer_.rayQueryAvailable() ? "yes" : "no");
