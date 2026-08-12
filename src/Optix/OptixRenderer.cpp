@@ -530,13 +530,14 @@ bool OptixRenderer::invokeDenoiser()
     try
     {
         const auto image = [this](CUdeviceptr buffer) {
+            constexpr unsigned int kHalf4PixelByteSize = sizeof(std::uint16_t) * 4;
             OptixImage2D result{};
             result.data = buffer;
             result.width = width_;
             result.height = height_;
-            result.rowStrideInBytes = width_ * static_cast<unsigned int>(sizeof(Vec4));
-            result.pixelStrideInBytes = sizeof(Vec4);
-            result.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+            result.rowStrideInBytes = width_ * kHalf4PixelByteSize;
+            result.pixelStrideInBytes = kHalf4PixelByteSize;
+            result.format = OPTIX_PIXEL_FORMAT_HALF4;
             return result;
         };
         OptixDenoiserGuideLayer guides{};

@@ -2,8 +2,11 @@ import Pbr;
 
 struct TaskPayload
 {
-    uint meshletIndex;
+    uint meshletIndices[32];
 };
+
+groupshared TaskPayload taskPayload;
+groupshared uint visibleMeshletCount;
 
 struct GpuVertex
 {
@@ -217,7 +220,7 @@ float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
     float3 hitPosition = bounceRay.Origin + bounceDirection * bounceQuery.CommittedRayT();
     float3 lightDirection = normalize(-frame.lightDirectionAndMode.xyz);
     float visibility = 1.0;
-    if (frame.rayTracedShadows != 0 && uint(frame.lightDirectionAndMode.w + 0.5) != 1)
+    if (frame.rayTracedShadows != 0)
     {
         float hitScale = max(max(abs(hitPosition.x), abs(hitPosition.y)), abs(hitPosition.z));
         float hitBias = max(0.0001, hitScale * 0.00001);
@@ -231,8 +234,9 @@ float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
         shadowQuery.Proceed();
         visibility = shadowQuery.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
     }
-    float3 directRadiance = uint(frame.lightDirectionAndMode.w + 0.5) == 1 ? float3(0.0) :
-                            frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
+    float3 directRadiance = uint(frame.lightDirectionAndMode.w + 0.5) == 1
+                                ? sampleGlobalEnvironment(lightDirection) * visibility
+                                : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
     float3 radiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
                                                  hitInstance.baseColorAndMetallic.w,
                                                  hitInstance.emissiveAndRoughness.w,
@@ -272,12 +276,16 @@ FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
 }
 
 [shader("amplification")]
-[numthreads(1, 1, 1)]
+[numthreads(32, 1, 1)]
 void TaskMain(
-    uint3 groupIndex : SV_GroupID)
+    uint3 groupIndex : SV_GroupID,
+    uint threadIndex : SV_GroupThreadID)
 {
-    TaskPayload taskPayload;
-    uint meshletIndex = groupIndex.x;
+    if (threadIndex == 0)
+        visibleMeshletCount = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint meshletIndex = groupIndex.x * 32 + threadIndex;
     bool visible = meshletIndex < frame.meshletCount;
     if (visible)
     {
@@ -315,8 +323,15 @@ void TaskMain(
         }
     }
 
-    taskPayload.meshletIndex = meshletIndex;
-    DispatchMesh(visible ? 1 : 0, 1, 1, taskPayload);
+    if (visible)
+    {
+        uint payloadIndex;
+        InterlockedAdd(visibleMeshletCount, 1, payloadIndex);
+        taskPayload.meshletIndices[payloadIndex] = meshletIndex;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (threadIndex == 0)
+        DispatchMesh(visibleMeshletCount, 1, 1, taskPayload);
 }
 
 [shader("mesh")]
@@ -329,7 +344,8 @@ void MeshMain(
     out vertices MeshVertex vertices[64],
     out indices uint3 triangles[124])
 {
-    GpuMeshlet meshlet = sceneMeshlets[taskPayload.meshletIndex];
+    uint meshletIndex = taskPayload.meshletIndices[groupIndex.x];
+    GpuMeshlet meshlet = sceneMeshlets[meshletIndex];
     GpuInstance instance = sceneInstances[meshlet.instanceIndex];
     SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
     for (uint outputVertex = threadIndex; outputVertex < meshlet.vertexCount; outputVertex += 32)
@@ -343,7 +359,7 @@ void MeshMain(
         vertices[outputVertex].uv = source.uv.xy;
         vertices[outputVertex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
         vertices[outputVertex].roughness = meshlet.materialParameters.x;
-        vertices[outputVertex].meshletIndex = taskPayload.meshletIndex;
+        vertices[outputVertex].meshletIndex = meshletIndex;
     }
     for (uint outputTriangle = threadIndex; outputTriangle < meshlet.triangleCount; outputTriangle += 32)
     {
@@ -384,11 +400,12 @@ FragmentOutput FragmentMain(MeshVertex input)
         query.Proceed();
         visibility = query.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
     }
-    float3 directRadiance = globalLightMode == 1 ? float3(0.0) :
-                            frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
+    float3 directRadiance = globalLightMode == 1
+                                ? sampleGlobalEnvironment(lightDirection) * visibility
+                                : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
     float3 color = evaluateMetallicRoughness(baseColor, input.baseColorAndMetallic.w, input.roughness,
                                              normal, viewDirection, lightDirection, directRadiance);
-    if (frame.skyHorizonAndIndirect.w != 0.0)
+    if (frame.skyHorizonAndIndirect.w != 0.0 && input.baseColorAndMetallic.w < 0.999)
     {
         color += traceDiffuseBounce(input.worldPosition, normal) * baseColor *
                  (1.0 - input.baseColorAndMetallic.w);
@@ -443,8 +460,9 @@ FragmentOutput FragmentMain(MeshVertex input)
                 reflectedShadowQuery.Proceed();
                 hitVisibility = reflectedShadowQuery.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
             }
-            float3 hitDirectRadiance = globalLightMode == 1 ? float3(0.0) :
-                                       frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
+            float3 hitDirectRadiance = globalLightMode == 1
+                                           ? sampleGlobalEnvironment(hitLightDirection) * hitVisibility
+                                           : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
             reflectedRadiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
                                                            hitInstance.baseColorAndMetallic.w,
                                                            hitInstance.emissiveAndRoughness.w,

@@ -269,8 +269,9 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
         check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(interoperability resize)");
         destroyGpuInteropSurface();
         const VkDeviceSize pixelByteSize = static_cast<VkDeviceSize>(width) * height * sizeof(std::uint32_t);
-        const VkDeviceSize floatImageByteSize = static_cast<VkDeviceSize>(width) * height * sizeof(Vec4);
-        const VkDeviceSize bufferByteSize = floatImageByteSize * 2 + pixelByteSize;
+        constexpr VkDeviceSize kHalf4PixelByteSize = sizeof(std::uint16_t) * 4;
+        const VkDeviceSize halfImageByteSize = static_cast<VkDeviceSize>(width) * height * kHalf4PixelByteSize;
+        const VkDeviceSize bufferByteSize = halfImageByteSize * 2 + pixelByteSize;
         VkDeviceSize allocationSize = 0;
         HANDLE memoryHandle = nullptr;
         gpuInteropBuffer_ = createExternalBuffer(bufferByteSize, allocationSize, memoryHandle);
@@ -317,8 +318,8 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
         gpuInteropSurfaceInfo_.pixelByteSize = pixelByteSize;
         gpuInteropSurfaceInfo_.bufferByteSize = bufferByteSize;
         gpuInteropSurfaceInfo_.inputOffset = 0;
-        gpuInteropSurfaceInfo_.denoisedOffset = floatImageByteSize;
-        gpuInteropSurfaceInfo_.displayOffset = floatImageByteSize * 2;
+        gpuInteropSurfaceInfo_.denoisedOffset = halfImageByteSize;
+        gpuInteropSurfaceInfo_.displayOffset = halfImageByteSize * 2;
         gpuInteropSurfaceInfo_.generation = ++gpuInteropGeneration_;
         gpuInteropSurfaceInfo_.width = width;
         gpuInteropSurfaceInfo_.height = height;
@@ -369,7 +370,7 @@ bool VulkanRenderer::createDenoiserInputImage(std::uint32_t width, std::uint32_t
         destroyDenoiserInputImage();
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
         imageInfo.extent = {width, height, 1};
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
@@ -392,7 +393,7 @@ bool VulkanRenderer::createDenoiserInputImage(std::uint32_t width, std::uint32_t
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = denoiserInputImage_;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.layerCount = 1;
@@ -602,7 +603,8 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
                                 &sceneDescriptorSet_, 0, nullptr);
         vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(FramePushConstants),
                            &framePushConstants_);
-        cmdDrawMeshTasks_(commandBuffer, uploadedMeshletCount_, 1, 1);
+        cmdDrawMeshTasks_(commandBuffer,
+                          (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
     }
     vkCmdEndRendering(commandBuffer);
 
@@ -1233,7 +1235,7 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = meshPipelineLayout_;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &meshPipeline_), "vkCreateGraphicsPipelines");
-        const VkFormat denoiserFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+        const VkFormat denoiserFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         renderingInfo.pColorAttachmentFormats = &denoiserFormat;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &denoiserMeshPipeline_),
               "vkCreateGraphicsPipelines(Vulkan denoiser mesh input)");
@@ -2282,7 +2284,8 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
                                 &sceneDescriptorSet_, 0, nullptr);
         vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages, 0,
                            sizeof(FramePushConstants), &framePushConstants_);
-        cmdDrawMeshTasks_(commandBuffer, uploadedMeshletCount_, 1, 1);
+        cmdDrawMeshTasks_(commandBuffer,
+                          (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
     }
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
     vkCmdEndRendering(commandBuffer);

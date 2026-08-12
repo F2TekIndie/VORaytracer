@@ -46,6 +46,7 @@ public:
 
 private:
     static constexpr std::uint32_t kFramesInFlight = 2;
+    static constexpr std::uint32_t kMeshletsPerTaskGroup = 32;
 
     struct FrameResources
     {

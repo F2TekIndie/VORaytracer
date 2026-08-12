@@ -17,7 +17,7 @@ struct GpuMaterial
 struct LaunchParameters
 {
     RWStructuredBuffer<float4> output;
-    RWStructuredBuffer<float4> denoisedOutput;
+    RWStructuredBuffer<half4> denoisedOutput;
     RWStructuredBuffer<float4> albedoGuide;
     RWStructuredBuffer<float4> normalGuide;
     RWStructuredBuffer<uint> displayOutput;
@@ -228,9 +228,10 @@ void RayGen(LaunchParameters parameters)
                          0xff, 0, 1, 0, shadowRay, shadowPayload);
                 visibility = shadowPayload.hit == 0 ? 1.0 : 0.0;
             }
-            float3 lightRadiance = parameters.globalLightMode == 1 ? float3(0.0) :
-                                   parameters.lightColorAndIntensity.xyz *
-                                   parameters.lightColorAndIntensity.w * visibility;
+            float3 lightRadiance = parameters.globalLightMode == 1
+                                       ? sampleGlobalEnvironment(parameters, lightDirection) * visibility
+                                       : parameters.lightColorAndIntensity.xyz *
+                                             parameters.lightColorAndIntensity.w * visibility;
             float roughness = clamp(material.emissiveAndRoughness.w, 0.02, 1.0);
             float3 direct = evaluateMetallicRoughness(material.baseColorAndMetallic.xyz,
                                                       material.baseColorAndMetallic.w,
@@ -322,7 +323,7 @@ void ToneMap(LaunchParameters parameters)
     if (any(launchIndex.xy >= parameters.outputSize))
         return;
     uint linearIndex = launchIndex.y * parameters.outputSize.x + launchIndex.x;
-    parameters.displayOutput[linearIndex] = toneMapAndPack(parameters.denoisedOutput[linearIndex].xyz,
+    parameters.displayOutput[linearIndex] = toneMapAndPack(float3(parameters.denoisedOutput[linearIndex].xyz),
                                                            parameters.exposure,
                                                            parameters.displayBgra);
 }

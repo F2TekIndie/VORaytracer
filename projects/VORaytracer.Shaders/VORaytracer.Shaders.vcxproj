@@ -9,33 +9,33 @@
   <PropertyGroup Label="Configuration"><ConfigurationType>Utility</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="$(SolutionDir)config\Common.props" />
-  <PropertyGroup><ShaderOutputDir>$(OutDir)Shaders\</ShaderOutputDir><SlangCompiler>G:\CodingLibraries\slang-14.1\bin\slangc.exe</SlangCompiler><SlangCommon>-target spirv -profile spirv_1_6 -emit-spirv-directly -fvk-use-entrypoint-name</SlangCommon></PropertyGroup>
+  <PropertyGroup><ShaderOutputDir>$(OutDir)Shaders\</ShaderOutputDir><SlangCompiler>G:\CodingLibraries\slang-14.1\bin\slangc.exe</SlangCompiler><SlangCommon>-target spirv -profile spirv_1_6 -emit-spirv-directly -fvk-use-entrypoint-name</SlangCommon><SlangOptimization Condition="'$(Configuration)'=='Debug'">-O0</SlangOptimization><SlangOptimization Condition="'$(Configuration)'=='Release'">-O3</SlangOptimization></PropertyGroup>
   <ItemGroup>
     <CustomBuild Include="$(SolutionDir)shaders\Vulkan\MeshPipeline.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry TaskMain -stage amplification -o "$(ShaderOutputDir)Task.spv"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry MeshMain -stage mesh -o "$(ShaderOutputDir)Mesh.spv"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry FragmentMain -stage fragment -o "$(ShaderOutputDir)PbrFragment.spv"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry BackgroundVertex -stage vertex -o "$(ShaderOutputDir)BackgroundVertex.spv"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry BackgroundFragment -stage fragment -o "$(ShaderOutputDir)BackgroundFragment.spv"</Command>
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry TaskMain -stage amplification -o "$(ShaderOutputDir)Task.spv"
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry MeshMain -stage mesh -o "$(ShaderOutputDir)Mesh.spv"
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry FragmentMain -stage fragment -o "$(ShaderOutputDir)PbrFragment.spv"
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry BackgroundVertex -stage vertex -o "$(ShaderOutputDir)BackgroundVertex.spv"
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry BackgroundFragment -stage fragment -o "$(ShaderOutputDir)BackgroundFragment.spv"</Command>
       <Outputs>$(ShaderOutputDir)Task.spv;$(ShaderOutputDir)Mesh.spv;$(ShaderOutputDir)PbrFragment.spv;$(ShaderOutputDir)BackgroundVertex.spv;$(ShaderOutputDir)BackgroundFragment.spv</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
     </CustomBuild>
     <CustomBuild Include="$(SolutionDir)shaders\Vulkan\RayQueryLighting.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry ComputeMain -stage compute -o "$(ShaderOutputDir)RayQueryLighting.spv"</Command>
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry ComputeMain -stage compute -o "$(ShaderOutputDir)RayQueryLighting.spv"</Command>
       <Outputs>$(ShaderOutputDir)RayQueryLighting.spv</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
     </CustomBuild>
     <CustomBuild Include="$(SolutionDir)shaders\Vulkan\ToneMap.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
-"$(SlangCompiler)" "%(FullPath)" $(SlangCommon) -entry ComputeMain -stage compute -o "$(ShaderOutputDir)ToneMap.spv"</Command>
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) $(SlangCommon) -entry ComputeMain -stage compute -o "$(ShaderOutputDir)ToneMap.spv"</Command>
       <Outputs>$(ShaderOutputDir)ToneMap.spv</Outputs>
     </CustomBuild>
     <CustomBuild Include="$(SolutionDir)shaders\Optix\PathTracer.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
 set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH%"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -I "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include" -target ptx -entry RayGen -stage raygeneration -entry ToneMap -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -I "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include" -target ptx -entry RayGen -stage raygeneration -entry ToneMap -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
       <Outputs>$(ShaderOutputDir)PathTracer.ptx</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
     </CustomBuild>
