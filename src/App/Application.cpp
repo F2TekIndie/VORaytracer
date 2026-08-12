@@ -2,18 +2,182 @@
 
 #include "Core/Log.h"
 
+#define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
 #include <imgui.h>
+#include <shobjidl.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
+#include <optional>
+#include <sstream>
 
 namespace vor
 {
+namespace
+{
+using Microsoft::WRL::ComPtr;
+
+struct FileDialogResult
+{
+    std::optional<std::filesystem::path> path;
+    std::string error;
+};
+
+std::string hresultMessage(const char* operation, HRESULT result)
+{
+    std::ostringstream message;
+    message << operation << " failed (HRESULT 0x" << std::hex << std::uppercase
+            << static_cast<unsigned long>(result) << ')';
+    return message.str();
+}
+
+std::string pathToUtf8(const std::filesystem::path& path)
+{
+    const std::wstring& wide = path.native();
+    if (wide.empty())
+        return {};
+    const int byteCount = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+                                               nullptr, 0, nullptr, nullptr);
+    if (byteCount <= 0)
+        return {};
+    std::string result(static_cast<std::size_t>(byteCount), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+                        result.data(), byteCount, nullptr, nullptr);
+    return result;
+}
+
+std::filesystem::path pathFromUtf8(const char* path)
+{
+    if (!path || !*path)
+        return {};
+    const int characterCount = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (characterCount <= 1)
+        return {};
+    std::wstring wide(static_cast<std::size_t>(characterCount), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide.data(), characterCount);
+    wide.pop_back();
+    return std::filesystem::path(wide);
+}
+
+std::filesystem::path dialogInitialFolder(const std::filesystem::path& currentPath)
+{
+    std::error_code error;
+    if (!currentPath.empty())
+    {
+        std::filesystem::path candidate = std::filesystem::is_directory(currentPath, error)
+                                              ? currentPath : currentPath.parent_path();
+        error.clear();
+        if (!candidate.empty() && std::filesystem::is_directory(candidate, error))
+            return candidate;
+    }
+
+    std::filesystem::path search = std::filesystem::current_path(error);
+    for (int level = 0; !search.empty() && level < 6; ++level)
+    {
+        const std::filesystem::path assets = search / L"assets";
+        error.clear();
+        if (std::filesystem::is_directory(assets, error))
+            return assets;
+        const std::filesystem::path parent = search.parent_path();
+        if (parent == search)
+            break;
+        search = parent;
+    }
+    return {};
+}
+
+FileDialogResult showOpenFileDialog(GLFWwindow* window, const wchar_t* title,
+                                    const COMDLG_FILTERSPEC* filters, UINT filterCount,
+                                    const wchar_t* defaultExtension,
+                                    const std::filesystem::path& currentPath)
+{
+    const HRESULT initializeResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool uninitialize = SUCCEEDED(initializeResult);
+    if (FAILED(initializeResult) && initializeResult != RPC_E_CHANGED_MODE)
+        return {.error = hresultMessage("CoInitializeEx", initializeResult)};
+
+    FileDialogResult result;
+    ComPtr<IFileOpenDialog> dialog;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(dialog.GetAddressOf()));
+    if (FAILED(hr))
+        result.error = hresultMessage("CoCreateInstance(IFileOpenDialog)", hr);
+    else
+    {
+        FILEOPENDIALOGOPTIONS options{};
+        if (SUCCEEDED(dialog->GetOptions(&options)))
+            dialog->SetOptions(options | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST |
+                               FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
+        dialog->SetTitle(title);
+        dialog->SetFileTypes(filterCount, filters);
+        dialog->SetFileTypeIndex(1);
+        dialog->SetDefaultExtension(defaultExtension);
+
+        const std::filesystem::path initialFolder = dialogInitialFolder(currentPath);
+        if (!initialFolder.empty())
+        {
+            ComPtr<IShellItem> folder;
+            if (SUCCEEDED(SHCreateItemFromParsingName(initialFolder.c_str(), nullptr,
+                                                      IID_PPV_ARGS(folder.GetAddressOf()))))
+                dialog->SetFolder(folder.Get());
+        }
+
+        hr = dialog->Show(window ? glfwGetWin32Window(window) : nullptr);
+        if (hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        {
+            if (FAILED(hr))
+                result.error = hresultMessage("IFileOpenDialog::Show", hr);
+            else
+            {
+                ComPtr<IShellItem> item;
+                hr = dialog->GetResult(item.GetAddressOf());
+                if (FAILED(hr))
+                    result.error = hresultMessage("IFileOpenDialog::GetResult", hr);
+                else
+                {
+                    PWSTR selectedPath = nullptr;
+                    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &selectedPath);
+                    if (FAILED(hr))
+                        result.error = hresultMessage("IShellItem::GetDisplayName", hr);
+                    else
+                    {
+                        result.path = std::filesystem::path(selectedPath);
+                        CoTaskMemFree(selectedPath);
+                    }
+                }
+            }
+        }
+    }
+
+    dialog.Reset();
+    if (uninitialize)
+        CoUninitialize();
+    return result;
+}
+
+template <std::size_t Size>
+bool writePathField(std::array<char, Size>& field, const std::filesystem::path& path, std::string& error)
+{
+    const std::string utf8 = pathToUtf8(path);
+    if (utf8.empty() || utf8.size() >= field.size())
+    {
+        error = "The selected path is too long for the path field";
+        return false;
+    }
+    std::fill(field.begin(), field.end(), '\0');
+    std::memcpy(field.data(), utf8.data(), utf8.size());
+    return true;
+}
+} // namespace
+
 int Application::run()
 {
     if (!initialize())
@@ -194,8 +358,10 @@ void Application::drawMainMenu()
         return;
     if (ImGui::BeginMenu("File"))
     {
-        if (ImGui::MenuItem("Load path"))
-            loadSceneFromUi();
+        if (ImGui::MenuItem("Open model..."))
+            openModelFileDialog();
+        if (ImGui::MenuItem("Open HDR environment..."))
+            openHdrFileDialog();
         if (ImGui::MenuItem("Procedural cube"))
         {
             Environment environment = std::move(scene_.environment);
@@ -224,6 +390,9 @@ void Application::drawScenePanel()
     ImGui::SameLine();
     if (ImGui::Button("Load"))
         loadSceneFromUi();
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##Model"))
+        openModelFileDialog();
     ImGui::Separator();
     ImGui::Text("Meshes: %zu", scene_.meshes.size());
     ImGui::Text("Instances: %zu", scene_.instances.size());
@@ -367,6 +536,9 @@ void Application::drawRenderPanel()
         ImGui::SameLine();
         if (ImGui::Button("Load HDR"))
             loadEnvironmentFromUi();
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...##HDR"))
+            openHdrFileDialog();
         if (scene_.environment.hasHdr())
             ImGui::TextDisabled("%ux%u - %s", scene_.environment.hdrWidth, scene_.environment.hdrHeight,
                                 scene_.environment.hdrPath.filename().string().c_str());
@@ -442,7 +614,7 @@ void Application::drawStatsPanel()
 
 void Application::loadSceneFromUi()
 {
-    const std::filesystem::path path(assetPath_.data());
+    const std::filesystem::path path = pathFromUtf8(assetPath_.data());
     if (path.empty())
     {
         statusMessage_ = "Enter an asset path first";
@@ -463,12 +635,12 @@ void Application::loadSceneFromUi()
     frameCameraToScene();
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
-    statusMessage_ = "Loaded and framed " + path.string();
+    statusMessage_ = "Loaded and framed " + pathToUtf8(path);
 }
 
 void Application::loadEnvironmentFromUi()
 {
-    const std::filesystem::path path(environmentPath_.data());
+    const std::filesystem::path path = pathFromUtf8(environmentPath_.data());
     if (path.empty())
     {
         statusMessage_ = "Enter an HDR path first";
@@ -483,7 +655,56 @@ void Application::loadEnvironmentFromUi()
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     resetCameraAccumulation();
-    statusMessage_ = "Loaded HDR environment " + path.string();
+    statusMessage_ = "Loaded HDR environment " + pathToUtf8(path);
+}
+
+void Application::openModelFileDialog()
+{
+    static constexpr COMDLG_FILTERSPEC filters[]{
+        {L"Supported 3D models", L"*.fbx;*.obj;*.gltf;*.glb;*.dae;*.3ds;*.ply;*.stl;*.blend"},
+        {L"FBX files", L"*.fbx"},
+        {L"Wavefront OBJ files", L"*.obj"},
+        {L"glTF files", L"*.gltf;*.glb"},
+        {L"COLLADA files", L"*.dae"},
+        {L"All files", L"*.*"},
+    };
+    const std::filesystem::path current = assetPath_[0] ? pathFromUtf8(assetPath_.data()) : scene_.sourcePath;
+    FileDialogResult result = showOpenFileDialog(window_, L"Open 3D model", filters,
+                                                  static_cast<UINT>(std::size(filters)), L"fbx", current);
+    if (!result.error.empty())
+    {
+        statusMessage_ = "File dialog failed: " + result.error;
+        return;
+    }
+    if (!result.path)
+        return;
+    if (!writePathField(assetPath_, *result.path, statusMessage_))
+        return;
+    loadSceneFromUi();
+}
+
+void Application::openHdrFileDialog()
+{
+    static constexpr COMDLG_FILTERSPEC filters[]{
+        {L"Radiance HDR images", L"*.hdr"},
+        {L"All files", L"*.*"},
+    };
+    const std::filesystem::path current = environmentPath_[0]
+                                              ? pathFromUtf8(environmentPath_.data())
+                                              : scene_.environment.hdrPath;
+    FileDialogResult result = showOpenFileDialog(window_, L"Open HDR environment", filters,
+                                                  static_cast<UINT>(std::size(filters)), L"hdr", current);
+    if (!result.error.empty())
+    {
+        statusMessage_ = "File dialog failed: " + result.error;
+        return;
+    }
+    if (!result.path)
+        return;
+    if (!writePathField(environmentPath_, *result.path, statusMessage_))
+        return;
+    scene_.environment.mode = GlobalLightMode::HdrEnvironment;
+    loadEnvironmentFromUi();
 }
 
 bool Application::reloadCurrentScene()

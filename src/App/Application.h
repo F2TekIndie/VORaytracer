@@ -27,6 +27,8 @@ private:
     void drawStatsPanel();
     void loadSceneFromUi();
     void loadEnvironmentFromUi();
+    void openModelFileDialog();
+    void openHdrFileDialog();
     bool reloadCurrentScene();
     void frameCameraToScene();
     void handleCameraNavigation();
