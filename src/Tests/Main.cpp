@@ -143,6 +143,20 @@ int main()
         }
     }
 
+    const std::filesystem::path hdrPath = projectRoot / "assets" / "SampleHDR.hdr";
+    if (std::filesystem::exists(hdrPath))
+    {
+        Environment environment;
+        std::string error;
+        require(assetLoader.loadHdrEnvironment(hdrPath, environment, error), "Radiance HDR sample import");
+        require(environment.hdrWidth == 4096 && environment.hdrHeight == 2048, "HDR sample dimensions");
+        require(environment.hdrMipCount == 13, "HDR mip count");
+        require(environment.hasHdr(), "HDR mip pyramid validation");
+        require(environment.hdrPixels.size() > static_cast<std::size_t>(environment.hdrWidth) *
+                                                   environment.hdrHeight,
+                "HDR mip pixels generated");
+    }
+
     if (failures == 0)
         std::cout << "VORaytracer CPU and asset tests passed\n";
     return failures == 0 ? 0 : 1;

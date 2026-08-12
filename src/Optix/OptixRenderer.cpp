@@ -116,7 +116,7 @@ struct LaunchParameters
     float environmentIntensity;
     float environmentRotation;
     std::uint32_t environmentVisible;
-    std::uint32_t environmentPadding;
+    std::uint32_t environmentMipCount;
     Vec4 cameraPositionAndFov;
     Vec4 cameraTargetAndAspect;
     Vec4 cameraUp;
@@ -940,6 +940,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.environmentIntensity = environment.intensity;
         parameters.environmentRotation = environment.rotationRadians;
         parameters.environmentVisible = environment.visibleBackground ? 1u : 0u;
+        parameters.environmentMipCount = environment.hasHdr() ? environment.hdrMipCount : 0u;
         parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
                                            camera.verticalFovDegrees * kPi / 180.0f};
         parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,

@@ -2,6 +2,7 @@
 
 #include "Core/Math.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -120,6 +121,7 @@ struct Environment
     std::vector<Vec4> hdrPixels;
     std::uint32_t hdrWidth{};
     std::uint32_t hdrHeight{};
+    std::uint32_t hdrMipCount{};
     float intensity{1.0f};
     float rotationRadians{};
     Vec3 zenithColor{0.12f, 0.32f, 0.75f};
@@ -129,8 +131,18 @@ struct Environment
 
     [[nodiscard]] bool hasHdr() const
     {
-        return hdrWidth > 0 && hdrHeight > 0 &&
-               hdrPixels.size() == static_cast<std::size_t>(hdrWidth) * hdrHeight;
+        if (hdrWidth == 0 || hdrHeight == 0 || hdrMipCount == 0)
+            return false;
+        std::size_t expectedPixels = 0;
+        std::uint32_t width = hdrWidth;
+        std::uint32_t height = hdrHeight;
+        for (std::uint32_t mip = 0; mip < hdrMipCount; ++mip)
+        {
+            expectedPixels += static_cast<std::size_t>(width) * height;
+            width = std::max(width / 2, 1u);
+            height = std::max(height / 2, 1u);
+        }
+        return hdrPixels.size() == expectedPixels;
     }
 };
 

@@ -62,7 +62,7 @@ struct FramePushConstants
     uint instanceCount;
     uint showMeshlets;
     uint postProcessInput;
-    uint padding2;
+    uint environmentMipCount;
 };
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
@@ -132,15 +132,28 @@ float3 rotateEnvironmentDirection(float3 direction)
                   -pitchSine * yawRotated.y + pitchCosine * yawRotated.z);
 }
 
-float3 sampleHdrEnvironment(float3 direction)
+uint environmentMipOffset(uint mipLevel)
 {
+    uint offset = 0;
     uint width = uint(frame.environmentParameters.x);
     uint height = uint(frame.environmentParameters.y);
+    for (uint mip = 0; mip < mipLevel; ++mip)
+    {
+        offset += width * height;
+        width = max(width / 2, 1u);
+        height = max(height / 2, 1u);
+    }
+    return offset;
+}
+
+float3 sampleHdrEnvironmentLevel(float3 rotatedDirection, uint mipLevel)
+{
+    uint width = max(uint(frame.environmentParameters.x) >> mipLevel, 1u);
+    uint height = max(uint(frame.environmentParameters.y) >> mipLevel, 1u);
     if (width == 0 || height == 0)
         return float3(0.0);
-    float3 rotated = rotateEnvironmentDirection(normalize(direction));
-    float2 uv = float2(atan2(rotated.z, rotated.x) / (2.0 * PI) + 0.5,
-                            acos(clamp(rotated.y, -1.0, 1.0)) / PI);
+    float2 uv = float2(atan2(rotatedDirection.z, rotatedDirection.x) / (2.0 * PI) + 0.5,
+                            acos(clamp(rotatedDirection.y, -1.0, 1.0)) / PI);
     float2 texel = uv * float2(width, height) - 0.5;
     int2 base = int2(floor(texel));
     float2 fraction = frac(texel);
@@ -148,11 +161,30 @@ float3 sampleHdrEnvironment(float3 direction)
     uint x1 = (x0 + 1) % width;
     uint y0 = uint(clamp(base.y, 0, int(height) - 1));
     uint y1 = min(y0 + 1, height - 1);
-    float3 a = lerp(environmentPixels[y0 * width + x0].xyz,
-                    environmentPixels[y0 * width + x1].xyz, fraction.x);
-    float3 b = lerp(environmentPixels[y1 * width + x0].xyz,
-                    environmentPixels[y1 * width + x1].xyz, fraction.x);
+    uint offset = environmentMipOffset(mipLevel);
+    float3 a = lerp(environmentPixels[offset + y0 * width + x0].xyz,
+                    environmentPixels[offset + y0 * width + x1].xyz, fraction.x);
+    float3 b = lerp(environmentPixels[offset + y1 * width + x0].xyz,
+                    environmentPixels[offset + y1 * width + x1].xyz, fraction.x);
     return lerp(a, b, fraction.y);
+}
+
+float3 sampleHdrEnvironmentLod(float3 direction, float mipLevel)
+{
+    if (frame.environmentMipCount == 0)
+        return float3(0.0);
+    float3 rotatedDirection = rotateEnvironmentDirection(normalize(direction));
+    float clampedLevel = clamp(mipLevel, 0.0, float(frame.environmentMipCount - 1));
+    uint lowerLevel = uint(floor(clampedLevel));
+    uint upperLevel = min(lowerLevel + 1, frame.environmentMipCount - 1);
+    float blend = frac(clampedLevel);
+    return lerp(sampleHdrEnvironmentLevel(rotatedDirection, lowerLevel),
+                sampleHdrEnvironmentLevel(rotatedDirection, upperLevel), blend);
+}
+
+float3 sampleHdrEnvironment(float3 direction)
+{
+    return sampleHdrEnvironmentLod(direction, 0.0);
 }
 
 float3 sampleGlobalEnvironment(float3 direction)
@@ -174,35 +206,38 @@ float3 sampleGlobalEnvironment(float3 direction)
     return float3(0.0);
 }
 
-float3 samplePrefilteredEnvironment(float3 reflectionDirection, float3 normal, float roughness)
+float hdrSpecularMipLevel(float roughness)
+{
+    if (frame.environmentMipCount <= 1)
+        return 0.0;
+    float maximumMip = float(frame.environmentMipCount - 1);
+    float angularFootprintInTexels = max(roughness * roughness * frame.environmentParameters.x /
+                                         (2.0 * PI), 1.0);
+    float footprintMip = log2(angularFootprintInTexels) + 0.5;
+    float perceptualMip = roughness * maximumMip * 1.75;
+    return min(max(footprintMip, perceptualMip), maximumMip);
+}
+
+float3 sampleDiffuseEnvironment(float3 normal)
+{
+    uint mode = uint(frame.lightDirectionAndMode.w + 0.5);
+    if (mode == 1)
+    {
+        float hemisphereFootprint = max(frame.environmentParameters.x / (2.0 * PI), 1.0);
+        float mipLevel = min(log2(hemisphereFootprint), float(max(frame.environmentMipCount, 1u) - 1));
+        return sampleHdrEnvironmentLod(normal, mipLevel) * frame.environmentParameters.z;
+    }
+    return sampleGlobalEnvironment(normal);
+}
+
+float3 samplePrefilteredEnvironment(float3 reflectionDirection, float roughness)
 {
     reflectionDirection = normalize(reflectionDirection);
     roughness = saturate(roughness);
-    float3 center = sampleGlobalEnvironment(reflectionDirection);
-    if (roughness <= 0.02)
-        return center;
-
-    float3 tangent = normalize(cross(abs(reflectionDirection.y) < 0.999
-                                         ? float3(0.0, 1.0, 0.0)
-                                         : float3(1.0, 0.0, 0.0),
-                                     reflectionDirection));
-    float3 bitangent = cross(reflectionDirection, tangent);
-    float coneWidth = roughness * roughness * 1.5;
-    float3 filtered = center;
-    float totalWeight = 1.0;
-    [unroll]
-    for (uint sampleIndex = 0; sampleIndex < 6; ++sampleIndex)
-    {
-        float radius = sqrt((float(sampleIndex) + 0.5) / 6.0) * coneWidth;
-        float angle = (float(sampleIndex) + 0.5) * 2.39996323;
-        float3 direction = normalize(reflectionDirection +
-                                     tangent * cos(angle) * radius +
-                                     bitangent * sin(angle) * radius);
-        float weight = saturate(dot(normal, direction));
-        filtered += sampleGlobalEnvironment(direction) * weight;
-        totalWeight += weight;
-    }
-    return filtered / max(totalWeight, 1e-4);
+    if (uint(frame.lightDirectionAndMode.w + 0.5) == 1)
+        return sampleHdrEnvironmentLod(reflectionDirection, hdrSpecularMipLevel(roughness)) *
+               frame.environmentParameters.z;
+    return sampleGlobalEnvironment(reflectionDirection);
 }
 
 float hash01(float3 value)
@@ -233,7 +268,7 @@ float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
     bounceQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, bounceRay);
     bounceQuery.Proceed();
     if (bounceQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-        return sampleGlobalEnvironment(bounceDirection);
+        return sampleDiffuseEnvironment(normal);
 
     GpuInstance hitInstance = sceneInstances[bounceQuery.CommittedInstanceID()];
     uint triangleOffset = hitInstance.geometry.y + bounceQuery.CommittedPrimitiveIndex() * 3;
@@ -272,7 +307,7 @@ float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
                                                  hitInstance.baseColorAndMetallic.w,
                                                  hitInstance.emissiveAndRoughness.w,
                                                  hitNormal, hitViewDirection, lightDirection, directRadiance);
-    radiance += sampleGlobalEnvironment(hitNormal) * hitInstance.baseColorAndMetallic.xyz *
+    radiance += sampleDiffuseEnvironment(hitNormal) * hitInstance.baseColorAndMetallic.xyz *
                 (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
     return radiance + hitInstance.emissiveAndRoughness.xyz;
 }
@@ -438,7 +473,10 @@ FragmentOutput FragmentMain(MeshVertex input)
                                              normal, viewDirection, lightDirection, directRadiance);
     if (frame.skyHorizonAndIndirect.w != 0.0 && input.baseColorAndMetallic.w < 0.999)
     {
-        color += traceDiffuseBounce(input.worldPosition, normal) * baseColor *
+        float3 indirectRadiance = globalLightMode == 1
+                                      ? sampleDiffuseEnvironment(normal)
+                                      : traceDiffuseBounce(input.worldPosition, normal);
+        color += indirectRadiance * baseColor *
                  (1.0 - input.baseColorAndMetallic.w);
     }
     if (frame.rayTracedReflections != 0)
@@ -454,7 +492,9 @@ FragmentOutput FragmentMain(MeshVertex input)
         reflectionQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, reflectionRay);
         reflectionQuery.Proceed();
 
-        float3 reflectedRadiance;
+        float3 environmentReflection = samplePrefilteredEnvironment(reflectionRay.Direction,
+                                                                     input.roughness);
+        float3 reflectedRadiance = environmentReflection;
         if (reflectionQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {
             uint instanceIndex = reflectionQuery.CommittedInstanceID();
@@ -494,23 +534,23 @@ FragmentOutput FragmentMain(MeshVertex input)
             float3 hitDirectRadiance = globalLightMode == 1
                                            ? float3(0.0)
                                            : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
-            reflectedRadiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
-                                                           hitInstance.baseColorAndMetallic.w,
-                                                           hitInstance.emissiveAndRoughness.w,
-                                                           hitNormal,
-                                                           reflectedViewDirection,
-                                                           hitLightDirection,
-                                                           hitDirectRadiance);
+            float3 localReflection = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
+                                                                hitInstance.baseColorAndMetallic.w,
+                                                                hitInstance.emissiveAndRoughness.w,
+                                                                hitNormal,
+                                                                reflectedViewDirection,
+                                                                hitLightDirection,
+                                                                hitDirectRadiance);
             if (frame.skyHorizonAndIndirect.w != 0.0)
-                reflectedRadiance += sampleGlobalEnvironment(hitNormal) *
-                                     hitInstance.baseColorAndMetallic.xyz *
-                                     (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
-            reflectedRadiance += hitInstance.emissiveAndRoughness.xyz;
-        }
-        else
-        {
-            reflectedRadiance = samplePrefilteredEnvironment(reflectionRay.Direction, normal,
-                                                              input.roughness);
+                localReflection += sampleDiffuseEnvironment(hitNormal) *
+                                   hitInstance.baseColorAndMetallic.xyz *
+                                   (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
+            localReflection += hitInstance.emissiveAndRoughness.xyz;
+
+            // A single ray can only represent a sharp local reflection. Fade it into the
+            // prefiltered environment once the material lobe is too wide for that sample.
+            float localReflectionWeight = 1.0 - smoothstep(0.12, 0.58, saturate(input.roughness));
+            reflectedRadiance = lerp(environmentReflection, localReflection, localReflectionWeight);
         }
         float3 reflectionF0 = lerp(float3(0.04), baseColor, input.baseColorAndMetallic.w);
         float3 reflectionWeight = fresnelSchlickRoughness(saturate(dot(normal, viewDirection)),

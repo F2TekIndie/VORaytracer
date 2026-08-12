@@ -465,6 +465,7 @@ void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSett
     framePushConstants_.instanceCount = static_cast<std::uint32_t>(uploadedInstances_.size());
     framePushConstants_.showMeshlets = settings.showMeshlets ? 1u : 0u;
     framePushConstants_.padding[0] = 0u;
+    framePushConstants_.padding[1] = environment.hasHdr() ? environment.hdrMipCount : 0u;
 }
 
 bool VulkanRenderer::renderDenoiserInput(const Camera& camera, const RenderSettings& settings)
@@ -719,11 +720,14 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         ++stats_.frameIndex;
         stats_.accumulatedSamples = 0;
         stats_.visibleMeshlets = stats_.totalMeshlets;
-        const std::uint64_t raysPerPixel = (settings.rayTracedShadows ? 1u : 0u) +
+        const bool hdrLighting = scene_ && scene_->environment.mode == GlobalLightMode::HdrEnvironment;
+        const std::uint64_t raysPerPixel = (settings.rayTracedShadows && !hdrLighting ? 1u : 0u) +
                                            (settings.rayTracedReflections ? 1u : 0u) +
-                                           (settings.rayTracedShadows && settings.rayTracedReflections ? 1u : 0u) +
-                                           (settings.indirectLighting ? 1u : 0u) +
-                                           (settings.indirectLighting && settings.rayTracedShadows ? 1u : 0u);
+                                           (settings.rayTracedShadows && settings.rayTracedReflections && !hdrLighting
+                                                ? 1u : 0u) +
+                                           (settings.indirectLighting && !hdrLighting ? 1u : 0u) +
+                                           (settings.indirectLighting && settings.rayTracedShadows && !hdrLighting
+                                                ? 1u : 0u);
         stats_.tracedRays = rayQueryAvailable_
                                 ? static_cast<std::uint64_t>(swapchainExtent_.width) * swapchainExtent_.height *
                                       raysPerPixel

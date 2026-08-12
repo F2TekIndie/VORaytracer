@@ -232,7 +232,9 @@ bool AssetLoader::loadHdrEnvironment(const std::filesystem::path& path,
     }
 
     const std::size_t pixelCount = static_cast<std::size_t>(width) * height;
-    std::vector<Vec4> decoded(pixelCount);
+    std::vector<Vec4> decoded;
+    decoded.reserve(pixelCount + pixelCount / 3);
+    decoded.resize(pixelCount);
     for (std::size_t index = 0; index < pixelCount; ++index)
     {
         const float* source = pixels + index * 4;
@@ -242,9 +244,45 @@ bool AssetLoader::loadHdrEnvironment(const std::filesystem::path& path,
                           1.0f};
     }
     stbi_image_free(pixels);
+
+    std::uint32_t mipCount = 1;
+    std::uint32_t previousWidth = static_cast<std::uint32_t>(width);
+    std::uint32_t previousHeight = static_cast<std::uint32_t>(height);
+    std::size_t previousOffset = 0;
+    while (previousWidth > 1 || previousHeight > 1)
+    {
+        const std::uint32_t mipWidth = std::max(previousWidth / 2, 1u);
+        const std::uint32_t mipHeight = std::max(previousHeight / 2, 1u);
+        const std::size_t mipOffset = decoded.size();
+        decoded.resize(mipOffset + static_cast<std::size_t>(mipWidth) * mipHeight);
+        for (std::uint32_t y = 0; y < mipHeight; ++y)
+        {
+            const std::uint32_t y0 = std::min(y * 2, previousHeight - 1);
+            const std::uint32_t y1 = std::min(y0 + 1, previousHeight - 1);
+            for (std::uint32_t x = 0; x < mipWidth; ++x)
+            {
+                const std::uint32_t x0 = std::min(x * 2, previousWidth - 1);
+                const std::uint32_t x1 = std::min(x0 + 1, previousWidth - 1);
+                const Vec4& a = decoded[previousOffset + static_cast<std::size_t>(y0) * previousWidth + x0];
+                const Vec4& b = decoded[previousOffset + static_cast<std::size_t>(y0) * previousWidth + x1];
+                const Vec4& c = decoded[previousOffset + static_cast<std::size_t>(y1) * previousWidth + x0];
+                const Vec4& d = decoded[previousOffset + static_cast<std::size_t>(y1) * previousWidth + x1];
+                decoded[mipOffset + static_cast<std::size_t>(y) * mipWidth + x] =
+                    {(a.x + b.x + c.x + d.x) * 0.25f,
+                     (a.y + b.y + c.y + d.y) * 0.25f,
+                     (a.z + b.z + c.z + d.z) * 0.25f, 1.0f};
+            }
+        }
+        previousOffset = mipOffset;
+        previousWidth = mipWidth;
+        previousHeight = mipHeight;
+        ++mipCount;
+    }
+
     environment.hdrPath = path;
     environment.hdrWidth = static_cast<std::uint32_t>(width);
     environment.hdrHeight = static_cast<std::uint32_t>(height);
+    environment.hdrMipCount = mipCount;
     environment.hdrPixels = std::move(decoded);
     environment.mode = GlobalLightMode::HdrEnvironment;
     error.clear();

@@ -47,7 +47,7 @@ struct LaunchParameters
     float environmentIntensity;
     float environmentRotation;
     uint environmentVisible;
-    uint environmentPadding;
+    uint environmentMipCount;
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
