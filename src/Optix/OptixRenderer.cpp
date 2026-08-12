@@ -103,9 +103,11 @@ struct LaunchParameters
     std::uint32_t samplesPerFrame;
     std::uint32_t accumulatedSamples;
     std::uint32_t rayTracedShadows;
+    std::uint32_t rayTracedReflections;
     std::uint32_t displayBgra;
     float exposure;
     std::uint32_t writeDisplay;
+    std::uint32_t padding[3];
     Vec4 cameraPositionAndFov;
     Vec4 cameraTargetAndAspect;
     Vec4 cameraUp;
@@ -124,8 +126,8 @@ struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) EmptyRecord
     std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
 };
 
-static_assert(sizeof(LaunchParameters) == 272);
-static_assert(sizeof(RaygenRecord) == 304);
+static_assert(sizeof(LaunchParameters) == 288);
+static_assert(sizeof(RaygenRecord) == 320);
 static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 } // namespace
 
@@ -345,7 +347,10 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         firstInteropLaunch_ = false;
         ++stats_.frameIndex;
         stats_.accumulatedSamples += settings.samplesPerFrame;
-        stats_.tracedRays = static_cast<std::uint64_t>(width_) * height_ * settings.samplesPerFrame;
+        const std::uint64_t pathDepth = settings.rayTracedReflections ? std::max(settings.maxBounces, 1u) : 1u;
+        const std::uint64_t shadowFactor = settings.rayTracedShadows ? 2u : 1u;
+        stats_.tracedRays = static_cast<std::uint64_t>(width_) * height_ * settings.samplesPerFrame * pathDepth *
+                            shadowFactor;
         stats_.frameMilliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
         return true;
     }
@@ -866,6 +871,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.samplesPerFrame = settings.samplesPerFrame;
         parameters.accumulatedSamples = static_cast<std::uint32_t>(stats_.accumulatedSamples);
         parameters.rayTracedShadows = settings.rayTracedShadows ? 1u : 0u;
+        parameters.rayTracedReflections = settings.rayTracedReflections ? 1u : 0u;
         parameters.displayBgra = interopBgra_ ? 1u : 0u;
         parameters.exposure = settings.exposure;
         parameters.writeDisplay = settings.denoiser ? 0u : 1u;

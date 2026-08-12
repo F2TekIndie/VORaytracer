@@ -95,10 +95,13 @@ private:
         Vec4 lightPosition{};
         Vec4 lightColorAndIntensity{};
         std::uint32_t rayTracedShadows{};
+        std::uint32_t rayTracedReflections{};
         float exposure{};
         std::uint32_t meshletCount{};
         std::uint32_t instanceCount{};
+        std::uint32_t padding[3]{};
     };
+    static_assert(sizeof(FramePushConstants) == 208);
 
     bool createInstance();
     bool createSurface();

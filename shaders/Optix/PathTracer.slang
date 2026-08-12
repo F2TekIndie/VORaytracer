@@ -32,9 +32,13 @@ struct LaunchParameters
     uint samplesPerFrame;
     uint accumulatedSamples;
     uint rayTracedShadows;
+    uint rayTracedReflections;
     uint displayBgra;
     float exposure;
     uint writeDisplay;
+    uint padding0;
+    uint padding1;
+    uint padding2;
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
@@ -95,14 +99,25 @@ void RayGen(LaunchParameters parameters)
         ray.TMin = 0.001;
         ray.TMax = 10000.0;
 
-        RadiancePayload payload;
-        payload.primitiveIndex = 0;
-        payload.barycentrics = float2(0.0);
-        payload.hitDistance = 0.0;
-        payload.hit = 0;
-        TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
-        if (payload.hit != 0)
+        float3 sampleRadiance = float3(0.0);
+        float3 throughput = float3(1.0);
+        uint bounceLimit = parameters.rayTracedReflections != 0 ? max(parameters.maxBounces, 1u) : 1u;
+        for (uint bounce = 0; bounce < bounceLimit; ++bounce)
         {
+            RadiancePayload payload;
+            payload.primitiveIndex = 0;
+            payload.barycentrics = float2(0.0);
+            payload.hitDistance = 0.0;
+            payload.hit = 0;
+            TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
+            if (payload.hit == 0)
+            {
+                float skyFactor = saturate(ray.Direction.y * 0.5 + 0.5);
+                float3 sky = lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
+                sampleRadiance += throughput * sky;
+                break;
+            }
+
             uint3 triangle = parameters.indices[payload.primitiveIndex];
             float barycentric0 = 1.0 - payload.barycentrics.x - payload.barycentrics.y;
             float3 normal = normalize(parameters.normals[triangle.x] * barycentric0 +
@@ -114,7 +129,7 @@ void RayGen(LaunchParameters parameters)
 
             uint materialIndex = parameters.triangleMaterialIndices[payload.primitiveIndex];
             GpuMaterial material = parameters.materials[materialIndex];
-            if (sampleIndex == 0 && parameters.writeDisplay == 0)
+            if (bounce == 0 && sampleIndex == 0 && parameters.writeDisplay == 0)
             {
                 guideAlbedo = material.baseColorAndMetallic.xyz;
                 guideNormal = normal;
@@ -123,11 +138,11 @@ void RayGen(LaunchParameters parameters)
             float3 lightVector = parameters.lightPosition.xyz - worldPosition;
             float lightDistance = max(length(lightVector), 0.0001);
             float3 lightDirection = lightVector / lightDistance;
+            float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
+            float rayBias = max(0.0001, coordinateScale * 0.00001);
             float visibility = 1.0;
             if (parameters.rayTracedShadows != 0)
             {
-                float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
-                float rayBias = max(0.0001, coordinateScale * 0.00001);
                 RayDesc shadowRay;
                 shadowRay.Origin = worldPosition + normal * rayBias;
                 shadowRay.Direction = lightDirection;
@@ -145,21 +160,58 @@ void RayGen(LaunchParameters parameters)
                          0xff, 0, 1, 0, shadowRay, shadowPayload);
                 visibility = shadowPayload.hit == 0 ? 1.0 : 0.0;
             }
-            float3 radiance = parameters.lightColorAndIntensity.xyz * parameters.lightColorAndIntensity.w * visibility;
+            float3 lightRadiance = parameters.lightColorAndIntensity.xyz *
+                                   parameters.lightColorAndIntensity.w * visibility;
+            float roughness = clamp(material.emissiveAndRoughness.w, 0.02, 1.0);
             float3 direct = evaluateMetallicRoughness(material.baseColorAndMetallic.xyz,
                                                       material.baseColorAndMetallic.w,
-                                                      material.emissiveAndRoughness.w,
+                                                      roughness,
                                                       normal,
                                                       viewDirection,
                                                       lightDirection,
-                                                      radiance);
-            sampleSum += direct + material.baseColorAndMetallic.xyz * 0.025 + material.emissiveAndRoughness.xyz;
+                                                      lightRadiance);
+            sampleRadiance += throughput *
+                              (direct + material.baseColorAndMetallic.xyz * 0.025 +
+                               material.emissiveAndRoughness.xyz);
+            if (bounce + 1 >= bounceLimit)
+                break;
+
+            float3 f0 = lerp(float3(0.04), material.baseColorAndMetallic.xyz,
+                             material.baseColorAndMetallic.w);
+            throughput *= fresnelSchlick(saturate(dot(normal, viewDirection)), f0);
+            float maximumThroughput = max(throughput.x, max(throughput.y, throughput.z));
+            if (maximumThroughput < 0.002)
+                break;
+            if (bounce >= 2)
+            {
+                float survival = clamp(maximumThroughput, 0.1, 0.95);
+                if (random01(seed ^ ((bounce + 1) * 0x9e3779b9u)) > survival)
+                    break;
+                throughput /= survival;
+            }
+
+            float randomPhi = random01(seed ^ ((bounce + 1) * 0x68bc21ebu));
+            float randomTheta = random01(seed ^ ((bounce + 1) * 0x02e5be93u));
+            float alpha = max(roughness * roughness, 0.002);
+            float phi = 2.0 * PI * randomPhi;
+            float cosTheta = sqrt((1.0 - randomTheta) /
+                                  max(1.0 + (alpha * alpha - 1.0) * randomTheta, 0.0001));
+            float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+            float3 tangent = normalize(cross(abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                                                      : float3(0.0, 1.0, 0.0),
+                                             normal));
+            float3 bitangent = cross(normal, tangent);
+            float3 halfway = normalize(tangent * (cos(phi) * sinTheta) +
+                                       bitangent * (sin(phi) * sinTheta) + normal * cosTheta);
+            float3 reflectedDirection = normalize(reflect(ray.Direction, halfway));
+            if (dot(reflectedDirection, normal) <= 0.001)
+                reflectedDirection = normalize(reflect(ray.Direction, normal));
+            ray.Origin = worldPosition + normal * rayBias;
+            ray.Direction = reflectedDirection;
+            ray.TMin = rayBias * 0.5;
+            ray.TMax = 10000.0;
         }
-        else
-        {
-            float skyFactor = saturate(ray.Direction.y * 0.5 + 0.5);
-            sampleSum += lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
-        }
+        sampleSum += sampleRadiance;
     }
 
     float3 current = sampleSum / float(sampleCount);

@@ -278,10 +278,17 @@ void Application::drawRenderPanel()
 
     ImGui::SeparatorText("PBR / Ray tracing");
     ImGui::SliderInt("Samples/frame", reinterpret_cast<int*>(&settings_.samplesPerFrame), 1, 16);
-    ImGui::SliderInt("Max bounces", reinterpret_cast<int*>(&settings_.maxBounces), 1, 16);
+    if (ImGui::SliderInt("Max bounces", reinterpret_cast<int*>(&settings_.maxBounces), 1, 16))
+        optixRenderer_.resetAccumulation();
     ImGui::SliderFloat("Exposure", &settings_.exposure, -8.0f, 8.0f);
     ImGui::Checkbox("Ray-traced shadows", &settings_.rayTracedShadows);
-    ImGui::Checkbox("Ray-traced reflections", &settings_.rayTracedReflections);
+    if (ImGui::Checkbox("Ray-traced reflections", &settings_.rayTracedReflections))
+    {
+        vulkanRenderer_.resetAccumulation();
+        optixRenderer_.resetAccumulation();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Vulkan: one inline Ray Query reflection.\nOptiX: rough PBR reflection paths up to Max bounces.");
     ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting);
     if (settings_.backend != BackendKind::Optix)
         ImGui::BeginDisabled();

@@ -69,6 +69,8 @@ Für einen automatisierten Start mit vorgewähltem OptiX-Backend kann vor dem Au
 
 Der OptiX-AI-Denoiser kann im Renderer-Fenster aktiviert werden. Für automatisierte Smoke-Tests lässt er sich mit `VOR_DENOISER=1` bereits beim Start einschalten; er nutzt Albedo- und Welt-Normalen-Guides und schreibt das Ergebnis vollständig auf der GPU in den Vulkan-Interop-Puffer.
 
+„Ray-traced reflections“ aktiviert im Vulkan-Backend eine Inline-Ray-Query-Reflexion pro sichtbarem Fragment inklusive Material- und Schattenauswertung am Treffer. Im OptiX-Backend werden raue, Fresnel-gewichtete PBR-Reflexionspfade verfolgt; „Max bounces“ begrenzt dort die Pfadtiefe.
+
 Für reproduzierbare Import-Smoke-Tests kann ein Startmodell über `VOR_SCENE=<absoluter Dateipfad>` vorgegeben werden.
 
 ## Tests

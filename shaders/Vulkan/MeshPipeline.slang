@@ -34,6 +34,9 @@ struct GpuInstance
     float4x4 transform;
     float4x4 normalTransform;
     float4 scaleAndFlags;
+    uint4 geometry;
+    float4 baseColorAndMetallic;
+    float4 emissiveAndRoughness;
 };
 
 struct FramePushConstants
@@ -44,9 +47,13 @@ struct FramePushConstants
     float4 lightPosition;
     float4 lightColorAndIntensity;
     uint rayTracedShadows;
+    uint rayTracedReflections;
     float exposure;
     uint meshletCount;
     uint instanceCount;
+    uint padding0;
+    uint padding1;
+    uint padding2;
 };
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
@@ -55,6 +62,7 @@ struct FramePushConstants
 [[vk::binding(3, 0)]] StructuredBuffer<uint> meshletTriangleIndices;
 [[vk::binding(4, 0)]] RaytracingAccelerationStructure sceneTlas;
 [[vk::binding(5, 0)]] StructuredBuffer<GpuInstance> sceneInstances;
+[[vk::binding(6, 0)]] StructuredBuffer<uint> geometryIndices;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -183,6 +191,78 @@ FragmentOutput FragmentMain(MeshVertex input)
                                              normal, viewDirection, lightDirection,
                                              frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility);
     color += baseColor * 0.025;
+    if (frame.rayTracedReflections != 0)
+    {
+        float coordinateScale = max(max(abs(input.worldPosition.x), abs(input.worldPosition.y)), abs(input.worldPosition.z));
+        float rayBias = max(0.0001, coordinateScale * 0.00001);
+        RayDesc reflectionRay;
+        reflectionRay.Origin = input.worldPosition + normal * rayBias;
+        reflectionRay.Direction = normalize(reflect(-viewDirection, normal));
+        reflectionRay.TMin = rayBias * 0.5;
+        reflectionRay.TMax = 10000.0;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectionQuery;
+        reflectionQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, reflectionRay);
+        reflectionQuery.Proceed();
+
+        float3 reflectedRadiance;
+        if (reflectionQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            uint instanceIndex = reflectionQuery.CommittedInstanceID();
+            GpuInstance hitInstance = sceneInstances[instanceIndex];
+            uint primitiveIndex = reflectionQuery.CommittedPrimitiveIndex();
+            uint triangleOffset = hitInstance.geometry.y + primitiveIndex * 3;
+            uint3 triangle = uint3(geometryIndices[triangleOffset],
+                                   geometryIndices[triangleOffset + 1],
+                                   geometryIndices[triangleOffset + 2]);
+            float2 barycentrics = reflectionQuery.CommittedTriangleBarycentrics();
+            float barycentric0 = 1.0 - barycentrics.x - barycentrics.y;
+            float3 hitNormal = normalize(sceneVertices[hitInstance.geometry.x + triangle.x].normal.xyz * barycentric0 +
+                                         sceneVertices[hitInstance.geometry.x + triangle.y].normal.xyz * barycentrics.x +
+                                         sceneVertices[hitInstance.geometry.x + triangle.z].normal.xyz * barycentrics.y);
+            hitNormal = normalize(mul((float3x3)hitInstance.normalTransform, hitNormal));
+            float3 reflectedViewDirection = normalize(-reflectionRay.Direction);
+            if (dot(hitNormal, reflectedViewDirection) < 0.0)
+                hitNormal = -hitNormal;
+            float3 hitPosition = reflectionRay.Origin + reflectionRay.Direction * reflectionQuery.CommittedRayT();
+            float3 hitLightVector = frame.lightPosition.xyz - hitPosition;
+            float hitLightDistance = max(length(hitLightVector), 0.0001);
+            float3 hitLightDirection = hitLightVector / hitLightDistance;
+            float hitVisibility = 1.0;
+            if (frame.rayTracedShadows != 0)
+            {
+                float hitCoordinateScale = max(max(abs(hitPosition.x), abs(hitPosition.y)), abs(hitPosition.z));
+                float hitRayBias = max(0.0001, hitCoordinateScale * 0.00001);
+                RayDesc reflectedShadowRay;
+                reflectedShadowRay.Origin = hitPosition + hitNormal * hitRayBias;
+                reflectedShadowRay.Direction = hitLightDirection;
+                reflectedShadowRay.TMin = hitRayBias * 0.5;
+                reflectedShadowRay.TMax = max(hitLightDistance - hitRayBias, hitRayBias);
+                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectedShadowQuery;
+                reflectedShadowQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, reflectedShadowRay);
+                reflectedShadowQuery.Proceed();
+                hitVisibility = reflectedShadowQuery.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+            }
+            reflectedRadiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
+                                                           hitInstance.baseColorAndMetallic.w,
+                                                           hitInstance.emissiveAndRoughness.w,
+                                                           hitNormal,
+                                                           reflectedViewDirection,
+                                                           hitLightDirection,
+                                                           frame.lightColorAndIntensity.xyz *
+                                                               frame.lightColorAndIntensity.w * hitVisibility);
+            reflectedRadiance += hitInstance.baseColorAndMetallic.xyz * 0.025 +
+                                 hitInstance.emissiveAndRoughness.xyz;
+        }
+        else
+        {
+            float skyFactor = saturate(reflectionRay.Direction.y * 0.5 + 0.5);
+            reflectedRadiance = lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
+        }
+        float3 reflectionF0 = lerp(float3(0.04), baseColor, input.baseColorAndMetallic.w);
+        float3 reflectionWeight = fresnelSchlick(saturate(dot(normal, viewDirection)), reflectionF0) *
+                                  (1.0 - saturate(input.roughness) * 0.75);
+        color += reflectedRadiance * reflectionWeight;
+    }
     color *= exp2(frame.exposure);
     color = max(color, 0.0);
     color = color / (1.0 + color);
