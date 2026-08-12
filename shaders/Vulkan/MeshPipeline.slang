@@ -51,7 +51,7 @@ struct FramePushConstants
     float exposure;
     uint meshletCount;
     uint instanceCount;
-    uint padding0;
+    uint showMeshlets;
     uint padding1;
     uint padding2;
 };
@@ -73,12 +73,32 @@ struct MeshVertex
     float2 uv : TEXCOORD0;
     nointerpolation float4 baseColorAndMetallic : TEXCOORD1;
     nointerpolation float roughness : TEXCOORD2;
+    nointerpolation uint meshletIndex : TEXCOORD3;
 };
 
 struct FragmentOutput
 {
     float4 color : SV_Target0;
 };
+
+uint meshletHash(uint value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+float3 meshletDebugColor(uint meshletIndex)
+{
+    uint hash = meshletHash(meshletIndex + 1u);
+    float3 color = float3(float(hash & 0xffu),
+                          float((hash >> 8) & 0xffu),
+                          float((hash >> 16) & 0xffu)) / 255.0;
+    return 0.2 + color * 0.8;
+}
 
 [shader("amplification")]
 [numthreads(1, 1, 1)]
@@ -152,6 +172,7 @@ void MeshMain(
         vertices[outputVertex].uv = source.uv.xy;
         vertices[outputVertex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
         vertices[outputVertex].roughness = meshlet.materialParameters.x;
+        vertices[outputVertex].meshletIndex = taskPayload.meshletIndex;
     }
     for (uint outputTriangle = threadIndex; outputTriangle < meshlet.triangleCount; outputTriangle += 32)
     {
@@ -164,6 +185,11 @@ void MeshMain(
 FragmentOutput FragmentMain(MeshVertex input)
 {
     FragmentOutput output;
+    if (frame.showMeshlets != 0)
+    {
+        output.color = float4(meshletDebugColor(input.meshletIndex), 1.0);
+        return output;
+    }
     float3 normal = normalize(input.worldNormal);
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
     if (dot(normal, viewDirection) < 0.0)

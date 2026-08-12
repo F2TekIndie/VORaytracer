@@ -99,7 +99,8 @@ private:
         float exposure{};
         std::uint32_t meshletCount{};
         std::uint32_t instanceCount{};
-        std::uint32_t padding[3]{};
+        std::uint32_t showMeshlets{};
+        std::uint32_t padding[2]{};
     };
     static_assert(sizeof(FramePushConstants) == 208);
 

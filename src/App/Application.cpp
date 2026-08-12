@@ -111,6 +111,9 @@ bool Application::initialize()
     if (const char* requestedDenoiser = std::getenv("VOR_DENOISER");
         requestedDenoiser && std::strcmp(requestedDenoiser, "1") == 0)
         settings_.denoiser = true;
+    if (const char* requestedMeshletDebug = std::getenv("VOR_MESHLET_DEBUG");
+        requestedMeshletDebug && std::strcmp(requestedMeshletDebug, "1") == 0)
+        settings_.showMeshlets = true;
 
     const AssetLoadOptions loadOptions{
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
@@ -297,7 +300,13 @@ void Application::drawRenderPanel()
         ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("OptiX AI denoiser with albedo and world-normal guides.");
+    if (settings_.backend != BackendKind::VulkanHybrid)
+        ImGui::BeginDisabled();
     ImGui::Checkbox("Meshlet debug colors", &settings_.showMeshlets);
+    if (settings_.backend != BackendKind::VulkanHybrid)
+        ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Shows every Vulkan meshlet with a stable pseudo-random color.");
 
     ImGui::SeparatorText("Key light");
     if (!scene_.lights.empty())

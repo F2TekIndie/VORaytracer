@@ -375,6 +375,7 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         framePushConstants_.exposure = settings.exposure;
         framePushConstants_.meshletCount = uploadedMeshletCount_;
         framePushConstants_.instanceCount = static_cast<std::uint32_t>(uploadedInstances_.size());
+        framePushConstants_.showMeshlets = settings.showMeshlets ? 1u : 0u;
 
         ImGui::Render();
         FrameResources& frame = frames_[frameSlot_];

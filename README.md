@@ -71,6 +71,8 @@ Der OptiX-AI-Denoiser kann im Renderer-Fenster aktiviert werden. Für automatisi
 
 „Ray-traced reflections“ aktiviert im Vulkan-Backend eine Inline-Ray-Query-Reflexion pro sichtbarem Fragment inklusive Material- und Schattenauswertung am Treffer. Im OptiX-Backend werden raue, Fresnel-gewichtete PBR-Reflexionspfade verfolgt; „Max bounces“ begrenzt dort die Pfadtiefe.
 
+„Meshlet debug colors“ ersetzt im Vulkan-Backend die Materialausgabe durch eine stabile, pseudozufällige Farbe pro Meshlet. Dadurch werden Meshlet-Grenzen und die von `meshoptimizer` erzeugte Partitionierung direkt sichtbar. Für automatisierte Starts kann der Modus mit `VOR_MESHLET_DEBUG=1` aktiviert werden.
+
 Für reproduzierbare Import-Smoke-Tests kann ein Startmodell über `VOR_SCENE=<absoluter Dateipfad>` vorgegeben werden.
 
 ## Tests
