@@ -106,6 +106,34 @@ struct Light
     float outerCone{0.7f};
 };
 
+enum class GlobalLightMode : std::uint32_t
+{
+    Directional,
+    HdrEnvironment,
+    ProceduralSky,
+};
+
+struct Environment
+{
+    GlobalLightMode mode{GlobalLightMode::Directional};
+    std::filesystem::path hdrPath;
+    std::vector<Vec4> hdrPixels;
+    std::uint32_t hdrWidth{};
+    std::uint32_t hdrHeight{};
+    float intensity{1.0f};
+    float rotationRadians{};
+    Vec3 zenithColor{0.12f, 0.32f, 0.75f};
+    Vec3 horizonColor{0.65f, 0.75f, 0.90f};
+    Vec3 groundColor{0.035f, 0.035f, 0.04f};
+    bool visibleBackground{true};
+
+    [[nodiscard]] bool hasHdr() const
+    {
+        return hdrWidth > 0 && hdrHeight > 0 &&
+               hdrPixels.size() == static_cast<std::size_t>(hdrWidth) * hdrHeight;
+    }
+};
+
 struct Camera
 {
     Vec3 position{0.0f, 1.5f, 4.0f};
@@ -125,6 +153,7 @@ struct Scene
     std::vector<TextureReference> textures;
     std::vector<Instance> instances;
     std::vector<Light> lights;
+    Environment environment{};
     Camera camera{};
 
     [[nodiscard]] std::size_t triangleCount() const;

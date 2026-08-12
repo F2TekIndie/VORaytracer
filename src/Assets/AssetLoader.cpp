@@ -9,8 +9,13 @@
 #include <assimp/scene.h>
 #include <meshoptimizer.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_HDR
+#include <stb_image.h>
+
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -186,12 +191,64 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
     visitNode(imported->mRootNode, Mat4::identity());
 
     if (scene.lights.empty())
-        scene.lights.push_back(Light{.name = "Sun"});
+        scene.lights.push_back(Light{.name = "Sun", .type = LightType::Directional});
     if (options.addGroundPlane)
         appendGroundPlane(scene, options.enableOptionalMeshoptimizerPasses);
 
     log(LogLevel::Info, "Loaded scene '" + scene.name + "' with " + std::to_string(scene.meshes.size()) + " meshes");
     return {.scene = std::move(scene)};
+}
+
+bool AssetLoader::loadHdrEnvironment(const std::filesystem::path& path,
+                                     Environment& environment,
+                                     std::string& error) const
+{
+    const std::string filename = path.string();
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    if (!stbi_is_hdr(filename.c_str()))
+    {
+        error = "The selected file is not a Radiance HDR image";
+        return false;
+    }
+    if (!stbi_info(filename.c_str(), &width, &height, &channels))
+    {
+        error = stbi_failure_reason() ? stbi_failure_reason() : "Cannot read HDR metadata";
+        return false;
+    }
+    constexpr std::uint64_t maxHdrPixels = 8192ull * 4096ull;
+    if (width <= 0 || height <= 0 || width > 16384 || height > 8192 ||
+        static_cast<std::uint64_t>(width) * height > maxHdrPixels)
+    {
+        error = "HDR dimensions are invalid or exceed the 8192x4096 pixel budget";
+        return false;
+    }
+    float* pixels = stbi_loadf(filename.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+    if (!pixels)
+    {
+        error = stbi_failure_reason() ? stbi_failure_reason() : "Unknown HDR decode error";
+        return false;
+    }
+
+    const std::size_t pixelCount = static_cast<std::size_t>(width) * height;
+    std::vector<Vec4> decoded(pixelCount);
+    for (std::size_t index = 0; index < pixelCount; ++index)
+    {
+        const float* source = pixels + index * 4;
+        decoded[index] = {std::isfinite(source[0]) ? std::max(source[0], 0.0f) : 0.0f,
+                          std::isfinite(source[1]) ? std::max(source[1], 0.0f) : 0.0f,
+                          std::isfinite(source[2]) ? std::max(source[2], 0.0f) : 0.0f,
+                          1.0f};
+    }
+    stbi_image_free(pixels);
+    environment.hdrPath = path;
+    environment.hdrWidth = static_cast<std::uint32_t>(width);
+    environment.hdrHeight = static_cast<std::uint32_t>(height);
+    environment.hdrPixels = std::move(decoded);
+    environment.mode = GlobalLightMode::HdrEnvironment;
+    error.clear();
+    return true;
 }
 
 Scene AssetLoader::createProceduralCube(AssetLoadOptions options) const

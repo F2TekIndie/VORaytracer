@@ -42,10 +42,16 @@ struct GpuInstance
 struct FramePushConstants
 {
     float4x4 viewProjection;
-    float4x4 model;
     float4 cameraPosition;
-    float4 lightPosition;
+    float4 cameraForwardAndFov;
+    float4 cameraRightAndAspect;
+    float4 cameraUp;
     float4 lightColorAndIntensity;
+    float4 lightDirectionAndMode;
+    float4 environmentParameters;
+    float4 skyZenithAndVisibility;
+    float4 skyHorizonAndIndirect;
+    float4 skyGround;
     uint rayTracedShadows;
     uint rayTracedReflections;
     float exposure;
@@ -63,6 +69,7 @@ struct FramePushConstants
 [[vk::binding(4, 0)]] RaytracingAccelerationStructure sceneTlas;
 [[vk::binding(5, 0)]] StructuredBuffer<GpuInstance> sceneInstances;
 [[vk::binding(6, 0)]] StructuredBuffer<uint> geometryIndices;
+[[vk::binding(7, 0)]] StructuredBuffer<float4> environmentPixels;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -79,6 +86,12 @@ struct MeshVertex
 struct FragmentOutput
 {
     float4 color : SV_Target0;
+};
+
+struct BackgroundVertexOutput
+{
+    float4 position : SV_Position;
+    float3 direction : TEXCOORD0;
 };
 
 uint meshletHash(uint value)
@@ -98,6 +111,161 @@ float3 meshletDebugColor(uint meshletIndex)
                           float((hash >> 8) & 0xffu),
                           float((hash >> 16) & 0xffu)) / 255.0;
     return 0.2 + color * 0.8;
+}
+
+float3 rotateEnvironmentDirection(float3 direction)
+{
+    float angle = frame.environmentParameters.w;
+    float sine = sin(angle);
+    float cosine = cos(angle);
+    float3 yawRotated = float3(cosine * direction.x - sine * direction.z,
+                               direction.y,
+                               sine * direction.x + cosine * direction.z);
+    float pitch = asin(clamp(frame.lightDirectionAndMode.y, -1.0, 1.0));
+    float pitchSine = sin(pitch);
+    float pitchCosine = cos(pitch);
+    return float3(yawRotated.x,
+                  pitchCosine * yawRotated.y + pitchSine * yawRotated.z,
+                  -pitchSine * yawRotated.y + pitchCosine * yawRotated.z);
+}
+
+float3 sampleHdrEnvironment(float3 direction)
+{
+    uint width = uint(frame.environmentParameters.x);
+    uint height = uint(frame.environmentParameters.y);
+    if (width == 0 || height == 0)
+        return float3(0.0);
+    float3 rotated = rotateEnvironmentDirection(normalize(direction));
+    float2 uv = float2(atan2(rotated.z, rotated.x) / (2.0 * PI) + 0.5,
+                            acos(clamp(rotated.y, -1.0, 1.0)) / PI);
+    float2 texel = uv * float2(width, height) - 0.5;
+    int2 base = int2(floor(texel));
+    float2 fraction = frac(texel);
+    uint x0 = uint((base.x % int(width) + int(width)) % int(width));
+    uint x1 = (x0 + 1) % width;
+    uint y0 = uint(clamp(base.y, 0, int(height) - 1));
+    uint y1 = min(y0 + 1, height - 1);
+    float3 a = lerp(environmentPixels[y0 * width + x0].xyz,
+                    environmentPixels[y0 * width + x1].xyz, fraction.x);
+    float3 b = lerp(environmentPixels[y1 * width + x0].xyz,
+                    environmentPixels[y1 * width + x1].xyz, fraction.x);
+    return lerp(a, b, fraction.y);
+}
+
+float3 sampleGlobalEnvironment(float3 direction)
+{
+    uint mode = uint(frame.lightDirectionAndMode.w + 0.5);
+    if (mode == 1)
+        return sampleHdrEnvironment(direction) * frame.environmentParameters.z;
+    if (mode == 2)
+    {
+        float3 normalizedDirection = normalize(direction);
+        float upperBlend = pow(saturate(normalizedDirection.y), 0.45);
+        float lowerBlend = pow(saturate(-normalizedDirection.y), 0.35);
+        float3 sky = lerp(frame.skyHorizonAndIndirect.xyz, frame.skyZenithAndVisibility.xyz, upperBlend);
+        sky = lerp(sky, frame.skyGround.xyz, lowerBlend);
+        float sun = pow(saturate(dot(normalizedDirection, normalize(-frame.lightDirectionAndMode.xyz))), 512.0);
+        return (sky + frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * sun) *
+               frame.environmentParameters.z;
+    }
+    return float3(0.0);
+}
+
+float hash01(float3 value)
+{
+    return frac(sin(dot(value, float3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
+{
+    float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
+    float rayBias = max(0.0001, coordinateScale * 0.00001);
+    float random0 = hash01(worldPosition + normal * 17.0);
+    float random1 = hash01(worldPosition.zxy * 3.1 + normal.yzx * 29.0);
+    float phi = 2.0 * PI * random0;
+    float cosTheta = sqrt(1.0 - random1);
+    float sinTheta = sqrt(random1);
+    float3 tangent = normalize(cross(abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                                               : float3(0.0, 1.0, 0.0), normal));
+    float3 bitangent = cross(normal, tangent);
+    float3 bounceDirection = normalize(tangent * cos(phi) * sinTheta +
+                                       bitangent * sin(phi) * sinTheta + normal * cosTheta);
+    RayDesc bounceRay;
+    bounceRay.Origin = worldPosition + normal * rayBias;
+    bounceRay.Direction = bounceDirection;
+    bounceRay.TMin = rayBias * 0.5;
+    bounceRay.TMax = 10000.0;
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> bounceQuery;
+    bounceQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, bounceRay);
+    bounceQuery.Proceed();
+    if (bounceQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+        return sampleGlobalEnvironment(bounceDirection);
+
+    GpuInstance hitInstance = sceneInstances[bounceQuery.CommittedInstanceID()];
+    uint triangleOffset = hitInstance.geometry.y + bounceQuery.CommittedPrimitiveIndex() * 3;
+    uint3 triangle = uint3(geometryIndices[triangleOffset], geometryIndices[triangleOffset + 1],
+                           geometryIndices[triangleOffset + 2]);
+    float2 barycentrics = bounceQuery.CommittedTriangleBarycentrics();
+    float barycentric0 = 1.0 - barycentrics.x - barycentrics.y;
+    float3 hitNormal = normalize(sceneVertices[hitInstance.geometry.x + triangle.x].normal.xyz * barycentric0 +
+                                 sceneVertices[hitInstance.geometry.x + triangle.y].normal.xyz * barycentrics.x +
+                                 sceneVertices[hitInstance.geometry.x + triangle.z].normal.xyz * barycentrics.y);
+    hitNormal = normalize(mul((float3x3)hitInstance.normalTransform, hitNormal));
+    float3 hitViewDirection = -bounceDirection;
+    if (dot(hitNormal, hitViewDirection) < 0.0)
+        hitNormal = -hitNormal;
+    float3 hitPosition = bounceRay.Origin + bounceDirection * bounceQuery.CommittedRayT();
+    float3 lightDirection = normalize(-frame.lightDirectionAndMode.xyz);
+    float visibility = 1.0;
+    if (frame.rayTracedShadows != 0 && uint(frame.lightDirectionAndMode.w + 0.5) != 1)
+    {
+        float hitScale = max(max(abs(hitPosition.x), abs(hitPosition.y)), abs(hitPosition.z));
+        float hitBias = max(0.0001, hitScale * 0.00001);
+        RayDesc shadowRay;
+        shadowRay.Origin = hitPosition + hitNormal * hitBias;
+        shadowRay.Direction = lightDirection;
+        shadowRay.TMin = hitBias * 0.5;
+        shadowRay.TMax = 10000.0;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> shadowQuery;
+        shadowQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, shadowRay);
+        shadowQuery.Proceed();
+        visibility = shadowQuery.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+    }
+    float3 directRadiance = uint(frame.lightDirectionAndMode.w + 0.5) == 1 ? float3(0.0) :
+                            frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
+    float3 radiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
+                                                 hitInstance.baseColorAndMetallic.w,
+                                                 hitInstance.emissiveAndRoughness.w,
+                                                 hitNormal, hitViewDirection, lightDirection, directRadiance);
+    radiance += sampleGlobalEnvironment(hitNormal) * hitInstance.baseColorAndMetallic.xyz *
+                (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
+    return radiance + hitInstance.emissiveAndRoughness.xyz;
+}
+
+[shader("vertex")]
+BackgroundVertexOutput BackgroundVertex(uint vertexIndex : SV_VertexID)
+{
+    BackgroundVertexOutput output;
+    float2 position = vertexIndex == 0 ? float2(-1.0, -1.0) :
+                      vertexIndex == 1 ? float2(-1.0, 3.0) : float2(3.0, -1.0);
+    output.position = float4(position, 0.0, 1.0);
+    output.direction = normalize(frame.cameraForwardAndFov.xyz +
+                                 frame.cameraRightAndAspect.xyz * position.x *
+                                     frame.cameraRightAndAspect.w * frame.cameraForwardAndFov.w -
+                                 frame.cameraUp.xyz * position.y * frame.cameraForwardAndFov.w);
+    return output;
+}
+
+[shader("fragment")]
+FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
+{
+    FragmentOutput output;
+    float3 color = frame.skyZenithAndVisibility.w != 0.0
+                       ? sampleGlobalEnvironment(input.direction) : float3(0.0);
+    color = max(color * exp2(frame.exposure), 0.0);
+    color = color / (1.0 + color);
+    output.color = float4(color, 1.0);
+    return output;
 }
 
 [shader("amplification")]
@@ -194,9 +362,9 @@ FragmentOutput FragmentMain(MeshVertex input)
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
     if (dot(normal, viewDirection) < 0.0)
         normal = -normal;
-    float3 lightVector = frame.lightPosition.xyz - input.worldPosition;
-    float lightDistance = max(length(lightVector), 0.0001);
-    float3 lightDirection = lightVector / lightDistance;
+    uint globalLightMode = uint(frame.lightDirectionAndMode.w + 0.5);
+    float lightDistance = 10000.0;
+    float3 lightDirection = normalize(-frame.lightDirectionAndMode.xyz);
     float3 baseColor = input.baseColorAndMetallic.xyz;
     float visibility = 1.0;
     if (frame.rayTracedShadows != 0)
@@ -213,10 +381,15 @@ FragmentOutput FragmentMain(MeshVertex input)
         query.Proceed();
         visibility = query.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
     }
+    float3 directRadiance = globalLightMode == 1 ? float3(0.0) :
+                            frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
     float3 color = evaluateMetallicRoughness(baseColor, input.baseColorAndMetallic.w, input.roughness,
-                                             normal, viewDirection, lightDirection,
-                                             frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility);
-    color += baseColor * 0.025;
+                                             normal, viewDirection, lightDirection, directRadiance);
+    if (frame.skyHorizonAndIndirect.w != 0.0)
+    {
+        color += traceDiffuseBounce(input.worldPosition, normal) * baseColor *
+                 (1.0 - input.baseColorAndMetallic.w);
+    }
     if (frame.rayTracedReflections != 0)
     {
         float coordinateScale = max(max(abs(input.worldPosition.x), abs(input.worldPosition.y)), abs(input.worldPosition.z));
@@ -250,9 +423,8 @@ FragmentOutput FragmentMain(MeshVertex input)
             if (dot(hitNormal, reflectedViewDirection) < 0.0)
                 hitNormal = -hitNormal;
             float3 hitPosition = reflectionRay.Origin + reflectionRay.Direction * reflectionQuery.CommittedRayT();
-            float3 hitLightVector = frame.lightPosition.xyz - hitPosition;
-            float hitLightDistance = max(length(hitLightVector), 0.0001);
-            float3 hitLightDirection = hitLightVector / hitLightDistance;
+            float hitLightDistance = 10000.0;
+            float3 hitLightDirection = normalize(-frame.lightDirectionAndMode.xyz);
             float hitVisibility = 1.0;
             if (frame.rayTracedShadows != 0)
             {
@@ -268,21 +440,24 @@ FragmentOutput FragmentMain(MeshVertex input)
                 reflectedShadowQuery.Proceed();
                 hitVisibility = reflectedShadowQuery.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
             }
+            float3 hitDirectRadiance = globalLightMode == 1 ? float3(0.0) :
+                                       frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
             reflectedRadiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
                                                            hitInstance.baseColorAndMetallic.w,
                                                            hitInstance.emissiveAndRoughness.w,
                                                            hitNormal,
                                                            reflectedViewDirection,
                                                            hitLightDirection,
-                                                           frame.lightColorAndIntensity.xyz *
-                                                               frame.lightColorAndIntensity.w * hitVisibility);
-            reflectedRadiance += hitInstance.baseColorAndMetallic.xyz * 0.025 +
-                                 hitInstance.emissiveAndRoughness.xyz;
+                                                           hitDirectRadiance);
+            if (frame.skyHorizonAndIndirect.w != 0.0)
+                reflectedRadiance += sampleGlobalEnvironment(hitNormal) *
+                                     hitInstance.baseColorAndMetallic.xyz *
+                                     (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
+            reflectedRadiance += hitInstance.emissiveAndRoughness.xyz;
         }
         else
         {
-            float skyFactor = saturate(reflectionRay.Direction.y * 0.5 + 0.5);
-            reflectedRadiance = lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
+            reflectedRadiance = sampleGlobalEnvironment(reflectionRay.Direction);
         }
         float3 reflectionF0 = lerp(float3(0.04), baseColor, input.baseColorAndMetallic.w);
         float3 reflectionWeight = fresnelSchlick(saturate(dot(normal, viewDirection)), reflectionF0) *

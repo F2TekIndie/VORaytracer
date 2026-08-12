@@ -95,6 +95,7 @@ struct LaunchParameters
     SlangStructuredBuffer indices;
     SlangStructuredBuffer triangleMaterialIndices;
     SlangStructuredBuffer materials;
+    SlangStructuredBuffer environmentPixels;
     OptixTraversableHandle scene;
     std::uint32_t width;
     std::uint32_t height;
@@ -108,11 +109,23 @@ struct LaunchParameters
     float exposure;
     std::uint32_t writeDisplay;
     std::uint32_t padding[3];
+    std::uint32_t indirectLighting;
+    std::uint32_t globalLightMode;
+    std::uint32_t environmentWidth;
+    std::uint32_t environmentHeight;
+    float environmentIntensity;
+    float environmentRotation;
+    std::uint32_t environmentVisible;
+    std::uint32_t environmentPadding;
     Vec4 cameraPositionAndFov;
     Vec4 cameraTargetAndAspect;
     Vec4 cameraUp;
     Vec4 lightPosition;
     Vec4 lightColorAndIntensity;
+    Vec4 lightDirection;
+    Vec4 skyZenith;
+    Vec4 skyHorizon;
+    Vec4 skyGround;
 };
 
 struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) RaygenRecord
@@ -126,8 +139,8 @@ struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) EmptyRecord
     std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
 };
 
-static_assert(sizeof(LaunchParameters) == 288);
-static_assert(sizeof(RaygenRecord) == 320);
+static_assert(sizeof(LaunchParameters) == 400);
+static_assert(sizeof(RaygenRecord) == 432);
 static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 } // namespace
 
@@ -614,18 +627,26 @@ bool OptixRenderer::buildSceneAcceleration()
             }
         }
         const std::size_t materialBytes = materials.size() * sizeof(GpuMaterial);
+        const Vec4 fallbackEnvironment{0.0f, 0.0f, 0.0f, 1.0f};
+        const Vec4* environmentData = scene_->environment.hasHdr() ? scene_->environment.hdrPixels.data()
+                                                                   : &fallbackEnvironment;
+        environmentPixelCount_ = scene_->environment.hasHdr() ? scene_->environment.hdrPixels.size() : 1;
+        const std::size_t environmentBytes = environmentPixelCount_ * sizeof(Vec4);
         checkCuda(cuMemAlloc(&vertexBuffer_, vertexBytes), "cuMemAlloc(OptiX vertices)");
         checkCuda(cuMemAlloc(&normalBuffer_, normalBytes), "cuMemAlloc(OptiX normals)");
         checkCuda(cuMemAlloc(&indexBuffer_, indexBytes), "cuMemAlloc(OptiX indices)");
         checkCuda(cuMemAlloc(&triangleMaterialIndexBuffer_, triangleMaterialBytes),
                   "cuMemAlloc(OptiX triangle materials)");
         checkCuda(cuMemAlloc(&materialBuffer_, materialBytes), "cuMemAlloc(OptiX materials)");
+        checkCuda(cuMemAlloc(&environmentBuffer_, environmentBytes), "cuMemAlloc(OptiX HDR environment)");
         checkCuda(cuMemcpyHtoD(vertexBuffer_, positions.data(), vertexBytes), "cuMemcpyHtoD(OptiX vertices)");
         checkCuda(cuMemcpyHtoD(normalBuffer_, normals.data(), normalBytes), "cuMemcpyHtoD(OptiX normals)");
         checkCuda(cuMemcpyHtoD(indexBuffer_, indices.data(), indexBytes), "cuMemcpyHtoD(OptiX indices)");
         checkCuda(cuMemcpyHtoD(triangleMaterialIndexBuffer_, triangleMaterialIndices.data(), triangleMaterialBytes),
                   "cuMemcpyHtoD(OptiX triangle materials)");
         checkCuda(cuMemcpyHtoD(materialBuffer_, materials.data(), materialBytes), "cuMemcpyHtoD(OptiX materials)");
+        checkCuda(cuMemcpyHtoD(environmentBuffer_, environmentData, environmentBytes),
+                  "cuMemcpyHtoD(OptiX HDR environment)");
         vertexCount_ = positions.size();
         triangleCount_ = indices.size() / 3;
         materialCount_ = materials.size();
@@ -681,6 +702,8 @@ void OptixRenderer::destroySceneAcceleration()
         cuMemFree(indexBuffer_);
     if (materialBuffer_)
         cuMemFree(materialBuffer_);
+    if (environmentBuffer_)
+        cuMemFree(environmentBuffer_);
     if (triangleMaterialIndexBuffer_)
         cuMemFree(triangleMaterialIndexBuffer_);
     if (normalBuffer_)
@@ -690,12 +713,14 @@ void OptixRenderer::destroySceneAcceleration()
     gasBuffer_ = 0;
     indexBuffer_ = 0;
     materialBuffer_ = 0;
+    environmentBuffer_ = 0;
     triangleMaterialIndexBuffer_ = 0;
     normalBuffer_ = 0;
     vertexBuffer_ = 0;
     vertexCount_ = 0;
     triangleCount_ = 0;
     materialCount_ = 0;
+    environmentPixelCount_ = 0;
     gasHandle_ = 0;
 }
 
@@ -863,6 +888,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.indices = {indexBuffer_, triangleCount_};
         parameters.triangleMaterialIndices = {triangleMaterialIndexBuffer_, triangleCount_};
         parameters.materials = {materialBuffer_, materialCount_};
+        parameters.environmentPixels = {environmentBuffer_, environmentPixelCount_};
         parameters.scene = gasHandle_;
         parameters.width = width_;
         parameters.height = height_;
@@ -875,6 +901,15 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.displayBgra = interopBgra_ ? 1u : 0u;
         parameters.exposure = settings.exposure;
         parameters.writeDisplay = settings.denoiser ? 0u : 1u;
+        const Environment fallbackEnvironment{};
+        const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
+        parameters.indirectLighting = settings.indirectLighting ? 1u : 0u;
+        parameters.globalLightMode = static_cast<std::uint32_t>(environment.mode);
+        parameters.environmentWidth = environment.hdrWidth;
+        parameters.environmentHeight = environment.hdrHeight;
+        parameters.environmentIntensity = environment.intensity;
+        parameters.environmentRotation = environment.rotationRadians;
+        parameters.environmentVisible = environment.visibleBackground ? 1u : 0u;
         parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
                                            camera.verticalFovDegrees * kPi / 180.0f};
         parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
@@ -883,6 +918,13 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
         parameters.lightPosition = {light.position.x, light.position.y, light.position.z, 1.0f};
         parameters.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
+        parameters.lightDirection = {light.direction.x, light.direction.y, light.direction.z, 0.0f};
+        parameters.skyZenith = {environment.zenithColor.x, environment.zenithColor.y,
+                                environment.zenithColor.z, 0.0f};
+        parameters.skyHorizon = {environment.horizonColor.x, environment.horizonColor.y,
+                                 environment.horizonColor.z, 0.0f};
+        parameters.skyGround = {environment.groundColor.x, environment.groundColor.y,
+                                environment.groundColor.z, 0.0f};
 
         checkCuda(cuMemcpyHtoDAsync(raygenRecord_ + offsetof(RaygenRecord, parameters), &parameters,
                                     sizeof(parameters), cudaStream_),

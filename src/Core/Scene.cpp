@@ -29,8 +29,7 @@ Scene makeDefaultScene()
     Scene scene{};
     scene.name = "Procedural Cube";
     scene.materials.push_back(Material{.name = "Default", .baseColor = {0.72f, 0.34f, 0.12f, 1.0f}, .metallic = 0.1f, .roughness = 0.35f});
-    scene.lights.push_back(Light{.name = "Sun"});
+    scene.lights.push_back(Light{.name = "Sun", .type = LightType::Directional});
     return scene;
 }
 } // namespace vor
-

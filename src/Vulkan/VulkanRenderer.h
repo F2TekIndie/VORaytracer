@@ -90,10 +90,16 @@ private:
     struct FramePushConstants
     {
         Mat4 viewProjection{Mat4::identity()};
-        Mat4 model{Mat4::identity()};
         Vec4 cameraPosition{};
-        Vec4 lightPosition{};
+        Vec4 cameraForwardAndFov{};
+        Vec4 cameraRightAndAspect{};
+        Vec4 cameraUp{};
         Vec4 lightColorAndIntensity{};
+        Vec4 lightDirectionAndMode{};
+        Vec4 environmentParameters{};
+        Vec4 skyZenithAndVisibility{};
+        Vec4 skyHorizonAndIndirect{};
+        Vec4 skyGround{};
         std::uint32_t rayTracedShadows{};
         std::uint32_t rayTracedReflections{};
         float exposure{};
@@ -102,7 +108,7 @@ private:
         std::uint32_t showMeshlets{};
         std::uint32_t padding[2]{};
     };
-    static_assert(sizeof(FramePushConstants) == 208);
+    static_assert(sizeof(FramePushConstants) == 256);
 
     bool createInstance();
     bool createSurface();
@@ -159,6 +165,7 @@ private:
 
     VkPipelineLayout meshPipelineLayout_{VK_NULL_HANDLE};
     VkPipeline meshPipeline_{VK_NULL_HANDLE};
+    VkPipeline backgroundPipeline_{VK_NULL_HANDLE};
     PFN_vkCmdDrawMeshTasksEXT cmdDrawMeshTasks_{};
     VkDescriptorSetLayout sceneDescriptorSetLayout_{VK_NULL_HANDLE};
     VkDescriptorPool sceneDescriptorPool_{VK_NULL_HANDLE};
@@ -169,6 +176,7 @@ private:
     GpuBuffer meshletTriangleBuffer_{};
     GpuBuffer geometryIndexBuffer_{};
     GpuBuffer sceneInstanceBuffer_{};
+    GpuBuffer environmentBuffer_{};
     GpuBuffer tlasStorage_{};
     GpuBuffer accelerationInstanceBuffer_{};
     std::vector<BlasResource> blases_;

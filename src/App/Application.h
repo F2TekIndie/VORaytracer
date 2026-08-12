@@ -26,9 +26,11 @@ private:
     void drawRenderPanel();
     void drawStatsPanel();
     void loadSceneFromUi();
+    void loadEnvironmentFromUi();
     bool reloadCurrentScene();
     void frameCameraToScene();
     void handleCameraNavigation();
+    void syncGlobalLightTransform();
     void resetCameraAccumulation();
 
     GLFWwindow* window_{};
@@ -40,6 +42,7 @@ private:
     BackendKind previousBackend_{BackendKind::VulkanHybrid};
     Vec3 lightTarget_{};
     std::array<char, 1024> assetPath_{};
+    std::array<char, 1024> environmentPath_{};
     std::string statusMessage_{"Ready"};
     bool meshoptimizerEnabled_{true};
     bool defaultPlasticEnabled_{false};

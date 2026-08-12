@@ -122,12 +122,29 @@ bool Application::initialize()
     };
     scene_ = assetLoader_.createProceduralCube(loadOptions);
     frameCameraToScene();
+    if (const char* requestedGlobalLight = std::getenv("VOR_GLOBAL_LIGHT"); requestedGlobalLight)
+    {
+        if (std::strcmp(requestedGlobalLight, "sky") == 0)
+            scene_.environment.mode = GlobalLightMode::ProceduralSky;
+        else if (std::strcmp(requestedGlobalLight, "hdr") == 0)
+            scene_.environment.mode = GlobalLightMode::HdrEnvironment;
+    }
+    if (const char* startupHdr = std::getenv("VOR_HDR"); startupHdr && *startupHdr)
+    {
+        std::string error;
+        if (!assetLoader_.loadHdrEnvironment(startupHdr, scene_.environment, error))
+            statusMessage_ = "Startup HDR failed: " + error;
+        else
+            std::strncpy(environmentPath_.data(), startupHdr, environmentPath_.size() - 1);
+    }
     if (const char* startupScene = std::getenv("VOR_SCENE"); startupScene && *startupScene)
     {
         AssetLoadResult result = assetLoader_.load(std::filesystem::path(startupScene), loadOptions);
         if (result)
         {
+            Environment environment = std::move(scene_.environment);
             scene_ = std::move(result.scene);
+            scene_.environment = std::move(environment);
             frameCameraToScene();
             statusMessage_ = std::string("Loaded and framed ") + startupScene;
         }
@@ -172,10 +189,12 @@ void Application::drawMainMenu()
             loadSceneFromUi();
         if (ImGui::MenuItem("Procedural cube"))
         {
+            Environment environment = std::move(scene_.environment);
             scene_ = assetLoader_.createProceduralCube(
                 {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
                  .overrideWithDefaultPlastic = defaultPlasticEnabled_,
                  .addGroundPlane = groundPlaneEnabled_});
+            scene_.environment = std::move(environment);
             frameCameraToScene();
             vulkanRenderer_.setScene(&scene_);
             optixRenderer_.setScene(&scene_);
@@ -292,7 +311,8 @@ void Application::drawRenderPanel()
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Vulkan: one inline Ray Query reflection.\nOptiX: rough PBR reflection paths up to Max bounces.");
-    ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting);
+    if (ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting))
+        resetCameraAccumulation();
     if (settings_.backend != BackendKind::Optix)
         ImGui::BeginDisabled();
     ImGui::Checkbox("OptiX denoiser", &settings_.denoiser);
@@ -308,7 +328,50 @@ void Application::drawRenderPanel()
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Shows every Vulkan meshlet with a stable pseudo-random color.");
 
-    ImGui::SeparatorText("Key light");
+    ImGui::SeparatorText("Global light");
+    int globalLightMode = static_cast<int>(scene_.environment.mode);
+    bool environmentChanged = false;
+    environmentChanged |= ImGui::RadioButton("Directional", &globalLightMode,
+                                              static_cast<int>(GlobalLightMode::Directional));
+    ImGui::SameLine();
+    environmentChanged |= ImGui::RadioButton("HDR", &globalLightMode,
+                                              static_cast<int>(GlobalLightMode::HdrEnvironment));
+    ImGui::SameLine();
+    environmentChanged |= ImGui::RadioButton("Procedural sky", &globalLightMode,
+                                              static_cast<int>(GlobalLightMode::ProceduralSky));
+    if (environmentChanged)
+    {
+        scene_.environment.mode = static_cast<GlobalLightMode>(globalLightMode);
+        resetCameraAccumulation();
+    }
+    if (scene_.environment.mode == GlobalLightMode::HdrEnvironment)
+    {
+        ImGui::InputText("HDR path", environmentPath_.data(), environmentPath_.size());
+        ImGui::SameLine();
+        if (ImGui::Button("Load HDR"))
+            loadEnvironmentFromUi();
+        if (scene_.environment.hasHdr())
+            ImGui::TextDisabled("%ux%u - %s", scene_.environment.hdrWidth, scene_.environment.hdrHeight,
+                                scene_.environment.hdrPath.filename().string().c_str());
+        else
+            ImGui::TextDisabled("No HDR loaded");
+    }
+    bool lightingChanged = ImGui::DragFloat("Environment intensity", &scene_.environment.intensity,
+                                             0.02f, 0.0f, 100.0f, "%.2f");
+    lightingChanged |= ImGui::Checkbox("Visible background", &scene_.environment.visibleBackground);
+    if (scene_.environment.mode == GlobalLightMode::ProceduralSky)
+    {
+        lightingChanged |= ImGui::ColorEdit3("Sky zenith", &scene_.environment.zenithColor.x);
+        lightingChanged |= ImGui::ColorEdit3("Sky horizon", &scene_.environment.horizonColor.x);
+        lightingChanged |= ImGui::ColorEdit3("Sky ground", &scene_.environment.groundColor.x);
+    }
+    if (lightingChanged)
+    {
+        scene_.environment.intensity = std::max(scene_.environment.intensity, 0.0f);
+        resetCameraAccumulation();
+    }
+
+    ImGui::SeparatorText("Shared light transform");
     if (!scene_.lights.empty())
     {
         Light& light = scene_.lights.front();
@@ -319,13 +382,11 @@ void Application::drawRenderPanel()
         if (lightChanged)
         {
             light.intensity = std::max(light.intensity, 0.0f);
-            const Vec3 direction = lightTarget_ - light.position;
-            if (length(direction) > 1e-6f)
-                light.direction = normalize(direction);
+            syncGlobalLightTransform();
             resetCameraAccumulation();
         }
     }
-    ImGui::TextDisabled("Shift+LMB: orbit light | Shift+MMB: pan | Shift+wheel: zoom");
+    ImGui::TextDisabled("Shift+LMB: rotate all light modes | Shift+MMB: pan | Shift+wheel: zoom");
 
     ImGui::SeparatorText("Camera");
     bool cameraChanged = ImGui::DragFloat3("Position", &scene_.camera.position.x, 0.02f);
@@ -376,11 +437,33 @@ void Application::loadSceneFromUi()
         statusMessage_ = "Import failed: " + result.error;
         return;
     }
+    Environment environment = std::move(scene_.environment);
     scene_ = std::move(result.scene);
+    scene_.environment = std::move(environment);
     frameCameraToScene();
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     statusMessage_ = "Loaded and framed " + path.string();
+}
+
+void Application::loadEnvironmentFromUi()
+{
+    const std::filesystem::path path(environmentPath_.data());
+    if (path.empty())
+    {
+        statusMessage_ = "Enter an HDR path first";
+        return;
+    }
+    std::string error;
+    if (!assetLoader_.loadHdrEnvironment(path, scene_.environment, error))
+    {
+        statusMessage_ = "HDR import failed: " + error;
+        return;
+    }
+    vulkanRenderer_.setScene(&scene_);
+    optixRenderer_.setScene(&scene_);
+    resetCameraAccumulation();
+    statusMessage_ = "Loaded HDR environment " + path.string();
 }
 
 bool Application::reloadCurrentScene()
@@ -404,7 +487,9 @@ bool Application::reloadCurrentScene()
         reloadedScene = std::move(result.scene);
     }
 
+    Environment environment = std::move(scene_.environment);
     scene_ = std::move(reloadedScene);
+    scene_.environment = std::move(environment);
     frameCameraToScene();
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
@@ -483,7 +568,7 @@ void Application::frameCameraToScene()
     scene_.camera.farPlane = std::max(distance + radius * 4.0f, radius * 20.0f);
 
     if (scene_.lights.empty())
-        scene_.lights.push_back(Light{.name = "Key Light"});
+        scene_.lights.push_back(Light{.name = "Sun", .type = LightType::Directional});
     Light& light = scene_.lights.front();
     lightTarget_ = center;
     Vec3 lightDirection = normalize(light.direction);
@@ -492,6 +577,8 @@ void Application::frameCameraToScene()
     const float lightDistance = radius * 2.5f;
     light.position = lightTarget_ - lightDirection * lightDistance;
     light.direction = normalize(lightTarget_ - light.position);
+    light.type = LightType::Directional;
+    syncGlobalLightTransform();
     light.range = radius * 10.0f;
     resetCameraAccumulation();
 }
@@ -564,11 +651,25 @@ void Application::handleCameraNavigation()
     {
         if (light)
         {
-            light->direction = normalize(lightTarget_ - light->position);
+            syncGlobalLightTransform();
             light->range = std::max(length(lightTarget_ - light->position) * 4.0f, 1.0f);
         }
         resetCameraAccumulation();
     }
+}
+
+void Application::syncGlobalLightTransform()
+{
+    if (scene_.lights.empty())
+        return;
+    Light& light = scene_.lights.front();
+    const Vec3 direction = lightTarget_ - light.position;
+    if (length(direction) > 1e-6f)
+        light.direction = normalize(direction);
+    light.type = LightType::Directional;
+    // Equirectangular HDR maps only have a meaningful rotational component. The same
+    // shared transform drives the sun direction of the procedural sky.
+    scene_.environment.rotationRadians = std::atan2(light.direction.x, light.direction.z);
 }
 
 void Application::resetCameraAccumulation()

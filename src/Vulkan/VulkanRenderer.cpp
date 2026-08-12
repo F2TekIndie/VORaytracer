@@ -365,11 +365,31 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         const Mat4 projection = perspective(camera.verticalFovDegrees * kPi / 180.0f, aspect, camera.nearPlane, camera.farPlane);
         const Mat4 view = lookAt(camera.position, camera.target, camera.up);
         framePushConstants_.viewProjection = projection * view;
-        framePushConstants_.model = Mat4::identity();
         framePushConstants_.cameraPosition = {camera.position.x, camera.position.y, camera.position.z, 1.0f};
+        const Vec3 cameraForward = normalize(camera.target - camera.position);
+        const Vec3 cameraRight = normalize(cross(cameraForward, camera.up));
+        const Vec3 cameraUp = normalize(cross(cameraRight, cameraForward));
+        framePushConstants_.cameraForwardAndFov = {cameraForward.x, cameraForward.y, cameraForward.z,
+                                                   std::tan(camera.verticalFovDegrees * kPi / 360.0f)};
+        framePushConstants_.cameraRightAndAspect = {cameraRight.x, cameraRight.y, cameraRight.z, aspect};
+        framePushConstants_.cameraUp = {cameraUp.x, cameraUp.y, cameraUp.z, 0.0f};
         const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
-        framePushConstants_.lightPosition = {light.position.x, light.position.y, light.position.z, 1.0f};
+        const Environment fallbackEnvironment{};
+        const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
         framePushConstants_.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
+        framePushConstants_.lightDirectionAndMode = {light.direction.x, light.direction.y, light.direction.z,
+                                                     static_cast<float>(environment.mode)};
+        framePushConstants_.environmentParameters = {static_cast<float>(environment.hdrWidth),
+                                                      static_cast<float>(environment.hdrHeight),
+                                                      environment.intensity, environment.rotationRadians};
+        framePushConstants_.skyZenithAndVisibility = {environment.zenithColor.x, environment.zenithColor.y,
+                                                      environment.zenithColor.z,
+                                                      environment.visibleBackground ? 1.0f : 0.0f};
+        framePushConstants_.skyHorizonAndIndirect = {environment.horizonColor.x, environment.horizonColor.y,
+                                                     environment.horizonColor.z,
+                                                     settings.indirectLighting ? 1.0f : 0.0f};
+        framePushConstants_.skyGround = {environment.groundColor.x, environment.groundColor.y,
+                                         environment.groundColor.z, 0.0f};
         framePushConstants_.rayTracedShadows = settings.rayTracedShadows && tlas_ ? 1u : 0u;
         framePushConstants_.rayTracedReflections = settings.rayTracedReflections && tlas_ ? 1u : 0u;
         framePushConstants_.exposure = settings.exposure;
@@ -436,7 +456,9 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         stats_.visibleMeshlets = stats_.totalMeshlets;
         const std::uint64_t raysPerPixel = (settings.rayTracedShadows ? 1u : 0u) +
                                            (settings.rayTracedReflections ? 1u : 0u) +
-                                           (settings.rayTracedShadows && settings.rayTracedReflections ? 1u : 0u);
+                                           (settings.rayTracedShadows && settings.rayTracedReflections ? 1u : 0u) +
+                                           (settings.indirectLighting ? 1u : 0u) +
+                                           (settings.indirectLighting && settings.rayTracedShadows ? 1u : 0u);
         stats_.tracedRays = rayQueryAvailable_
                                 ? static_cast<std::uint64_t>(swapchainExtent_.width) * swapchainExtent_.height *
                                       raysPerPixel
@@ -595,11 +617,13 @@ bool VulkanRenderer::createDevice()
     VkPhysicalDeviceAccelerationStructureFeaturesKHR availableAcceleration{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT availableMesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceVulkan13Features available13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan11Features available11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceBufferDeviceAddressFeatures availableBufferAddress{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
 
     VkPhysicalDeviceFeatures2 available{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     available.pNext = &available13;
-    available13.pNext = &availableBufferAddress;
+    available13.pNext = &available11;
+    available11.pNext = &availableBufferAddress;
     availableBufferAddress.pNext = &availableMesh;
     if (rayQueryExtensions)
     {
@@ -609,7 +633,7 @@ bool VulkanRenderer::createDevice()
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &available);
 
     if (!available13.dynamicRendering || !available13.synchronization2 || !availableMesh.meshShader ||
-        !availableMesh.taskShader)
+        !availableMesh.taskShader || !available11.shaderDrawParameters)
         throw std::runtime_error("Required Vulkan 1.3 dynamic rendering/synchronization or task/mesh shader features are missing");
     taskShaderAvailable_ = true;
     rayQueryAvailable_ = rayQueryExtensions && availableBufferAddress.bufferDeviceAddress &&
@@ -636,10 +660,13 @@ bool VulkanRenderer::createDevice()
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddress{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
-    features13.pNext = &bufferDeviceAddress;
+    features13.pNext = &features11;
+    features11.shaderDrawParameters = VK_TRUE;
+    features11.pNext = &bufferDeviceAddress;
     bufferDeviceAddress.bufferDeviceAddress = rayQueryAvailable_ ? VK_TRUE : VK_FALSE;
     bufferDeviceAddress.pNext = &meshFeatures;
     meshFeatures.meshShader = VK_TRUE;
@@ -832,7 +859,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -854,13 +881,17 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[6].descriptorCount = 1;
     bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[7].binding = 7;
+    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[7].descriptorCount = 1;
+    bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
 
     const std::array poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -876,6 +907,8 @@ bool VulkanRenderer::createMeshPipeline()
     const VkShaderModule taskModule = loadShaderModule(L"Shaders\\Task.spv");
     const VkShaderModule meshModule = loadShaderModule(L"Shaders\\Mesh.spv");
     const VkShaderModule fragmentModule = loadShaderModule(L"Shaders\\PbrFragment.spv");
+    const VkShaderModule backgroundVertexModule = loadShaderModule(L"Shaders\\BackgroundVertex.spv");
+    const VkShaderModule backgroundFragmentModule = loadShaderModule(L"Shaders\\BackgroundFragment.spv");
     const std::array stages{
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_TASK_BIT_EXT, taskModule, "TaskMain", nullptr},
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshModule, "MeshMain", nullptr},
@@ -885,7 +918,8 @@ bool VulkanRenderer::createMeshPipeline()
     try
     {
         VkPushConstantRange pushConstantRange{};
-        pushConstantRange.stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                       VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pushConstantRange.offset = 0;
         pushConstantRange.size = sizeof(FramePushConstants);
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -934,17 +968,44 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = meshPipelineLayout_;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &meshPipeline_), "vkCreateGraphicsPipelines");
+
+        const std::array backgroundStages{
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                             VK_SHADER_STAGE_VERTEX_BIT, backgroundVertexModule,
+                                             "BackgroundVertex", nullptr},
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                             VK_SHADER_STAGE_FRAGMENT_BIT, backgroundFragmentModule,
+                                             "BackgroundFragment", nullptr},
+        };
+        VkPipelineDepthStencilStateCreateInfo backgroundDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        backgroundDepth.depthTestEnable = VK_FALSE;
+        backgroundDepth.depthWriteEnable = VK_FALSE;
+        VkPipelineVertexInputStateCreateInfo backgroundVertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo backgroundInputAssembly{
+            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        backgroundInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        pipelineInfo.stageCount = static_cast<std::uint32_t>(backgroundStages.size());
+        pipelineInfo.pStages = backgroundStages.data();
+        pipelineInfo.pVertexInputState = &backgroundVertexInput;
+        pipelineInfo.pInputAssemblyState = &backgroundInputAssembly;
+        pipelineInfo.pDepthStencilState = &backgroundDepth;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &backgroundPipeline_),
+              "vkCreateGraphicsPipelines(background)");
     }
     catch (...)
     {
         vkDestroyShaderModule(device_, fragmentModule, nullptr);
         vkDestroyShaderModule(device_, meshModule, nullptr);
         vkDestroyShaderModule(device_, taskModule, nullptr);
+        vkDestroyShaderModule(device_, backgroundFragmentModule, nullptr);
+        vkDestroyShaderModule(device_, backgroundVertexModule, nullptr);
         throw;
     }
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
     vkDestroyShaderModule(device_, meshModule, nullptr);
     vkDestroyShaderModule(device_, taskModule, nullptr);
+    vkDestroyShaderModule(device_, backgroundFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, backgroundVertexModule, nullptr);
     return true;
 }
 
@@ -1040,9 +1101,12 @@ void VulkanRenderer::destroyMeshPipeline()
         return;
     if (meshPipeline_)
         vkDestroyPipeline(device_, meshPipeline_, nullptr);
+    if (backgroundPipeline_)
+        vkDestroyPipeline(device_, backgroundPipeline_, nullptr);
     if (meshPipelineLayout_)
         vkDestroyPipelineLayout(device_, meshPipelineLayout_, nullptr);
     meshPipeline_ = VK_NULL_HANDLE;
+    backgroundPipeline_ = VK_NULL_HANDLE;
     meshPipelineLayout_ = VK_NULL_HANDLE;
 }
 
@@ -1064,6 +1128,7 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(meshletTriangleBuffer_);
     destroyBuffer(geometryIndexBuffer_);
     destroyBuffer(sceneInstanceBuffer_);
+    destroyBuffer(environmentBuffer_);
     uploadedGeometries_.clear();
     uploadedInstances_.clear();
     uploadedMeshletCount_ = 0;
@@ -1127,6 +1192,10 @@ bool VulkanRenderer::uploadSceneResources()
     std::vector<std::uint32_t> meshletVertices;
     std::vector<std::uint32_t> packedTriangles;
     std::vector<std::uint32_t> geometryIndices;
+    const Vec4 fallbackEnvironment{0.0f, 0.0f, 0.0f, 1.0f};
+    const std::span<const Vec4> environmentPixels = scene_->environment.hasHdr()
+                                                        ? std::span<const Vec4>(scene_->environment.hdrPixels)
+                                                        : std::span<const Vec4>(&fallbackEnvironment, 1);
     std::vector<std::uint32_t> meshToGeometry(scene_->meshes.size(), UINT32_MAX);
     std::vector<RasterMeshRange> rasterRanges(scene_->meshes.size());
 
@@ -1237,6 +1306,7 @@ bool VulkanRenderer::uploadSceneResources()
                                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     sceneInstanceBuffer_ = createDeviceLocalBuffer(gpuInstances.size() * sizeof(GpuInstance),
                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    environmentBuffer_ = createDeviceLocalBuffer(environmentPixels.size_bytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const std::array uploads{
         BufferUpload{&vertexBuffer_, vertices.data(), vertices.size() * sizeof(GpuVertex)},
         BufferUpload{&meshletBuffer_, meshlets.data(), meshlets.size() * sizeof(GpuMeshlet)},
@@ -1244,6 +1314,7 @@ bool VulkanRenderer::uploadSceneResources()
         BufferUpload{&meshletTriangleBuffer_, packedTriangles.data(), packedTriangles.size() * sizeof(std::uint32_t)},
         BufferUpload{&geometryIndexBuffer_, geometryIndices.data(), geometryIndices.size() * sizeof(std::uint32_t)},
         BufferUpload{&sceneInstanceBuffer_, gpuInstances.data(), gpuInstances.size() * sizeof(GpuInstance)},
+        BufferUpload{&environmentBuffer_, environmentPixels.data(), environmentPixels.size_bytes()},
     };
     if (!uploadDeviceLocalBuffers(uploads))
         throw std::runtime_error("Failed to stage Vulkan scene geometry into device-local memory");
@@ -1257,15 +1328,16 @@ bool VulkanRenderer::uploadSceneResources()
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &sceneDescriptorSetLayout_;
     check(vkAllocateDescriptorSets(device_, &allocateInfo, &sceneDescriptorSet_), "vkAllocateDescriptorSets");
-    const std::array<VkDescriptorBufferInfo, 6> bufferInfos{{
+    const std::array<VkDescriptorBufferInfo, 7> bufferInfos{{
         {vertexBuffer_.buffer, 0, vertexBuffer_.size},
         {meshletBuffer_.buffer, 0, meshletBuffer_.size},
         {meshletVertexBuffer_.buffer, 0, meshletVertexBuffer_.size},
         {meshletTriangleBuffer_.buffer, 0, meshletTriangleBuffer_.size},
         {sceneInstanceBuffer_.buffer, 0, sceneInstanceBuffer_.size},
         {geometryIndexBuffer_.buffer, 0, geometryIndexBuffer_.size},
+        {environmentBuffer_.buffer, 0, environmentBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 7> writes{};
+    std::array<VkWriteDescriptorSet, 8> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1297,6 +1369,12 @@ bool VulkanRenderer::uploadSceneResources()
     writes[6].descriptorCount = 1;
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[6].pBufferInfo = &bufferInfos[5];
+    writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[7].dstSet = sceneDescriptorSet_;
+    writes[7].dstBinding = 7;
+    writes[7].descriptorCount = 1;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[7].pBufferInfo = &bufferInfos[6];
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
@@ -1909,11 +1987,18 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
     if (!externalBuffer && sceneDescriptorSet_ && uploadedMeshletCount_ > 0)
     {
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, backgroundPipeline_);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
+                                &sceneDescriptorSet_, 0, nullptr);
+        constexpr VkShaderStageFlags allPushConstantStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                                              VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages,
+                           0, sizeof(FramePushConstants), &framePushConstants_);
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                                 &sceneDescriptorSet_, 0, nullptr);
-        vkCmdPushConstants(commandBuffer, meshPipelineLayout_,
-                           VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages, 0,
                            sizeof(FramePushConstants), &framePushConstants_);
         cmdDrawMeshTasks_(commandBuffer, uploadedMeshletCount_, 1, 1);
     }

@@ -26,6 +26,7 @@ class AssetLoader
 {
 public:
     AssetLoadResult load(const std::filesystem::path& path, AssetLoadOptions options = {}) const;
+    bool loadHdrEnvironment(const std::filesystem::path& path, Environment& environment, std::string& error) const;
     Scene createProceduralCube(AssetLoadOptions options = {}) const;
 
 private:

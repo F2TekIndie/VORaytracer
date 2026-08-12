@@ -25,6 +25,7 @@ struct LaunchParameters
     StructuredBuffer<uint3> indices;
     StructuredBuffer<uint> triangleMaterialIndices;
     StructuredBuffer<GpuMaterial> materials;
+    StructuredBuffer<float4> environmentPixels;
     RaytracingAccelerationStructure scene;
     uint2 outputSize;
     uint frameIndex;
@@ -39,11 +40,23 @@ struct LaunchParameters
     uint padding0;
     uint padding1;
     uint padding2;
+    uint indirectLighting;
+    uint globalLightMode;
+    uint environmentWidth;
+    uint environmentHeight;
+    float environmentIntensity;
+    float environmentRotation;
+    uint environmentVisible;
+    uint environmentPadding;
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
     float4 lightPosition;
     float4 lightColorAndIntensity;
+    float4 lightDirection;
+    float4 skyZenith;
+    float4 skyHorizon;
+    float4 skyGround;
 };
 
 float random01(uint value)
@@ -54,6 +67,62 @@ float random01(uint value)
     value *= 0x846ca68b;
     value ^= value >> 16;
     return float(value & 0x00ffffff) / float(0x01000000);
+}
+
+float3 rotateEnvironmentDirection(float3 direction, float angle, float3 lightDirection)
+{
+    float sine = sin(angle);
+    float cosine = cos(angle);
+    float3 yawRotated = float3(cosine * direction.x - sine * direction.z,
+                               direction.y,
+                               sine * direction.x + cosine * direction.z);
+    float pitch = asin(clamp(lightDirection.y, -1.0, 1.0));
+    float pitchSine = sin(pitch);
+    float pitchCosine = cos(pitch);
+    return float3(yawRotated.x,
+                  pitchCosine * yawRotated.y + pitchSine * yawRotated.z,
+                  -pitchSine * yawRotated.y + pitchCosine * yawRotated.z);
+}
+
+float3 sampleHdrEnvironment(LaunchParameters parameters, float3 direction)
+{
+    if (parameters.environmentWidth == 0 || parameters.environmentHeight == 0)
+        return float3(0.0);
+    float3 rotated = rotateEnvironmentDirection(normalize(direction), parameters.environmentRotation,
+                                                 parameters.lightDirection.xyz);
+    float2 uv = float2(atan2(rotated.z, rotated.x) / (2.0 * PI) + 0.5,
+                            acos(clamp(rotated.y, -1.0, 1.0)) / PI);
+    float2 texel = uv * float2(parameters.environmentWidth, parameters.environmentHeight) - 0.5;
+    int2 base = int2(floor(texel));
+    float2 fraction = frac(texel);
+    uint x0 = uint((base.x % int(parameters.environmentWidth) + int(parameters.environmentWidth)) %
+                   int(parameters.environmentWidth));
+    uint x1 = (x0 + 1) % parameters.environmentWidth;
+    uint y0 = uint(clamp(base.y, 0, int(parameters.environmentHeight) - 1));
+    uint y1 = min(y0 + 1, parameters.environmentHeight - 1);
+    float3 a = lerp(parameters.environmentPixels[y0 * parameters.environmentWidth + x0].xyz,
+                    parameters.environmentPixels[y0 * parameters.environmentWidth + x1].xyz, fraction.x);
+    float3 b = lerp(parameters.environmentPixels[y1 * parameters.environmentWidth + x0].xyz,
+                    parameters.environmentPixels[y1 * parameters.environmentWidth + x1].xyz, fraction.x);
+    return lerp(a, b, fraction.y);
+}
+
+float3 sampleGlobalEnvironment(LaunchParameters parameters, float3 direction)
+{
+    if (parameters.globalLightMode == 1)
+        return sampleHdrEnvironment(parameters, direction) * parameters.environmentIntensity;
+    if (parameters.globalLightMode == 2)
+    {
+        float3 normalizedDirection = normalize(direction);
+        float upperBlend = pow(saturate(normalizedDirection.y), 0.45);
+        float lowerBlend = pow(saturate(-normalizedDirection.y), 0.35);
+        float3 sky = lerp(parameters.skyHorizon.xyz, parameters.skyZenith.xyz, upperBlend);
+        sky = lerp(sky, parameters.skyGround.xyz, lowerBlend);
+        float sun = pow(saturate(dot(normalizedDirection, normalize(-parameters.lightDirection.xyz))), 512.0);
+        return (sky + parameters.lightColorAndIntensity.xyz * parameters.lightColorAndIntensity.w * sun) *
+               parameters.environmentIntensity;
+    }
+    return float3(0.0);
 }
 
 uint toneMapAndPack(float3 color, float exposure, uint displayBgra)
@@ -101,7 +170,8 @@ void RayGen(LaunchParameters parameters)
 
         float3 sampleRadiance = float3(0.0);
         float3 throughput = float3(1.0);
-        uint bounceLimit = parameters.rayTracedReflections != 0 ? max(parameters.maxBounces, 1u) : 1u;
+        uint bounceLimit = (parameters.rayTracedReflections != 0 || parameters.indirectLighting != 0)
+                               ? max(parameters.maxBounces, 1u) : 1u;
         for (uint bounce = 0; bounce < bounceLimit; ++bounce)
         {
             RadiancePayload payload;
@@ -112,9 +182,8 @@ void RayGen(LaunchParameters parameters)
             TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
             if (payload.hit == 0)
             {
-                float skyFactor = saturate(ray.Direction.y * 0.5 + 0.5);
-                float3 sky = lerp(float3(0.012, 0.018, 0.035), float3(0.16, 0.38, 0.78), skyFactor);
-                sampleRadiance += throughput * sky;
+                if (bounce != 0 || parameters.environmentVisible != 0)
+                    sampleRadiance += throughput * sampleGlobalEnvironment(parameters, ray.Direction);
                 break;
             }
 
@@ -135,9 +204,8 @@ void RayGen(LaunchParameters parameters)
                 guideNormal = normal;
             }
             float3 worldPosition = ray.Origin + ray.Direction * payload.hitDistance;
-            float3 lightVector = parameters.lightPosition.xyz - worldPosition;
-            float lightDistance = max(length(lightVector), 0.0001);
-            float3 lightDirection = lightVector / lightDistance;
+            float lightDistance = 10000.0;
+            float3 lightDirection = normalize(-parameters.lightDirection.xyz);
             float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
             float rayBias = max(0.0001, coordinateScale * 0.00001);
             float visibility = 1.0;
@@ -160,7 +228,8 @@ void RayGen(LaunchParameters parameters)
                          0xff, 0, 1, 0, shadowRay, shadowPayload);
                 visibility = shadowPayload.hit == 0 ? 1.0 : 0.0;
             }
-            float3 lightRadiance = parameters.lightColorAndIntensity.xyz *
+            float3 lightRadiance = parameters.globalLightMode == 1 ? float3(0.0) :
+                                   parameters.lightColorAndIntensity.xyz *
                                    parameters.lightColorAndIntensity.w * visibility;
             float roughness = clamp(material.emissiveAndRoughness.w, 0.02, 1.0);
             float3 direct = evaluateMetallicRoughness(material.baseColorAndMetallic.xyz,
@@ -171,14 +240,27 @@ void RayGen(LaunchParameters parameters)
                                                       lightDirection,
                                                       lightRadiance);
             sampleRadiance += throughput *
-                              (direct + material.baseColorAndMetallic.xyz * 0.025 +
-                               material.emissiveAndRoughness.xyz);
+                              (direct + material.emissiveAndRoughness.xyz);
             if (bounce + 1 >= bounceLimit)
                 break;
 
             float3 f0 = lerp(float3(0.04), material.baseColorAndMetallic.xyz,
                              material.baseColorAndMetallic.w);
-            throughput *= fresnelSchlick(saturate(dot(normal, viewDirection)), f0);
+            bool sampleSpecular = parameters.rayTracedReflections != 0;
+            if (parameters.indirectLighting != 0 && parameters.rayTracedReflections != 0)
+            {
+                float specularProbability = clamp(0.2 + material.baseColorAndMetallic.w * 0.65,
+                                                  0.15, 0.9);
+                sampleSpecular = random01(seed ^ ((bounce + 1) * 0x51ed270bu)) < specularProbability;
+                throughput *= sampleSpecular ? f0 / specularProbability
+                                             : material.baseColorAndMetallic.xyz *
+                                               (1.0 - material.baseColorAndMetallic.w) /
+                                               (1.0 - specularProbability);
+            }
+            else if (sampleSpecular)
+                throughput *= f0;
+            else
+                throughput *= material.baseColorAndMetallic.xyz * (1.0 - material.baseColorAndMetallic.w);
             float maximumThroughput = max(throughput.x, max(throughput.y, throughput.z));
             if (maximumThroughput < 0.002)
                 break;
@@ -194,8 +276,10 @@ void RayGen(LaunchParameters parameters)
             float randomTheta = random01(seed ^ ((bounce + 1) * 0x02e5be93u));
             float alpha = max(roughness * roughness, 0.002);
             float phi = 2.0 * PI * randomPhi;
-            float cosTheta = sqrt((1.0 - randomTheta) /
-                                  max(1.0 + (alpha * alpha - 1.0) * randomTheta, 0.0001));
+            float cosTheta = sampleSpecular
+                                 ? sqrt((1.0 - randomTheta) /
+                                        max(1.0 + (alpha * alpha - 1.0) * randomTheta, 0.0001))
+                                 : sqrt(1.0 - randomTheta);
             float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
             float3 tangent = normalize(cross(abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
                                                                       : float3(0.0, 1.0, 0.0),
@@ -203,7 +287,7 @@ void RayGen(LaunchParameters parameters)
             float3 bitangent = cross(normal, tangent);
             float3 halfway = normalize(tangent * (cos(phi) * sinTheta) +
                                        bitangent * (sin(phi) * sinTheta) + normal * cosTheta);
-            float3 reflectedDirection = normalize(reflect(ray.Direction, halfway));
+            float3 reflectedDirection = sampleSpecular ? normalize(reflect(ray.Direction, halfway)) : halfway;
             if (dot(reflectedDirection, normal) <= 0.001)
                 reflectedDirection = normalize(reflect(ray.Direction, normal));
             ray.Origin = worldPosition + normal * rayBias;

@@ -80,9 +80,11 @@ private:
     CUdeviceptr indexBuffer_{};
     CUdeviceptr triangleMaterialIndexBuffer_{};
     CUdeviceptr materialBuffer_{};
+    CUdeviceptr environmentBuffer_{};
     std::size_t vertexCount_{};
     std::size_t triangleCount_{};
     std::size_t materialCount_{};
+    std::size_t environmentPixelCount_{};
     CUdeviceptr gasBuffer_{};
     OptixTraversableHandle gasHandle_{};
     OptixDenoiser denoiser_{};
