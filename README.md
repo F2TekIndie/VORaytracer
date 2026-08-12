@@ -47,9 +47,8 @@ In PowerShell:
 .\scripts\Build.ps1 -Configuration Release
 ```
 
-Das Skript baut Assimp aus `G:\CodingLibraries\assimp` in `build\assimp` und anschließend `VORaytracer.sln`.
-
-Alternativ kann die Solution nach dem ersten Assimp-Build direkt in Visual Studio geöffnet werden.
+Das Skript baut `VORaytracer.sln`. Assimp wird als globale Debug-/Release-Bibliothek aus
+`G:\CodingLibraries\assimp\out-v145` eingebunden; ein projektspezifischer Assimp-Build ist nicht erforderlich.
 
 ## Starten
 

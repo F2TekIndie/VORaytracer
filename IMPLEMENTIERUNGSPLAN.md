@@ -43,9 +43,11 @@ Mesh-Shader sind compute-ähnliche Stufen der Vulkan-Grafikpipeline, führen abe
 | meshoptimizer | `G:\CodingLibraries\meshoptimizer`, Version 1.2 |
 | CUDA | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` |
 | OptiX | `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0` |
-| Bilddecoder | `G:\CodingLibraries\assimp\contrib\stb\stb_image.h` |
+| Bilddecoder | `G:\CodingLibraries\stb\stb_image.h` |
 
-Assimp ist als vollständiger Quellbaum vorhanden, besitzt derzeit aber nur eine erzeugte Debug-Bibliothek. GLFW und meshoptimizer liegen als Quellcode vor. Für alle drei Bibliotheken werden konsistente x64-Debug- und x64-Release-Artefakte erzeugt.
+Assimp wird mit konsistenten x64-Debug- und x64-Release-Artefakten aus
+`G:\CodingLibraries\assimp\out-v145` eingebunden. Ein lokaler Assimp-Build im Projekt ist nicht erforderlich.
+GLFW und meshoptimizer liegen als Quellcode vor und werden als Solution-Projekte gebaut.
 
 ## 3. Solution- und Projektstruktur
 

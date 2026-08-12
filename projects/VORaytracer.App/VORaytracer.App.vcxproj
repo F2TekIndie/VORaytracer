@@ -16,7 +16,7 @@
       <IgnoreSpecificDefaultLibraries>libcmt.lib;%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
-      <Command>if exist "$(SolutionDir)build\assimp\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" copy /Y "$(SolutionDir)build\assimp\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" "$(OutDir)"
+      <Command>if exist "G:\CodingLibraries\assimp\out-v145\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" copy /Y "G:\CodingLibraries\assimp\out-v145\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" "$(OutDir)"
 copy /Y "G:\CodingLibraries\slang-14.1\bin\slang.dll" "$(OutDir)"
 copy /Y "G:\CodingLibraries\slang-14.1\bin\slang-rt.dll" "$(OutDir)"</Command>
     </PostBuildEvent>
