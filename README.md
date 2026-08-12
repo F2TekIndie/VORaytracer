@@ -9,6 +9,7 @@ Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation 
 
 - [Technischer Umsetzungsstand und weitere Planung](IMPLEMENTIERUNGSPLAN.md)
 - [Grafische Darstellung der Renderpfade](RENDERPFADE.md)
+- [Geplanter Ausbau des PBR-Material- und BSDF-Systems](PBR_SHADER_UPDATE.md)
 
 ## Funktionsumfang
 
@@ -29,7 +30,7 @@ Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation 
 - optionaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Ein- und Ausgabe
 - CUDA/Vulkan-External-Memory- und Semaphore-Interop ohne Bildkopie zur CPU
 - progressiver OptiX-Pathtracer mit Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
-- standardisiertes hellgraues Kunststoffmaterial als optionale Importüberschreibung
+- standardisiertes hellgraues Kunststoffmaterial als nichtdestruktive Laufzeitüberschreibung
 - ein- und ausblendbare Bodenebene mit Standardkunststoffmaterial
 - stabile, pseudozufällige Meshlet-Debugfarbe pro Meshlet
 
@@ -82,7 +83,7 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 ## Szenen- und Materialoptionen
 
 - `meshoptimizer`: Lädt das aktuelle Modell beim Umschalten neu. Meshlet-Erzeugung bleibt immer aktiv; zusätzliche Optimierungen folgen dem Schalter.
-- `Default plastic`: Lädt die Szene neu und überschreibt jedes importierte Material mit `Albedo 0.75`, `Metallic 0.0`, `Roughness 0.5`.
+- `Default plastic`: Setzt `materialOverrideId` auf das residente Material mit `Albedo 0.75`, `Metallic 0.0`, `Roughness 0.5`. Originalmaterialien und Texturreferenzen bleiben erhalten; Geometrie und Acceleration Structures werden nicht neu geladen.
 - `Ground plane`: Blendet eine Bodenebene mit dem Standardkunststoffmaterial ein oder aus.
 - `Meshlet debug colors`: Zeigt im Vulkan-Pfad eine stabile Zufallsfarbe pro Meshlet.
 - `Ray-traced reflections`: Aktiviert Vulkan-Reflexions-Ray-Queries; im OptiX-Pfad steuert die Option die reflektierenden Sekundärpfade.
@@ -108,6 +109,7 @@ OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` 
 | `VOR_DENOISER=1` | aktiviert den Vulkan-Postrender-Denoiser |
 | `VOR_SCENE=<absoluter Pfad>` | lädt beim Start ein Modell |
 | `VOR_MESHLET_DEBUG=1` | aktiviert die Meshlet-Debugfarben |
+| `VOR_DEFAULT_PLASTIC=1` | startet mit der nichtdestruktiven Default-Plastic-Materialüberschreibung |
 | `VOR_GLOBAL_LIGHT=sky` | startet mit prozeduralem Himmel |
 | `VOR_GLOBAL_LIGHT=hdr` | startet im HDR-Modus |
 | `VOR_HDR=<absoluter Pfad>` | lädt beim Start ein Radiance-HDR-Environment |

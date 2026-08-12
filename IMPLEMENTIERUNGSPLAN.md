@@ -2,7 +2,7 @@
 
 Stand: 12. August 2026
 
-Dieses Dokument beschreibt den implementierten Stand des Projekts und grenzt ihn von den noch offenen Ausbauschritten ab. Die detaillierten Frameabläufe sind in [RENDERPFADE.md](RENDERPFADE.md) grafisch dargestellt.
+Dieses Dokument beschreibt den implementierten Stand des Projekts und grenzt ihn von den noch offenen Ausbauschritten ab. Die detaillierten Frameabläufe sind in [RENDERPFADE.md](RENDERPFADE.md) grafisch dargestellt. Der spätere Ausbau des Material- und BSDF-Systems ist in [PBR_SHADER_UPDATE.md](PBR_SHADER_UPDATE.md) festgehalten.
 
 ## 1. Zielbild
 
@@ -62,10 +62,11 @@ VORaytracer.sln
 1. Ein Modell wird über `IFileOpenDialog`, einen direkten Pfad oder `VOR_SCENE` ausgewählt.
 2. Assimp importiert Meshes, Node-Transformationen, Instanzen und PBR-Materialwerte.
 3. Fehlende oder ungültige Basisdaten werden in ein kanonisches Vertex-/Indexformat überführt.
-4. Optional überschreibt `Default plastic` jedes Material mit:
+4. `Default Plastic` wird zusätzlich zu den importierten Materialien resident gehalten. Der UI-Schalter setzt eine allgemeine `materialOverrideId` auf dieses Material:
    - Albedo: `0.75, 0.75, 0.75`
    - Metallic: `0.0`
    - Roughness: `0.5`
+   Die Originalmaterialien, Texturreferenzen und Mesh-Material-IDs bleiben unverändert. Beim Umschalten werden weder das Modell neu importiert noch Geometrie oder Acceleration Structures neu aufgebaut.
 5. meshoptimizer erzeugt das Vulkan-Meshlet-Layout. Bei aktivierter Optimierung werden zusätzlich Remap, Vertex Cache, Overdraw, Vertex Fetch, Bounds und LODs berechnet.
 6. Nach erfolgreichem Laden wird die Kamera anhand der Welt-Bounds so positioniert, dass das vollständige Modell sichtbar ist.
 7. Der Szenenupload erneuert beide Backends und setzt gegebenenfalls die OptiX-Akkumulation zurück.
@@ -195,7 +196,7 @@ OptiX akkumuliert in einem CUDA-`float4`-Buffer. Eine CUDA-/OptiX-Stufe führt T
 - Reflexionen und indirekte Beleuchtung
 - Vulkan-Postrender-Denoiser
 - meshoptimizer-Schalter mit Neuladen
-- Default-Plastic-Schalter mit Neuladen
+- Default-Plastic-Schalter über allgemeine `materialOverrideId`, ohne Neuladen
 - Bodenebene
 - Meshlet-Debugfarben
 - Szenen- und Rendererstatistiken

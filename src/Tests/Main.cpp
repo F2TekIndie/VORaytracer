@@ -89,27 +89,43 @@ int main()
                 "optional meshlet bounds disabled");
     }
 
-    AssetLoadResult importedWithDefaultPlastic = assetLoader.load(
-        projectRoot / "assets" / "SampleTriangle.obj",
-        {.enableOptionalMeshoptimizerPasses = true, .overrideWithDefaultPlastic = true});
-    require(static_cast<bool>(importedWithDefaultPlastic), "Assimp import with default plastic override");
-    if (importedWithDefaultPlastic)
+    AssetLoadResult importedWithMaterialOverride = assetLoader.load(projectRoot / "assets" / "SampleTriangle.obj");
+    require(static_cast<bool>(importedWithMaterialOverride), "Assimp import for material override");
+    if (importedWithMaterialOverride)
     {
-        require(importedWithDefaultPlastic.scene.materials.size() == 1, "single default plastic material");
-        const Material& plastic = importedWithDefaultPlastic.scene.materials.front();
+        Scene& overrideScene = importedWithMaterialOverride.scene;
+        const std::size_t materialCountBeforeOverride = overrideScene.materials.size();
+        const std::size_t textureCountBeforeOverride = overrideScene.textures.size();
+        const std::size_t triangleCountBeforeOverride = overrideScene.triangleCount();
+        const std::size_t meshletCountBeforeOverride = overrideScene.meshletCount();
+        const std::uint32_t originalMaterialId = overrideScene.meshes.front().materialIndex;
+        AssetLoader::setDefaultPlasticOverride(overrideScene, true);
+        require(overrideScene.materialOverrideId != kInvalidMaterialId, "default plastic material override enabled");
+        require(overrideScene.materialOverrideId < overrideScene.materials.size(), "material override ID in range");
+        const Material& plastic = overrideScene.materials[overrideScene.materialOverrideId];
         require(plastic.name == "Default Plastic", "default plastic name");
         require(plastic.baseColor.x == 0.75f && plastic.baseColor.y == 0.75f && plastic.baseColor.z == 0.75f,
                 "default plastic light-gray albedo");
         require(plastic.metallic == 0.0f, "default plastic metallic");
         require(plastic.roughness == 0.5f, "default plastic roughness");
-        require(importedWithDefaultPlastic.scene.textures.empty(), "default plastic removes imported textures");
-        for (const Mesh& importedMesh : importedWithDefaultPlastic.scene.meshes)
-            require(importedMesh.materialIndex == 0, "default plastic assigned to every mesh");
+        require(overrideScene.materials.size() == materialCountBeforeOverride,
+                "default plastic already resident before override");
+        require(overrideScene.meshes.front().materialIndex == originalMaterialId,
+                "material override preserves original mesh material ID");
+        require(overrideScene.textures.size() == textureCountBeforeOverride,
+                "material override preserves imported texture references");
+        require(overrideScene.triangleCount() == triangleCountBeforeOverride &&
+                    overrideScene.meshletCount() == meshletCountBeforeOverride,
+                "material override preserves processed geometry");
+        AssetLoader::setDefaultPlasticOverride(overrideScene, false);
+        require(overrideScene.materialOverrideId == kInvalidMaterialId, "material override disabled");
+        require(overrideScene.meshes.front().materialIndex == originalMaterialId,
+                "original material restored without reload");
     }
 
     AssetLoadResult importedWithGroundPlane = assetLoader.load(
         projectRoot / "assets" / "SampleTriangle.obj",
-        {.enableOptionalMeshoptimizerPasses = true, .overrideWithDefaultPlastic = false, .addGroundPlane = true});
+        {.enableOptionalMeshoptimizerPasses = true, .addGroundPlane = true});
     require(static_cast<bool>(importedWithGroundPlane), "Assimp import with ground plane");
     if (importedWithGroundPlane)
     {

@@ -23,13 +23,11 @@ struct GpuMeshlet
     uint vertexCount;
     uint triangleCount;
     uint instanceIndex;
+    uint materialIndex;
     uint padding0;
     uint padding1;
-    uint padding2;
     float4 boundingSphere;
     float4 normalCone;
-    float4 baseColorAndMetallic;
-    float4 materialParameters;
 };
 
 struct GpuInstance
@@ -38,6 +36,14 @@ struct GpuInstance
     float4x4 normalTransform;
     float4 scaleAndFlags;
     uint4 geometry;
+    uint materialIndex;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+};
+
+struct GpuMaterial
+{
     float4 baseColorAndMetallic;
     float4 emissiveAndRoughness;
 };
@@ -59,7 +65,7 @@ struct FramePushConstants
     uint rayTracedReflections;
     float exposure;
     uint meshletCount;
-    uint instanceCount;
+    uint materialOverrideId;
     uint showMeshlets;
     uint postProcessInput;
     uint environmentMipCount;
@@ -73,6 +79,7 @@ struct FramePushConstants
 [[vk::binding(5, 0)]] StructuredBuffer<GpuInstance> sceneInstances;
 [[vk::binding(6, 0)]] StructuredBuffer<uint> geometryIndices;
 [[vk::binding(7, 0)]] StructuredBuffer<float4> environmentPixels;
+[[vk::binding(8, 0)]] StructuredBuffer<GpuMaterial> sceneMaterials;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -114,6 +121,16 @@ float3 meshletDebugColor(uint meshletIndex)
                           float((hash >> 8) & 0xffu),
                           float((hash >> 16) & 0xffu)) / 255.0;
     return 0.2 + color * 0.8;
+}
+
+uint effectiveMaterialId(uint materialId)
+{
+    return frame.materialOverrideId != 0xffffffffu ? frame.materialOverrideId : materialId;
+}
+
+GpuMaterial loadMaterial(uint materialId)
+{
+    return sceneMaterials[effectiveMaterialId(materialId)];
 }
 
 float3 rotateEnvironmentDirection(float3 direction)
@@ -271,6 +288,7 @@ float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
         return sampleDiffuseEnvironment(normal);
 
     GpuInstance hitInstance = sceneInstances[bounceQuery.CommittedInstanceID()];
+    GpuMaterial hitMaterial = loadMaterial(hitInstance.materialIndex);
     uint triangleOffset = hitInstance.geometry.y + bounceQuery.CommittedPrimitiveIndex() * 3;
     uint3 triangle = uint3(geometryIndices[triangleOffset], geometryIndices[triangleOffset + 1],
                            geometryIndices[triangleOffset + 2]);
@@ -303,13 +321,13 @@ float3 traceDiffuseBounce(float3 worldPosition, float3 normal)
     float3 directRadiance = uint(frame.lightDirectionAndMode.w + 0.5) == 1
                                 ? float3(0.0)
                                 : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
-    float3 radiance = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
-                                                 hitInstance.baseColorAndMetallic.w,
-                                                 hitInstance.emissiveAndRoughness.w,
+    float3 radiance = evaluateMetallicRoughness(hitMaterial.baseColorAndMetallic.xyz,
+                                                 hitMaterial.baseColorAndMetallic.w,
+                                                 hitMaterial.emissiveAndRoughness.w,
                                                  hitNormal, hitViewDirection, lightDirection, directRadiance);
-    radiance += sampleDiffuseEnvironment(hitNormal) * hitInstance.baseColorAndMetallic.xyz *
-                (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
-    return radiance + hitInstance.emissiveAndRoughness.xyz;
+    radiance += sampleDiffuseEnvironment(hitNormal) * hitMaterial.baseColorAndMetallic.xyz *
+                (1.0 - hitMaterial.baseColorAndMetallic.w) / PI;
+    return radiance + hitMaterial.emissiveAndRoughness.xyz;
 }
 
 [shader("vertex")]
@@ -356,8 +374,7 @@ void TaskMain(
     if (visible)
     {
         GpuMeshlet meshlet = sceneMeshlets[meshletIndex];
-        visible = meshlet.vertexCount <= 64 && meshlet.triangleCount <= 124 &&
-                  meshlet.instanceIndex < frame.instanceCount;
+        visible = meshlet.vertexCount <= 64 && meshlet.triangleCount <= 124;
         if (visible)
         {
             GpuInstance instance = sceneInstances[meshlet.instanceIndex];
@@ -413,6 +430,7 @@ void MeshMain(
     uint meshletIndex = taskPayload.meshletIndices[groupIndex.x];
     GpuMeshlet meshlet = sceneMeshlets[meshletIndex];
     GpuInstance instance = sceneInstances[meshlet.instanceIndex];
+    GpuMaterial material = loadMaterial(meshlet.materialIndex);
     SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
     for (uint outputVertex = threadIndex; outputVertex < meshlet.vertexCount; outputVertex += 32)
     {
@@ -423,8 +441,8 @@ void MeshMain(
         vertices[outputVertex].worldPosition = worldPosition.xyz;
         vertices[outputVertex].worldNormal = normalize(mul((float3x3)instance.normalTransform, source.normal.xyz));
         vertices[outputVertex].uv = source.uv.xy;
-        vertices[outputVertex].baseColorAndMetallic = meshlet.baseColorAndMetallic;
-        vertices[outputVertex].roughness = meshlet.materialParameters.x;
+        vertices[outputVertex].baseColorAndMetallic = material.baseColorAndMetallic;
+        vertices[outputVertex].roughness = material.emissiveAndRoughness.w;
         vertices[outputVertex].meshletIndex = meshletIndex;
     }
     for (uint outputTriangle = threadIndex; outputTriangle < meshlet.triangleCount; outputTriangle += 32)
@@ -499,6 +517,7 @@ FragmentOutput FragmentMain(MeshVertex input)
         {
             uint instanceIndex = reflectionQuery.CommittedInstanceID();
             GpuInstance hitInstance = sceneInstances[instanceIndex];
+            GpuMaterial hitMaterial = loadMaterial(hitInstance.materialIndex);
             uint primitiveIndex = reflectionQuery.CommittedPrimitiveIndex();
             uint triangleOffset = hitInstance.geometry.y + primitiveIndex * 3;
             uint3 triangle = uint3(geometryIndices[triangleOffset],
@@ -534,18 +553,18 @@ FragmentOutput FragmentMain(MeshVertex input)
             float3 hitDirectRadiance = globalLightMode == 1
                                            ? float3(0.0)
                                            : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
-            float3 localReflection = evaluateMetallicRoughness(hitInstance.baseColorAndMetallic.xyz,
-                                                                hitInstance.baseColorAndMetallic.w,
-                                                                hitInstance.emissiveAndRoughness.w,
+            float3 localReflection = evaluateMetallicRoughness(hitMaterial.baseColorAndMetallic.xyz,
+                                                                hitMaterial.baseColorAndMetallic.w,
+                                                                hitMaterial.emissiveAndRoughness.w,
                                                                 hitNormal,
                                                                 reflectedViewDirection,
                                                                 hitLightDirection,
                                                                 hitDirectRadiance);
             if (frame.skyHorizonAndIndirect.w != 0.0)
                 localReflection += sampleDiffuseEnvironment(hitNormal) *
-                                   hitInstance.baseColorAndMetallic.xyz *
-                                   (1.0 - hitInstance.baseColorAndMetallic.w) / PI;
-            localReflection += hitInstance.emissiveAndRoughness.xyz;
+                                   hitMaterial.baseColorAndMetallic.xyz *
+                                   (1.0 - hitMaterial.baseColorAndMetallic.w) / PI;
+            localReflection += hitMaterial.emissiveAndRoughness.xyz;
 
             // A single ray can only represent a sharp local reflection. Fade it into the
             // prefiltered environment once the material lobe is too wide for that sample.

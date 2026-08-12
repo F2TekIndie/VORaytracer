@@ -287,10 +287,12 @@ bool Application::initialize()
     if (const char* requestedMeshletDebug = std::getenv("VOR_MESHLET_DEBUG");
         requestedMeshletDebug && std::strcmp(requestedMeshletDebug, "1") == 0)
         settings_.showMeshlets = true;
+    if (const char* requestedDefaultPlastic = std::getenv("VOR_DEFAULT_PLASTIC");
+        requestedDefaultPlastic && std::strcmp(requestedDefaultPlastic, "1") == 0)
+        defaultPlasticEnabled_ = true;
 
     const AssetLoadOptions loadOptions{
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
-        .overrideWithDefaultPlastic = defaultPlasticEnabled_,
         .addGroundPlane = groundPlaneEnabled_,
     };
     scene_ = assetLoader_.createProceduralCube(loadOptions);
@@ -324,6 +326,7 @@ bool Application::initialize()
         else
             statusMessage_ = "Startup import failed: " + result.error;
     }
+    AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     return true;
@@ -367,9 +370,9 @@ void Application::drawMainMenu()
             Environment environment = std::move(scene_.environment);
             scene_ = assetLoader_.createProceduralCube(
                 {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
-                 .overrideWithDefaultPlastic = defaultPlasticEnabled_,
                  .addGroundPlane = groundPlaneEnabled_});
             scene_.environment = std::move(environment);
+            AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
             frameCameraToScene();
             vulkanRenderer_.setScene(&scene_);
             optixRenderer_.setScene(&scene_);
@@ -416,7 +419,6 @@ void Application::drawScenePanel()
                           "Toggle controls remap, cache, overdraw, vertex fetch, bounds and LOD simplification.\n"
                           "Changing it reloads the current model.");
     }
-    const bool previousDefaultPlasticState = defaultPlasticEnabled_;
     const ImVec4 plasticToggleColor = defaultPlasticEnabled_ ? ImVec4(0.16f, 0.52f, 0.24f, 1.0f)
                                                               : ImVec4(0.42f, 0.18f, 0.18f, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Button, plasticToggleColor);
@@ -424,15 +426,18 @@ void Application::drawScenePanel()
                       ImVec2(210.0f, 0.0f)))
     {
         defaultPlasticEnabled_ = !defaultPlasticEnabled_;
-        if (!reloadCurrentScene())
-            defaultPlasticEnabled_ = previousDefaultPlasticState;
+        AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
+        vulkanRenderer_.resetAccumulation();
+        optixRenderer_.resetAccumulation();
+        statusMessage_ = std::string("Material override: Default Plastic ") +
+                         (defaultPlasticEnabled_ ? "ON" : "OFF");
     }
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
     {
         ImGui::SetTooltip("Overrides every loaded mesh with one light-gray plastic material.\n"
                           "Albedo: 0.75 | Metallic: 0.0 | Roughness: 0.5\n"
-                          "Changing it reloads the current model.");
+                          "Original materials stay resident; changing it does not reload geometry.");
     }
     const bool previousGroundPlaneState = groundPlaneEnabled_;
     const ImVec4 groundToggleColor = groundPlaneEnabled_ ? ImVec4(0.16f, 0.52f, 0.24f, 1.0f)
@@ -622,7 +627,6 @@ void Application::loadSceneFromUi()
     }
     AssetLoadResult result = assetLoader_.load(
         path, {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
-               .overrideWithDefaultPlastic = defaultPlasticEnabled_,
                .addGroundPlane = groundPlaneEnabled_});
     if (!result)
     {
@@ -632,6 +636,7 @@ void Application::loadSceneFromUi()
     Environment environment = std::move(scene_.environment);
     scene_ = std::move(result.scene);
     scene_.environment = std::move(environment);
+    AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
     frameCameraToScene();
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
@@ -712,7 +717,6 @@ bool Application::reloadCurrentScene()
     Scene reloadedScene;
     const AssetLoadOptions options{
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
-        .overrideWithDefaultPlastic = defaultPlasticEnabled_,
         .addGroundPlane = groundPlaneEnabled_,
     };
     if (scene_.sourcePath.empty())
@@ -731,6 +735,7 @@ bool Application::reloadCurrentScene()
     Environment environment = std::move(scene_.environment);
     scene_ = std::move(reloadedScene);
     scene_.environment = std::move(environment);
+    AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
     frameCameraToScene();
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);

@@ -462,7 +462,9 @@ void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSett
     framePushConstants_.rayTracedReflections = settings.rayTracedReflections && tlas_ ? 1u : 0u;
     framePushConstants_.exposure = settings.exposure;
     framePushConstants_.meshletCount = uploadedMeshletCount_;
-    framePushConstants_.instanceCount = static_cast<std::uint32_t>(uploadedInstances_.size());
+    framePushConstants_.materialOverrideId =
+        scene_ && scene_->materialOverrideId < scene_->materials.size() ? scene_->materialOverrideId
+                                                                        : kInvalidMaterialId;
     framePushConstants_.showMeshlets = settings.showMeshlets ? 1u : 0u;
     framePushConstants_.padding[0] = 0u;
     framePushConstants_.padding[1] = environment.hasHdr() ? environment.hdrMipCount : 0u;
@@ -1130,7 +1132,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -1156,13 +1158,17 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[7].descriptorCount = 1;
     bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[8].binding = 8;
+    bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[8].descriptorCount = 1;
+    bindings[8].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
 
     const std::array poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1415,6 +1421,7 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(geometryIndexBuffer_);
     destroyBuffer(sceneInstanceBuffer_);
     destroyBuffer(environmentBuffer_);
+    destroyBuffer(materialBuffer_);
     uploadedGeometries_.clear();
     uploadedInstances_.clear();
     uploadedMeshletCount_ = 0;
@@ -1448,11 +1455,10 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t vertexCount;
         std::uint32_t triangleCount;
         std::uint32_t instanceIndex;
-        std::uint32_t padding[3];
+        std::uint32_t materialIndex;
+        std::uint32_t padding[2];
         Vec4 boundingSphere;
         Vec4 normalCone;
-        Vec4 baseColorAndMetallic;
-        Vec4 materialParameters;
     };
     struct alignas(16) GpuInstance
     {
@@ -1460,11 +1466,17 @@ bool VulkanRenderer::uploadSceneResources()
         Mat4 normalTransform;
         Vec4 scaleAndFlags;
         std::uint32_t geometry[4];
+        std::uint32_t materialIndex;
+        std::uint32_t padding[3];
+    };
+    struct alignas(16) GpuMaterial
+    {
         Vec4 baseColorAndMetallic;
         Vec4 emissiveAndRoughness;
     };
-    static_assert(sizeof(GpuMeshlet) == 96);
-    static_assert(sizeof(GpuInstance) == 192);
+    static_assert(sizeof(GpuMeshlet) == 64);
+    static_assert(sizeof(GpuInstance) == 176);
+    static_assert(sizeof(GpuMaterial) == 32);
     struct RasterMeshRange
     {
         std::uint32_t firstMeshlet{};
@@ -1478,6 +1490,7 @@ bool VulkanRenderer::uploadSceneResources()
     std::vector<std::uint32_t> meshletVertices;
     std::vector<std::uint32_t> packedTriangles;
     std::vector<std::uint32_t> geometryIndices;
+    std::vector<GpuMaterial> gpuMaterials;
     const Vec4 fallbackEnvironment{0.0f, 0.0f, 0.0f, 1.0f};
     const std::span<const Vec4> environmentPixels = scene_->environment.hasHdr()
                                                         ? std::span<const Vec4>(scene_->environment.hdrPixels)
@@ -1504,9 +1517,7 @@ bool VulkanRenderer::uploadSceneResources()
                                 {vertex.uv.x, vertex.uv.y, 0.0f, 0.0f}});
         }
 
-        Material material{};
-        if (mesh.materialIndex < scene_->materials.size())
-            material = scene_->materials[mesh.materialIndex];
+        const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
         RasterMeshRange& rasterRange = rasterRanges[meshIndex];
         rasterRange.firstMeshlet = static_cast<std::uint32_t>(meshletTemplates.size());
         for (const Meshlet& meshlet : lod.meshlets)
@@ -1524,9 +1535,7 @@ bool VulkanRenderer::uploadSceneResources()
                 packedTriangles.push_back(packed);
             }
             meshletTemplates.push_back({meshletVertexOffset, triangleOffset, meshlet.vertexCount, meshlet.triangleCount,
-                                        0, {}, meshlet.boundingSphere, meshlet.normalCone,
-                                        {material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
-                                        {material.roughness, 0.0f, 0.0f, 0.0f}});
+                                        0, materialIndex, {}, meshlet.boundingSphere, meshlet.normalCone});
         }
         rasterRange.meshletCount = static_cast<std::uint32_t>(meshletTemplates.size()) - rasterRange.firstMeshlet;
         for (std::uint32_t index : lod.indices)
@@ -1543,16 +1552,14 @@ bool VulkanRenderer::uploadSceneResources()
         const float minScale = std::min({scaleX, scaleY, scaleZ});
         const std::uint32_t gpuInstanceIndex = static_cast<std::uint32_t>(gpuInstances.size());
         const UploadedGeometry& geometry = uploadedGeometries_[meshToGeometry[meshIndex]];
-        Material material{};
         const Mesh& mesh = scene_->meshes[meshIndex];
-        if (mesh.materialIndex < scene_->materials.size())
-            material = scene_->materials[mesh.materialIndex];
+        const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
         gpuInstances.push_back({transform,
                                 normalTransformMatrix(transform),
                                 {maxScale, minScale, 0.0f, 0.0f},
                                 {geometry.vertexOffset, geometry.indexOffset, geometry.indexCount, 0},
-                                {material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
-                                {material.emissive.x, material.emissive.y, material.emissive.z, material.roughness}});
+                                materialIndex,
+                                {}});
         const RasterMeshRange range = rasterRanges[meshIndex];
         for (std::uint32_t index = 0; index < range.meshletCount; ++index)
         {
@@ -1577,6 +1584,19 @@ bool VulkanRenderer::uploadSceneResources()
     if (vertices.empty() || meshlets.empty() || geometryIndices.empty() || gpuInstances.empty())
         return true;
 
+    if (scene_->materials.empty())
+        gpuMaterials.push_back({{1.0f, 1.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f}});
+    else
+    {
+        gpuMaterials.reserve(scene_->materials.size());
+        for (const Material& material : scene_->materials)
+        {
+            gpuMaterials.push_back({{material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
+                                    {material.emissive.x, material.emissive.y, material.emissive.z,
+                                     material.roughness}});
+        }
+    }
+
     vertexBuffer_ = createDeviceLocalBuffer(vertices.size() * sizeof(GpuVertex),
                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
@@ -1593,6 +1613,8 @@ bool VulkanRenderer::uploadSceneResources()
     sceneInstanceBuffer_ = createDeviceLocalBuffer(gpuInstances.size() * sizeof(GpuInstance),
                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     environmentBuffer_ = createDeviceLocalBuffer(environmentPixels.size_bytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    materialBuffer_ = createDeviceLocalBuffer(gpuMaterials.size() * sizeof(GpuMaterial),
+                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const std::array uploads{
         BufferUpload{&vertexBuffer_, vertices.data(), vertices.size() * sizeof(GpuVertex)},
         BufferUpload{&meshletBuffer_, meshlets.data(), meshlets.size() * sizeof(GpuMeshlet)},
@@ -1601,6 +1623,7 @@ bool VulkanRenderer::uploadSceneResources()
         BufferUpload{&geometryIndexBuffer_, geometryIndices.data(), geometryIndices.size() * sizeof(std::uint32_t)},
         BufferUpload{&sceneInstanceBuffer_, gpuInstances.data(), gpuInstances.size() * sizeof(GpuInstance)},
         BufferUpload{&environmentBuffer_, environmentPixels.data(), environmentPixels.size_bytes()},
+        BufferUpload{&materialBuffer_, gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)},
     };
     if (!uploadDeviceLocalBuffers(uploads))
         throw std::runtime_error("Failed to stage Vulkan scene geometry into device-local memory");
@@ -1614,7 +1637,7 @@ bool VulkanRenderer::uploadSceneResources()
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &sceneDescriptorSetLayout_;
     check(vkAllocateDescriptorSets(device_, &allocateInfo, &sceneDescriptorSet_), "vkAllocateDescriptorSets");
-    const std::array<VkDescriptorBufferInfo, 7> bufferInfos{{
+    const std::array<VkDescriptorBufferInfo, 8> bufferInfos{{
         {vertexBuffer_.buffer, 0, vertexBuffer_.size},
         {meshletBuffer_.buffer, 0, meshletBuffer_.size},
         {meshletVertexBuffer_.buffer, 0, meshletVertexBuffer_.size},
@@ -1622,8 +1645,9 @@ bool VulkanRenderer::uploadSceneResources()
         {sceneInstanceBuffer_.buffer, 0, sceneInstanceBuffer_.size},
         {geometryIndexBuffer_.buffer, 0, geometryIndexBuffer_.size},
         {environmentBuffer_.buffer, 0, environmentBuffer_.size},
+        {materialBuffer_.buffer, 0, materialBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 8> writes{};
+    std::array<VkWriteDescriptorSet, 9> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1661,6 +1685,12 @@ bool VulkanRenderer::uploadSceneResources()
     writes[7].descriptorCount = 1;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[7].pBufferInfo = &bufferInfos[6];
+    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[8].dstSet = sceneDescriptorSet_;
+    writes[8].dstBinding = 8;
+    writes[8].descriptorCount = 1;
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[8].pBufferInfo = &bufferInfos[7];
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;

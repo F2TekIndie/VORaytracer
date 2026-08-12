@@ -128,12 +128,7 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
         material.emissiveTexture = addTexture(scene, basePath, source, aiTextureType_EMISSIVE, true);
         scene.materials.push_back(std::move(material));
     }
-    if (options.overrideWithDefaultPlastic)
-    {
-        scene.materials.clear();
-        scene.materials.push_back(makeDefaultPlasticMaterial());
-        scene.textures.clear();
-    }
+    ensureDefaultPlasticMaterial(scene);
 
     scene.meshes.reserve(imported->mNumMeshes);
     for (unsigned meshIndex = 0; meshIndex < imported->mNumMeshes; ++meshIndex)
@@ -141,7 +136,7 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
         const aiMesh* source = imported->mMeshes[meshIndex];
         Mesh mesh{};
         mesh.name = source->mName.C_Str();
-        mesh.materialIndex = options.overrideWithDefaultPlastic ? 0u : source->mMaterialIndex;
+        mesh.materialIndex = source->mMaterialIndex;
         mesh.vertices.resize(source->mNumVertices);
         for (unsigned vertexIndex = 0; vertexIndex < source->mNumVertices; ++vertexIndex)
         {
@@ -292,12 +287,7 @@ bool AssetLoader::loadHdrEnvironment(const std::filesystem::path& path,
 Scene AssetLoader::createProceduralCube(AssetLoadOptions options) const
 {
     Scene scene = makeDefaultScene();
-    if (options.overrideWithDefaultPlastic)
-    {
-        scene.materials.clear();
-        scene.materials.push_back(makeDefaultPlasticMaterial());
-        scene.textures.clear();
-    }
+    ensureDefaultPlasticMaterial(scene);
     Mesh mesh{};
     mesh.name = "Cube";
     mesh.materialIndex = 0;
@@ -374,20 +364,7 @@ void AssetLoader::appendGroundPlane(Scene& scene, bool enableOptionalPasses)
     const float verticalOffset = std::max(extent.y * 0.00001f, 0.0001f);
     const float groundY = minimum.y - verticalOffset;
 
-    const Material defaultPlastic = makeDefaultPlasticMaterial();
-    const auto matchingMaterial = std::find_if(scene.materials.begin(), scene.materials.end(), [&](const Material& material) {
-        return material.name == defaultPlastic.name && material.baseColor.x == defaultPlastic.baseColor.x &&
-               material.baseColor.y == defaultPlastic.baseColor.y && material.baseColor.z == defaultPlastic.baseColor.z &&
-               material.metallic == defaultPlastic.metallic && material.roughness == defaultPlastic.roughness;
-    });
-    std::uint32_t materialIndex = 0;
-    if (matchingMaterial != scene.materials.end())
-        materialIndex = static_cast<std::uint32_t>(std::distance(scene.materials.begin(), matchingMaterial));
-    else
-    {
-        materialIndex = static_cast<std::uint32_t>(scene.materials.size());
-        scene.materials.push_back(defaultPlastic);
-    }
+    const std::uint32_t materialIndex = ensureDefaultPlasticMaterial(scene);
 
     Mesh ground{};
     ground.name = "Ground Plane";
@@ -407,6 +384,27 @@ void AssetLoader::appendGroundPlane(Scene& scene, bool enableOptionalPasses)
     const std::uint32_t groundMeshIndex = static_cast<std::uint32_t>(scene.meshes.size());
     scene.meshes.push_back(std::move(ground));
     scene.instances.push_back({"Ground Plane", groundMeshIndex, Mat4::identity(), Mat4::identity()});
+}
+
+std::uint32_t AssetLoader::ensureDefaultPlasticMaterial(Scene& scene)
+{
+    const Material defaultPlastic = makeDefaultPlasticMaterial();
+    const auto matchingMaterial = std::find_if(scene.materials.begin(), scene.materials.end(), [&](const Material& material) {
+        return material.name == defaultPlastic.name && material.baseColor.x == defaultPlastic.baseColor.x &&
+               material.baseColor.y == defaultPlastic.baseColor.y && material.baseColor.z == defaultPlastic.baseColor.z &&
+               material.metallic == defaultPlastic.metallic && material.roughness == defaultPlastic.roughness;
+    });
+    if (matchingMaterial != scene.materials.end())
+        return static_cast<std::uint32_t>(std::distance(scene.materials.begin(), matchingMaterial));
+
+    const std::uint32_t materialId = static_cast<std::uint32_t>(scene.materials.size());
+    scene.materials.push_back(defaultPlastic);
+    return materialId;
+}
+
+void AssetLoader::setDefaultPlasticOverride(Scene& scene, bool enabled)
+{
+    scene.materialOverrideId = enabled ? ensureDefaultPlasticMaterial(scene) : kInvalidMaterialId;
 }
 
 void AssetLoader::processMesh(Mesh& mesh, bool enableOptionalPasses)

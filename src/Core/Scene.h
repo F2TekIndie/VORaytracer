@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
 namespace vor
 {
+inline constexpr std::uint32_t kInvalidMaterialId = std::numeric_limits<std::uint32_t>::max();
+
 struct Vertex
 {
     Vec3 position{};
@@ -167,6 +170,7 @@ struct Scene
     std::vector<Light> lights;
     Environment environment{};
     Camera camera{};
+    std::uint32_t materialOverrideId{kInvalidMaterialId};
 
     [[nodiscard]] std::size_t triangleCount() const;
     [[nodiscard]] std::size_t meshletCount() const;

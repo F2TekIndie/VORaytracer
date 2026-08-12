@@ -37,7 +37,7 @@ struct LaunchParameters
     uint displayBgra;
     float exposure;
     uint writeDisplay;
-    uint padding0;
+    uint materialOverrideId;
     uint padding1;
     uint padding2;
     uint indirectLighting;
@@ -196,7 +196,9 @@ void RayGen(LaunchParameters parameters)
             if (dot(normal, viewDirection) < 0.0)
                 normal = -normal;
 
-            uint materialIndex = parameters.triangleMaterialIndices[payload.primitiveIndex];
+            uint materialIndex = parameters.materialOverrideId != 0xffffffffu
+                                     ? parameters.materialOverrideId
+                                     : parameters.triangleMaterialIndices[payload.primitiveIndex];
             GpuMaterial material = parameters.materials[materialIndex];
             if (bounce == 0 && sampleIndex == 0 && parameters.writeDisplay == 0)
             {

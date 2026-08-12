@@ -108,7 +108,7 @@ private:
         std::uint32_t rayTracedReflections{};
         float exposure{};
         std::uint32_t meshletCount{};
-        std::uint32_t instanceCount{};
+        std::uint32_t materialOverrideId{kInvalidMaterialId};
         std::uint32_t showMeshlets{};
         std::uint32_t padding[2]{};
     };
@@ -187,6 +187,7 @@ private:
     GpuBuffer geometryIndexBuffer_{};
     GpuBuffer sceneInstanceBuffer_{};
     GpuBuffer environmentBuffer_{};
+    GpuBuffer materialBuffer_{};
     GpuBuffer tlasStorage_{};
     GpuBuffer accelerationInstanceBuffer_{};
     std::vector<BlasResource> blases_;

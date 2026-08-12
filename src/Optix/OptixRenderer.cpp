@@ -108,7 +108,8 @@ struct LaunchParameters
     std::uint32_t displayBgra;
     float exposure;
     std::uint32_t writeDisplay;
-    std::uint32_t padding[3];
+    std::uint32_t materialOverrideId;
+    std::uint32_t padding[2];
     std::uint32_t indirectLighting;
     std::uint32_t globalLightMode;
     std::uint32_t environmentWidth;
@@ -931,6 +932,9 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.displayBgra = interopBgra_ ? 1u : 0u;
         parameters.exposure = settings.exposure;
         parameters.writeDisplay = 1u;
+        parameters.materialOverrideId = scene_ && scene_->materialOverrideId < scene_->materials.size()
+                                            ? scene_->materialOverrideId
+                                            : kInvalidMaterialId;
         const Environment fallbackEnvironment{};
         const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
         parameters.indirectLighting = settings.indirectLighting ? 1u : 0u;
