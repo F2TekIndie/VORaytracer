@@ -6,6 +6,12 @@ float3 fresnelSchlick(float cosTheta, float3 f0)
     return f0 + (1.0 - f0) * factor;
 }
 
+float3 fresnelSchlickRoughness(float cosTheta, float3 f0, float roughness)
+{
+    float factor = pow(saturate(1.0 - cosTheta), 5.0);
+    return f0 + (max(float3(1.0 - roughness), f0) - f0) * factor;
+}
+
 float distributionGgx(float3 normal, float3 halfway, float roughness)
 {
     float a = roughness * roughness;
@@ -47,4 +53,3 @@ float3 evaluateMetallicRoughness(
     float3 diffuseWeight = (1.0 - fresnel) * (1.0 - metallic);
     return (diffuseWeight * baseColor / PI + specular) * radiance * saturate(dot(normal, lightDirection));
 }
-

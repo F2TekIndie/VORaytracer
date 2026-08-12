@@ -209,7 +209,7 @@ void RayGen(LaunchParameters parameters)
             float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
             float rayBias = max(0.0001, coordinateScale * 0.00001);
             float visibility = 1.0;
-            if (parameters.rayTracedShadows != 0)
+            if (parameters.rayTracedShadows != 0 && parameters.globalLightMode != 1)
             {
                 RayDesc shadowRay;
                 shadowRay.Origin = worldPosition + normal * rayBias;
@@ -229,7 +229,7 @@ void RayGen(LaunchParameters parameters)
                 visibility = shadowPayload.hit == 0 ? 1.0 : 0.0;
             }
             float3 lightRadiance = parameters.globalLightMode == 1
-                                       ? sampleGlobalEnvironment(parameters, lightDirection) * visibility
+                                       ? float3(0.0)
                                        : parameters.lightColorAndIntensity.xyz *
                                              parameters.lightColorAndIntensity.w * visibility;
             float roughness = clamp(material.emissiveAndRoughness.w, 0.02, 1.0);
