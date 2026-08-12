@@ -108,6 +108,9 @@ bool Application::initialize()
         settings_.backend = BackendKind::Optix;
         previousBackend_ = BackendKind::Optix;
     }
+    if (const char* requestedDenoiser = std::getenv("VOR_DENOISER");
+        requestedDenoiser && std::strcmp(requestedDenoiser, "1") == 0)
+        settings_.denoiser = true;
 
     const AssetLoadOptions loadOptions{
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
@@ -280,7 +283,13 @@ void Application::drawRenderPanel()
     ImGui::Checkbox("Ray-traced shadows", &settings_.rayTracedShadows);
     ImGui::Checkbox("Ray-traced reflections", &settings_.rayTracedReflections);
     ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting);
-    ImGui::Checkbox("Denoiser", &settings_.denoiser);
+    if (settings_.backend != BackendKind::Optix)
+        ImGui::BeginDisabled();
+    ImGui::Checkbox("OptiX denoiser", &settings_.denoiser);
+    if (settings_.backend != BackendKind::Optix)
+        ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("OptiX AI denoiser with albedo and world-normal guides.");
     ImGui::Checkbox("Meshlet debug colors", &settings_.showMeshlets);
 
     ImGui::SeparatorText("Key light");

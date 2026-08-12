@@ -37,6 +37,13 @@ public:
 private:
     static void contextLog(unsigned int level, const char* tag, const char* message, void* data);
     bool resizeOutput();
+    bool createDenoiser();
+    bool ensureDenoiserResources();
+    bool resizeDenoiser();
+    bool invokeDenoiser();
+    void destroyDenoiserResources();
+    void destroyDenoiser();
+    void destroyOutputBuffers();
     bool createPipeline();
     void destroyPipeline();
     bool buildSceneAcceleration();
@@ -52,15 +59,20 @@ private:
     OptixDeviceContext optixContext_{};
     OptixModule module_{};
     OptixProgramGroup raygenProgramGroup_{};
+    OptixProgramGroup toneMapProgramGroup_{};
     OptixProgramGroup missProgramGroup_{};
     OptixProgramGroup hitProgramGroup_{};
     OptixPipeline pipeline_{};
     CUdeviceptr outputBuffer_{};
+    CUdeviceptr denoisedOutputBuffer_{};
+    CUdeviceptr albedoGuideBuffer_{};
+    CUdeviceptr normalGuideBuffer_{};
     CUdeviceptr interopOutputBuffer_{};
     CUexternalMemory externalMemory_{};
     CUexternalSemaphore cudaReadySemaphore_{};
     CUexternalSemaphore vulkanCompleteSemaphore_{};
     CUdeviceptr raygenRecord_{};
+    CUdeviceptr toneMapRecord_{};
     CUdeviceptr missRecord_{};
     CUdeviceptr hitRecord_{};
     CUdeviceptr vertexBuffer_{};
@@ -73,6 +85,11 @@ private:
     std::size_t materialCount_{};
     CUdeviceptr gasBuffer_{};
     OptixTraversableHandle gasHandle_{};
+    OptixDenoiser denoiser_{};
+    CUdeviceptr denoiserState_{};
+    CUdeviceptr denoiserScratch_{};
+    std::size_t denoiserStateSize_{};
+    std::size_t denoiserScratchSize_{};
     void* launchParametersHost_{};
     std::uint64_t interopGeneration_{};
     bool firstInteropLaunch_{true};

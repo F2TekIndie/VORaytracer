@@ -6,6 +6,8 @@
 #include <optix_stack_size.h>
 #include <optix_stubs.h>
 
+#include <GLFW/glfw3.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -85,6 +87,9 @@ struct SlangStructuredBuffer
 struct LaunchParameters
 {
     SlangStructuredBuffer output;
+    SlangStructuredBuffer denoisedOutput;
+    SlangStructuredBuffer albedoGuide;
+    SlangStructuredBuffer normalGuide;
     SlangStructuredBuffer displayOutput;
     SlangStructuredBuffer normals;
     SlangStructuredBuffer indices;
@@ -100,7 +105,7 @@ struct LaunchParameters
     std::uint32_t rayTracedShadows;
     std::uint32_t displayBgra;
     float exposure;
-    std::uint32_t padding;
+    std::uint32_t writeDisplay;
     Vec4 cameraPositionAndFov;
     Vec4 cameraTargetAndAspect;
     Vec4 cameraUp;
@@ -119,8 +124,8 @@ struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) EmptyRecord
     std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
 };
 
-static_assert(sizeof(LaunchParameters) == 224);
-static_assert(sizeof(RaygenRecord) == 256);
+static_assert(sizeof(LaunchParameters) == 272);
+static_assert(sizeof(RaygenRecord) == 304);
 static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 } // namespace
 
@@ -129,7 +134,7 @@ OptixRenderer::~OptixRenderer()
     shutdown();
 }
 
-bool OptixRenderer::initialize(GLFWwindow*)
+bool OptixRenderer::initialize(GLFWwindow* window)
 {
     try
     {
@@ -151,12 +156,18 @@ bool OptixRenderer::initialize(GLFWwindow*)
         options.logCallbackLevel = VOR_DEBUG ? 4 : 2;
         checkOptix(optixDeviceContextCreate(cudaContext_, &options, &optixContext_), "optixDeviceContextCreate");
 
-        if (!createPipeline())
+        if (!createPipeline() || !createDenoiser())
             return false;
 
         char deviceName[256]{};
         checkCuda(cuDeviceGetName(deviceName, sizeof(deviceName), cudaDevice_), "cuDeviceGetName");
         stats_.deviceName = deviceName;
+        int framebufferWidth = 1;
+        int framebufferHeight = 1;
+        if (window)
+            glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
+        width_ = static_cast<std::uint32_t>(std::max(framebufferWidth, 1));
+        height_ = static_cast<std::uint32_t>(std::max(framebufferHeight, 1));
         if (!resizeOutput())
             return false;
         available_ = true;
@@ -184,9 +195,8 @@ void OptixRenderer::shutdown()
     clearGpuInteropSurface();
     destroySceneAcceleration();
     destroyPipeline();
-    if (outputBuffer_)
-        cuMemFree(outputBuffer_);
-    outputBuffer_ = 0;
+    destroyDenoiser();
+    destroyOutputBuffers();
     if (optixContext_)
         optixDeviceContextDestroy(optixContext_);
     optixContext_ = nullptr;
@@ -301,6 +311,8 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
     try
     {
         checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
+        if (settings.denoiser && !ensureDenoiserResources())
+            return false;
         if (!updateShaderBindingTable(camera, settings))
             return false;
         OptixShaderBindingTable shaderBindingTable{};
@@ -318,6 +330,15 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
                       "cuWaitExternalSemaphoresAsync(Vulkan complete)");
         }
         checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &shaderBindingTable, width_, height_, 1), "optixLaunch");
+        if (settings.denoiser)
+        {
+            if (!invokeDenoiser())
+                return false;
+            OptixShaderBindingTable toneMapBindingTable{};
+            toneMapBindingTable.raygenRecord = toneMapRecord_;
+            checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &toneMapBindingTable, width_, height_, 1),
+                       "optixLaunch(tone map)");
+        }
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
         checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
                   "cuSignalExternalSemaphoresAsync(CUDA ready)");
@@ -345,11 +366,11 @@ bool OptixRenderer::resizeOutput()
 {
     try
     {
-        if (outputBuffer_)
-            checkCuda(cuMemFree(outputBuffer_), "cuMemFree");
-        outputBuffer_ = 0;
+        if (cudaStream_)
+            checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(resize output)");
+        destroyOutputBuffers();
         const std::size_t byteCount = static_cast<std::size_t>(width_) * height_ * 4 * sizeof(float);
-        checkCuda(cuMemAlloc(&outputBuffer_, byteCount), "cuMemAlloc");
+        checkCuda(cuMemAlloc(&outputBuffer_, byteCount), "cuMemAlloc(beauty output)");
         resetAccumulation();
         return true;
     }
@@ -358,6 +379,164 @@ bool OptixRenderer::resizeOutput()
         setError(error.what());
         return false;
     }
+}
+
+bool OptixRenderer::ensureDenoiserResources()
+{
+    if (denoisedOutputBuffer_ && albedoGuideBuffer_ && normalGuideBuffer_ && denoiserState_ && denoiserScratch_)
+        return true;
+    try
+    {
+        if ((denoisedOutputBuffer_ || albedoGuideBuffer_ || normalGuideBuffer_ || denoiserState_ || denoiserScratch_) &&
+            cudaStream_)
+            checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(rebuild denoiser resources)");
+        destroyDenoiserResources();
+        const std::size_t byteCount = static_cast<std::size_t>(width_) * height_ * sizeof(Vec4);
+        checkCuda(cuMemAlloc(&denoisedOutputBuffer_, byteCount), "cuMemAlloc(denoised output)");
+        checkCuda(cuMemAlloc(&albedoGuideBuffer_, byteCount), "cuMemAlloc(albedo guide)");
+        checkCuda(cuMemAlloc(&normalGuideBuffer_, byteCount), "cuMemAlloc(normal guide)");
+        if (!resizeDenoiser())
+            throw std::runtime_error(unavailableReason_.empty() ? "OptiX denoiser setup failed" : unavailableReason_);
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        destroyDenoiserResources();
+        return false;
+    }
+}
+
+bool OptixRenderer::createDenoiser()
+{
+    try
+    {
+        log(LogLevel::Info, "Creating OptiX AI denoiser");
+        OptixDenoiserOptions options{};
+        options.guideAlbedo = 1;
+        options.guideNormal = 1;
+        options.denoiseAlpha = OPTIX_DENOISER_ALPHA_MODE_COPY;
+        checkOptix(optixDenoiserCreate(optixContext_, OPTIX_DENOISER_MODEL_KIND_AOV, &options, &denoiser_),
+                   "optixDenoiserCreate");
+        log(LogLevel::Info, "OptiX AI denoiser created");
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        destroyDenoiser();
+        return false;
+    }
+}
+
+bool OptixRenderer::resizeDenoiser()
+{
+    try
+    {
+        if (!denoiser_)
+            return false;
+        if (denoiserState_)
+            checkCuda(cuMemFree(denoiserState_), "cuMemFree(denoiser state)");
+        if (denoiserScratch_)
+            checkCuda(cuMemFree(denoiserScratch_), "cuMemFree(denoiser scratch)");
+        denoiserState_ = 0;
+        denoiserScratch_ = 0;
+        denoiserStateSize_ = 0;
+        denoiserScratchSize_ = 0;
+
+        OptixDenoiserSizes sizes{};
+        checkOptix(optixDenoiserComputeMemoryResources(denoiser_, width_, height_, &sizes),
+                   "optixDenoiserComputeMemoryResources");
+        denoiserStateSize_ = sizes.stateSizeInBytes;
+        denoiserScratchSize_ = sizes.withoutOverlapScratchSizeInBytes;
+        log(LogLevel::Info, "OptiX denoiser setup " + std::to_string(width_) + "x" + std::to_string(height_) +
+                                ": state " + std::to_string(denoiserStateSize_) + " bytes, scratch " +
+                                std::to_string(denoiserScratchSize_) + " bytes");
+        checkCuda(cuMemAlloc(&denoiserState_, denoiserStateSize_), "cuMemAlloc(denoiser state)");
+        checkCuda(cuMemAlloc(&denoiserScratch_, denoiserScratchSize_), "cuMemAlloc(denoiser scratch)");
+        checkOptix(optixDenoiserSetup(denoiser_, cudaStream_, width_, height_, denoiserState_, denoiserStateSize_,
+                                      denoiserScratch_, denoiserScratchSize_),
+                   "optixDenoiserSetup");
+        log(LogLevel::Info, "OptiX denoiser setup complete");
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        return false;
+    }
+}
+
+bool OptixRenderer::invokeDenoiser()
+{
+    try
+    {
+        const auto image = [this](CUdeviceptr buffer) {
+            OptixImage2D result{};
+            result.data = buffer;
+            result.width = width_;
+            result.height = height_;
+            result.rowStrideInBytes = width_ * static_cast<unsigned int>(sizeof(Vec4));
+            result.pixelStrideInBytes = sizeof(Vec4);
+            result.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+            return result;
+        };
+        OptixDenoiserGuideLayer guides{};
+        guides.albedo = image(albedoGuideBuffer_);
+        guides.normal = image(normalGuideBuffer_);
+        OptixDenoiserLayer layer{};
+        layer.input = image(outputBuffer_);
+        layer.output = image(denoisedOutputBuffer_);
+        layer.type = OPTIX_DENOISER_AOV_TYPE_BEAUTY;
+        OptixDenoiserParams parameters{};
+        parameters.blendFactor = 0.0f;
+        checkOptix(optixDenoiserInvoke(denoiser_, cudaStream_, &parameters, denoiserState_, denoiserStateSize_,
+                                       &guides, &layer, 1, 0, 0, denoiserScratch_, denoiserScratchSize_),
+                   "optixDenoiserInvoke");
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        return false;
+    }
+}
+
+void OptixRenderer::destroyDenoiser()
+{
+    destroyDenoiserResources();
+    if (denoiser_)
+        optixDenoiserDestroy(denoiser_);
+    denoiser_ = nullptr;
+}
+
+void OptixRenderer::destroyDenoiserResources()
+{
+    if (denoiserScratch_)
+        cuMemFree(denoiserScratch_);
+    if (denoiserState_)
+        cuMemFree(denoiserState_);
+    denoiserScratch_ = 0;
+    denoiserState_ = 0;
+    denoiserScratchSize_ = 0;
+    denoiserStateSize_ = 0;
+    if (normalGuideBuffer_)
+        cuMemFree(normalGuideBuffer_);
+    if (albedoGuideBuffer_)
+        cuMemFree(albedoGuideBuffer_);
+    if (denoisedOutputBuffer_)
+        cuMemFree(denoisedOutputBuffer_);
+    normalGuideBuffer_ = 0;
+    albedoGuideBuffer_ = 0;
+    denoisedOutputBuffer_ = 0;
+}
+
+void OptixRenderer::destroyOutputBuffers()
+{
+    destroyDenoiserResources();
+    if (outputBuffer_)
+        cuMemFree(outputBuffer_);
+    outputBuffer_ = 0;
 }
 
 bool OptixRenderer::buildSceneAcceleration()
@@ -548,18 +727,21 @@ bool OptixRenderer::createPipeline()
                 std::string_view(logBuffer.data(), std::min(logSize, logBuffer.size())));
         checkOptix(moduleResult, "optixModuleCreate");
 
-        std::array<OptixProgramGroupDesc, 3> programGroupDescriptions{};
+        std::array<OptixProgramGroupDesc, 4> programGroupDescriptions{};
         programGroupDescriptions[0].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
         programGroupDescriptions[0].raygen.module = module_;
         programGroupDescriptions[0].raygen.entryFunctionName = "__raygen__RayGen";
-        programGroupDescriptions[1].kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
-        programGroupDescriptions[1].miss.module = module_;
-        programGroupDescriptions[1].miss.entryFunctionName = "__miss__Miss";
-        programGroupDescriptions[2].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
-        programGroupDescriptions[2].hitgroup.moduleCH = module_;
-        programGroupDescriptions[2].hitgroup.entryFunctionNameCH = "__closesthit__ClosestHit";
+        programGroupDescriptions[1].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+        programGroupDescriptions[1].raygen.module = module_;
+        programGroupDescriptions[1].raygen.entryFunctionName = "__raygen__ToneMap";
+        programGroupDescriptions[2].kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+        programGroupDescriptions[2].miss.module = module_;
+        programGroupDescriptions[2].miss.entryFunctionName = "__miss__Miss";
+        programGroupDescriptions[3].kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+        programGroupDescriptions[3].hitgroup.moduleCH = module_;
+        programGroupDescriptions[3].hitgroup.entryFunctionNameCH = "__closesthit__ClosestHit";
         OptixProgramGroupOptions programGroupOptions{};
-        std::array<OptixProgramGroup, 3> programGroups{};
+        std::array<OptixProgramGroup, 4> programGroups{};
         logSize = logBuffer.size();
         const OptixResult programResult = optixProgramGroupCreate(optixContext_, programGroupDescriptions.data(),
                                                                   static_cast<unsigned int>(programGroupDescriptions.size()),
@@ -570,8 +752,9 @@ bool OptixRenderer::createPipeline()
                 std::string_view(logBuffer.data(), std::min(logSize, logBuffer.size())));
         checkOptix(programResult, "optixProgramGroupCreate");
         raygenProgramGroup_ = programGroups[0];
-        missProgramGroup_ = programGroups[1];
-        hitProgramGroup_ = programGroups[2];
+        toneMapProgramGroup_ = programGroups[1];
+        missProgramGroup_ = programGroups[2];
+        hitProgramGroup_ = programGroups[3];
 
         OptixPipelineLinkOptions linkOptions{};
         linkOptions.maxTraceDepth = 1;
@@ -584,7 +767,6 @@ bool OptixRenderer::createPipeline()
             log(pipelineResult == OPTIX_SUCCESS ? LogLevel::Info : LogLevel::Error,
                 std::string_view(logBuffer.data(), std::min(logSize, logBuffer.size())));
         checkOptix(pipelineResult, "optixPipelineCreate");
-
         OptixStackSizes stackSizes{};
         for (OptixProgramGroup group : programGroups)
             checkOptix(optixUtilAccumulateStackSizes(group, &stackSizes, pipeline_), "optixUtilAccumulateStackSizes");
@@ -598,15 +780,21 @@ bool OptixRenderer::createPipeline()
                    "optixPipelineSetStackSize");
 
         checkCuda(cuMemAlloc(&raygenRecord_, sizeof(RaygenRecord)), "cuMemAlloc(raygen SBT)");
+        checkCuda(cuMemAlloc(&toneMapRecord_, sizeof(RaygenRecord)), "cuMemAlloc(tone map SBT)");
         checkCuda(cuMemAlloc(&missRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(miss SBT)");
         checkCuda(cuMemAlloc(&hitRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(hit SBT)");
         RaygenRecord raygenRecord{};
+        RaygenRecord toneMapRecord{};
         EmptyRecord missRecord{};
         EmptyRecord hitRecord{};
         checkOptix(optixSbtRecordPackHeader(raygenProgramGroup_, &raygenRecord), "optixSbtRecordPackHeader(raygen)");
+        checkOptix(optixSbtRecordPackHeader(toneMapProgramGroup_, &toneMapRecord),
+                   "optixSbtRecordPackHeader(tone map)");
         checkOptix(optixSbtRecordPackHeader(missProgramGroup_, &missRecord), "optixSbtRecordPackHeader(miss)");
         checkOptix(optixSbtRecordPackHeader(hitProgramGroup_, &hitRecord), "optixSbtRecordPackHeader(hit)");
         checkCuda(cuMemcpyHtoD(raygenRecord_, &raygenRecord, sizeof(raygenRecord)), "cuMemcpyHtoD(raygen SBT)");
+        checkCuda(cuMemcpyHtoD(toneMapRecord_, &toneMapRecord, sizeof(toneMapRecord)),
+                  "cuMemcpyHtoD(tone map SBT)");
         checkCuda(cuMemcpyHtoD(missRecord_, &missRecord, sizeof(missRecord)), "cuMemcpyHtoD(miss SBT)");
         checkCuda(cuMemcpyHtoD(hitRecord_, &hitRecord, sizeof(hitRecord)), "cuMemcpyHtoD(hit SBT)");
         return true;
@@ -621,6 +809,8 @@ bool OptixRenderer::createPipeline()
 
 void OptixRenderer::destroyPipeline()
 {
+    if (toneMapRecord_)
+        cuMemFree(toneMapRecord_);
     if (hitRecord_)
         cuMemFree(hitRecord_);
     if (missRecord_)
@@ -630,16 +820,20 @@ void OptixRenderer::destroyPipeline()
     hitRecord_ = 0;
     missRecord_ = 0;
     raygenRecord_ = 0;
+    toneMapRecord_ = 0;
     if (pipeline_)
         optixPipelineDestroy(pipeline_);
     pipeline_ = nullptr;
     if (raygenProgramGroup_)
         optixProgramGroupDestroy(raygenProgramGroup_);
+    if (toneMapProgramGroup_)
+        optixProgramGroupDestroy(toneMapProgramGroup_);
     if (missProgramGroup_)
         optixProgramGroupDestroy(missProgramGroup_);
     if (hitProgramGroup_)
         optixProgramGroupDestroy(hitProgramGroup_);
     raygenProgramGroup_ = nullptr;
+    toneMapProgramGroup_ = nullptr;
     missProgramGroup_ = nullptr;
     hitProgramGroup_ = nullptr;
     if (module_)
@@ -656,6 +850,9 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         auto& parameters = *static_cast<LaunchParameters*>(launchParametersHost_);
         parameters = {};
         parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.denoisedOutput = {denoisedOutputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.albedoGuide = {albedoGuideBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.normalGuide = {normalGuideBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.normals = {normalBuffer_, vertexCount_};
         parameters.indices = {indexBuffer_, triangleCount_};
@@ -671,6 +868,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.rayTracedShadows = settings.rayTracedShadows ? 1u : 0u;
         parameters.displayBgra = interopBgra_ ? 1u : 0u;
         parameters.exposure = settings.exposure;
+        parameters.writeDisplay = settings.denoiser ? 0u : 1u;
         parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
                                            camera.verticalFovDegrees * kPi / 180.0f};
         parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
@@ -683,6 +881,12 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         checkCuda(cuMemcpyHtoDAsync(raygenRecord_ + offsetof(RaygenRecord, parameters), &parameters,
                                     sizeof(parameters), cudaStream_),
                   "cuMemcpyHtoDAsync(launch parameters)");
+        if (settings.denoiser)
+        {
+            checkCuda(cuMemcpyHtoDAsync(toneMapRecord_ + offsetof(RaygenRecord, parameters), &parameters,
+                                        sizeof(parameters), cudaStream_),
+                      "cuMemcpyHtoDAsync(tone map parameters)");
+        }
         checkCuda(cuEventRecord(launchParameterCopyComplete_, cudaStream_), "cuEventRecord(launch parameter copy)");
         launchParameterCopyPending_ = true;
         return true;

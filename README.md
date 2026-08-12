@@ -67,6 +67,8 @@ Der Button „Default plastic: ON/OFF“ ersetzt beim Laden sämtliche importier
 
 Für einen automatisierten Start mit vorgewähltem OptiX-Backend kann vor dem Aufruf `VOR_BACKEND=optix` als Umgebungsvariable gesetzt werden. Im normalen Betrieb erfolgt der Wechsel über die Radio-Buttons im ImGui-Fenster „Renderer“.
 
+Der OptiX-AI-Denoiser kann im Renderer-Fenster aktiviert werden. Für automatisierte Smoke-Tests lässt er sich mit `VOR_DENOISER=1` bereits beim Start einschalten; er nutzt Albedo- und Welt-Normalen-Guides und schreibt das Ergebnis vollständig auf der GPU in den Vulkan-Interop-Puffer.
+
 Für reproduzierbare Import-Smoke-Tests kann ein Startmodell über `VOR_SCENE=<absoluter Dateipfad>` vorgegeben werden.
 
 ## Tests

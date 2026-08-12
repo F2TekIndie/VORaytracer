@@ -17,6 +17,9 @@ struct GpuMaterial
 struct LaunchParameters
 {
     RWStructuredBuffer<float4> output;
+    RWStructuredBuffer<float4> denoisedOutput;
+    RWStructuredBuffer<float4> albedoGuide;
+    RWStructuredBuffer<float4> normalGuide;
     RWStructuredBuffer<uint> displayOutput;
     StructuredBuffer<float3> normals;
     StructuredBuffer<uint3> indices;
@@ -31,7 +34,7 @@ struct LaunchParameters
     uint rayTracedShadows;
     uint displayBgra;
     float exposure;
-    uint padding;
+    uint writeDisplay;
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
@@ -49,6 +52,18 @@ float random01(uint value)
     return float(value & 0x00ffffff) / float(0x01000000);
 }
 
+uint toneMapAndPack(float3 color, float exposure, uint displayBgra)
+{
+    float3 mapped = max(color * exp2(exposure), 0.0);
+    mapped = mapped / (1.0f + mapped);
+    mapped = float3(mapped.x <= 0.0031308f ? 12.92f * mapped.x : 1.055f * pow(mapped.x, 0.41666667f) - 0.055f,
+                    mapped.y <= 0.0031308f ? 12.92f * mapped.y : 1.055f * pow(mapped.y, 0.41666667f) - 0.055f,
+                    mapped.z <= 0.0031308f ? 12.92f * mapped.z : 1.055f * pow(mapped.z, 0.41666667f) - 0.055f);
+    uint3 rgb = uint3(clamp(mapped * 255.0f + 0.5f, 0.0f, 255.0f));
+    return displayBgra != 0 ? rgb.z | (rgb.y << 8) | (rgb.x << 16) | 0xff000000
+                            : rgb.x | (rgb.y << 8) | (rgb.z << 16) | 0xff000000;
+}
+
 [shader("raygeneration")]
 void RayGen(LaunchParameters parameters)
 {
@@ -64,6 +79,8 @@ void RayGen(LaunchParameters parameters)
     uint linearIndex = launchIndex.y * parameters.outputSize.x + launchIndex.x;
     uint sampleCount = max(parameters.samplesPerFrame, 1u);
     float3 sampleSum = float3(0.0);
+    float3 guideAlbedo = float3(0.0);
+    float3 guideNormal = float3(0.0);
     for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
     {
         uint seed = linearIndex * 9781u + (parameters.frameIndex * sampleCount + sampleIndex) * 6271u;
@@ -97,6 +114,11 @@ void RayGen(LaunchParameters parameters)
 
             uint materialIndex = parameters.triangleMaterialIndices[payload.primitiveIndex];
             GpuMaterial material = parameters.materials[materialIndex];
+            if (sampleIndex == 0 && parameters.writeDisplay == 0)
+            {
+                guideAlbedo = material.baseColorAndMetallic.xyz;
+                guideNormal = normal;
+            }
             float3 worldPosition = ray.Origin + ray.Direction * payload.hitDistance;
             float3 lightVector = parameters.lightPosition.xyz - worldPosition;
             float lightDistance = max(length(lightVector), 0.0001);
@@ -148,15 +170,25 @@ void RayGen(LaunchParameters parameters)
         current = lerp(previous, current, weight);
     }
     parameters.output[linearIndex] = float4(current, 1.0);
-    float3 mapped = max(current * exp2(parameters.exposure), 0.0);
-    mapped = mapped / (1.0f + mapped);
-    mapped = float3(mapped.x <= 0.0031308f ? 12.92f * mapped.x : 1.055f * pow(mapped.x, 0.41666667f) - 0.055f,
-                    mapped.y <= 0.0031308f ? 12.92f * mapped.y : 1.055f * pow(mapped.y, 0.41666667f) - 0.055f,
-                    mapped.z <= 0.0031308f ? 12.92f * mapped.z : 1.055f * pow(mapped.z, 0.41666667f) - 0.055f);
-    uint3 rgb = uint3(clamp(mapped * 255.0f + 0.5f, 0.0f, 255.0f));
-    parameters.displayOutput[linearIndex] = parameters.displayBgra != 0
-                                                ? rgb.z | (rgb.y << 8) | (rgb.x << 16) | 0xff000000
-                                                : rgb.x | (rgb.y << 8) | (rgb.z << 16) | 0xff000000;
+    if (parameters.writeDisplay == 0)
+    {
+        parameters.albedoGuide[linearIndex] = float4(guideAlbedo, 1.0);
+        parameters.normalGuide[linearIndex] = float4(guideNormal, 0.0);
+    }
+    else
+        parameters.displayOutput[linearIndex] = toneMapAndPack(current, parameters.exposure, parameters.displayBgra);
+}
+
+[shader("raygeneration")]
+void ToneMap(LaunchParameters parameters)
+{
+    uint3 launchIndex = DispatchRaysIndex();
+    if (any(launchIndex.xy >= parameters.outputSize))
+        return;
+    uint linearIndex = launchIndex.y * parameters.outputSize.x + launchIndex.x;
+    parameters.displayOutput[linearIndex] = toneMapAndPack(parameters.denoisedOutput[linearIndex].xyz,
+                                                           parameters.exposure,
+                                                           parameters.displayBgra);
 }
 
 [shader("miss")]

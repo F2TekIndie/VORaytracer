@@ -33,7 +33,7 @@
     <CustomBuild Include="$(SolutionDir)shaders\Optix\PathTracer.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
 set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH%"
-"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -I "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include" -target ptx -entry RayGen -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
+"$(SlangCompiler)" "%(FullPath)" -I "$(SolutionDir)shaders\Shared" -I "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include" -target ptx -entry RayGen -stage raygeneration -entry ToneMap -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
       <Outputs>$(ShaderOutputDir)PathTracer.ptx</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
     </CustomBuild>
