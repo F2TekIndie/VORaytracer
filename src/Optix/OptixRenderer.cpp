@@ -171,7 +171,7 @@ bool OptixRenderer::initialize(GLFWwindow* window)
         options.logCallbackLevel = VOR_DEBUG ? 4 : 2;
         checkOptix(optixDeviceContextCreate(cudaContext_, &options, &optixContext_), "optixDeviceContextCreate");
 
-        if (!createPipeline() || !createDenoiser())
+        if (!createPipeline())
             return false;
 
         char deviceName[256]{};
@@ -268,9 +268,12 @@ bool OptixRenderer::setGpuInteropSurface(const GpuInteropSurface& surface)
         memoryDesc.size = surface.allocationSize;
         checkCuda(cuImportExternalMemory(&externalMemory_, &memoryDesc), "cuImportExternalMemory(Vulkan)");
         CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufferDesc{};
-        bufferDesc.size = surface.pixelByteSize;
-        checkCuda(cuExternalMemoryGetMappedBuffer(&interopOutputBuffer_, externalMemory_, &bufferDesc),
+        bufferDesc.size = surface.bufferByteSize;
+        checkCuda(cuExternalMemoryGetMappedBuffer(&interopBaseBuffer_, externalMemory_, &bufferDesc),
                   "cuExternalMemoryGetMappedBuffer(Vulkan)");
+        interopInputBuffer_ = interopBaseBuffer_ + surface.inputOffset;
+        interopDenoisedBuffer_ = interopBaseBuffer_ + surface.denoisedOffset;
+        interopOutputBuffer_ = interopBaseBuffer_ + surface.displayOffset;
 
         const auto importSemaphore = [](void* handle, CUexternalSemaphore& semaphore) {
             CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC semaphoreDesc{};
@@ -297,8 +300,11 @@ void OptixRenderer::clearGpuInteropSurface()
 {
     if (cudaStream_)
         cuStreamSynchronize(cudaStream_);
-    if (interopOutputBuffer_)
-        cuMemFree(interopOutputBuffer_);
+    if (interopBaseBuffer_)
+        cuMemFree(interopBaseBuffer_);
+    interopBaseBuffer_ = 0;
+    interopInputBuffer_ = 0;
+    interopDenoisedBuffer_ = 0;
     interopOutputBuffer_ = 0;
     if (cudaReadySemaphore_)
         cuDestroyExternalSemaphore(cudaReadySemaphore_);
@@ -326,8 +332,6 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
     try
     {
         checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
-        if (settings.denoiser && !ensureDenoiserResources())
-            return false;
         if (!updateShaderBindingTable(camera, settings))
             return false;
         OptixShaderBindingTable shaderBindingTable{};
@@ -345,15 +349,6 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
                       "cuWaitExternalSemaphoresAsync(Vulkan complete)");
         }
         checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &shaderBindingTable, width_, height_, 1), "optixLaunch");
-        if (settings.denoiser)
-        {
-            if (!invokeDenoiser())
-                return false;
-            OptixShaderBindingTable toneMapBindingTable{};
-            toneMapBindingTable.raygenRecord = toneMapRecord_;
-            checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &toneMapBindingTable, width_, height_, 1),
-                       "optixLaunch(tone map)");
-        }
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
         checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
                   "cuSignalExternalSemaphoresAsync(CUDA ready)");
@@ -365,6 +360,54 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         stats_.tracedRays = static_cast<std::uint64_t>(width_) * height_ * settings.samplesPerFrame * pathDepth *
                             shadowFactor;
         stats_.frameMilliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        return false;
+    }
+}
+
+bool OptixRenderer::denoiseVulkanFrame(float exposure)
+{
+    if (!available_ || !interopInputBuffer_ || !interopDenoisedBuffer_ || !interopOutputBuffer_)
+        return false;
+    try
+    {
+        checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent(Vulkan denoiser)");
+        if (!ensureDenoiserResources())
+            return false;
+        CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS waitParams{};
+        checkCuda(cuWaitExternalSemaphoresAsync(&vulkanCompleteSemaphore_, &waitParams, 1, cudaStream_),
+                  "cuWaitExternalSemaphoresAsync(Vulkan denoiser input)");
+        if (!invokeDenoiser())
+            return false;
+        if (launchParameterCopyPending_)
+            checkCuda(cuEventSynchronize(launchParameterCopyComplete_),
+                      "cuEventSynchronize(Vulkan tone map parameters)");
+        auto& parameters = *static_cast<LaunchParameters*>(launchParametersHost_);
+        parameters = {};
+        parameters.denoisedOutput = {interopDenoisedBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.width = width_;
+        parameters.height = height_;
+        parameters.displayBgra = interopBgra_ ? 1u : 0u;
+        parameters.exposure = exposure;
+        checkCuda(cuMemcpyHtoDAsync(toneMapRecord_ + offsetof(RaygenRecord, parameters), &parameters,
+                                    sizeof(parameters), cudaStream_),
+                  "cuMemcpyHtoDAsync(Vulkan tone map parameters)");
+        OptixShaderBindingTable toneMapBindingTable{};
+        toneMapBindingTable.raygenRecord = toneMapRecord_;
+        checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &toneMapBindingTable, width_, height_, 1),
+                   "optixLaunch(Vulkan post-denoiser tone map)");
+        checkCuda(cuEventRecord(launchParameterCopyComplete_, cudaStream_),
+                  "cuEventRecord(Vulkan tone map parameters)");
+        launchParameterCopyPending_ = true;
+        CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
+        checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
+                  "cuSignalExternalSemaphoresAsync(Vulkan denoised)");
+        firstInteropLaunch_ = false;
         return true;
     }
     catch (const std::exception& error)
@@ -401,18 +444,15 @@ bool OptixRenderer::resizeOutput()
 
 bool OptixRenderer::ensureDenoiserResources()
 {
-    if (denoisedOutputBuffer_ && albedoGuideBuffer_ && normalGuideBuffer_ && denoiserState_ && denoiserScratch_)
+    if (denoiserState_ && denoiserScratch_)
         return true;
     try
     {
-        if ((denoisedOutputBuffer_ || albedoGuideBuffer_ || normalGuideBuffer_ || denoiserState_ || denoiserScratch_) &&
-            cudaStream_)
+        if (!denoiser_ && !createDenoiser())
+            return false;
+        if ((denoiserState_ || denoiserScratch_) && cudaStream_)
             checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(rebuild denoiser resources)");
         destroyDenoiserResources();
-        const std::size_t byteCount = static_cast<std::size_t>(width_) * height_ * sizeof(Vec4);
-        checkCuda(cuMemAlloc(&denoisedOutputBuffer_, byteCount), "cuMemAlloc(denoised output)");
-        checkCuda(cuMemAlloc(&albedoGuideBuffer_, byteCount), "cuMemAlloc(albedo guide)");
-        checkCuda(cuMemAlloc(&normalGuideBuffer_, byteCount), "cuMemAlloc(normal guide)");
         if (!resizeDenoiser())
             throw std::runtime_error(unavailableReason_.empty() ? "OptiX denoiser setup failed" : unavailableReason_);
         return true;
@@ -431,8 +471,8 @@ bool OptixRenderer::createDenoiser()
     {
         log(LogLevel::Info, "Creating OptiX AI denoiser");
         OptixDenoiserOptions options{};
-        options.guideAlbedo = 1;
-        options.guideNormal = 1;
+        options.guideAlbedo = 0;
+        options.guideNormal = 0;
         options.denoiseAlpha = OPTIX_DENOISER_ALPHA_MODE_COPY;
         checkOptix(optixDenoiserCreate(optixContext_, OPTIX_DENOISER_MODEL_KIND_AOV, &options, &denoiser_),
                    "optixDenoiserCreate");
@@ -500,11 +540,9 @@ bool OptixRenderer::invokeDenoiser()
             return result;
         };
         OptixDenoiserGuideLayer guides{};
-        guides.albedo = image(albedoGuideBuffer_);
-        guides.normal = image(normalGuideBuffer_);
         OptixDenoiserLayer layer{};
-        layer.input = image(outputBuffer_);
-        layer.output = image(denoisedOutputBuffer_);
+        layer.input = image(interopInputBuffer_);
+        layer.output = image(interopDenoisedBuffer_);
         layer.type = OPTIX_DENOISER_AOV_TYPE_BEAUTY;
         OptixDenoiserParams parameters{};
         parameters.blendFactor = 0.0f;
@@ -538,15 +576,6 @@ void OptixRenderer::destroyDenoiserResources()
     denoiserState_ = 0;
     denoiserScratchSize_ = 0;
     denoiserStateSize_ = 0;
-    if (normalGuideBuffer_)
-        cuMemFree(normalGuideBuffer_);
-    if (albedoGuideBuffer_)
-        cuMemFree(albedoGuideBuffer_);
-    if (denoisedOutputBuffer_)
-        cuMemFree(denoisedOutputBuffer_);
-    normalGuideBuffer_ = 0;
-    albedoGuideBuffer_ = 0;
-    denoisedOutputBuffer_ = 0;
 }
 
 void OptixRenderer::destroyOutputBuffers()
@@ -880,9 +909,9 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         auto& parameters = *static_cast<LaunchParameters*>(launchParametersHost_);
         parameters = {};
         parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
-        parameters.denoisedOutput = {denoisedOutputBuffer_, static_cast<std::size_t>(width_) * height_};
-        parameters.albedoGuide = {albedoGuideBuffer_, static_cast<std::size_t>(width_) * height_};
-        parameters.normalGuide = {normalGuideBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.denoisedOutput = {};
+        parameters.albedoGuide = {};
+        parameters.normalGuide = {};
         parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.normals = {normalBuffer_, vertexCount_};
         parameters.indices = {indexBuffer_, triangleCount_};
@@ -900,7 +929,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.rayTracedReflections = settings.rayTracedReflections ? 1u : 0u;
         parameters.displayBgra = interopBgra_ ? 1u : 0u;
         parameters.exposure = settings.exposure;
-        parameters.writeDisplay = settings.denoiser ? 0u : 1u;
+        parameters.writeDisplay = 1u;
         const Environment fallbackEnvironment{};
         const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
         parameters.indirectLighting = settings.indirectLighting ? 1u : 0u;
@@ -929,12 +958,6 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         checkCuda(cuMemcpyHtoDAsync(raygenRecord_ + offsetof(RaygenRecord, parameters), &parameters,
                                     sizeof(parameters), cudaStream_),
                   "cuMemcpyHtoDAsync(launch parameters)");
-        if (settings.denoiser)
-        {
-            checkCuda(cuMemcpyHtoDAsync(toneMapRecord_ + offsetof(RaygenRecord, parameters), &parameters,
-                                        sizeof(parameters), cudaStream_),
-                      "cuMemcpyHtoDAsync(tone map parameters)");
-        }
         checkCuda(cuEventRecord(launchParameterCopyComplete_, cudaStream_), "cuEventRecord(launch parameter copy)");
         launchParameterCopyPending_ = true;
         return true;

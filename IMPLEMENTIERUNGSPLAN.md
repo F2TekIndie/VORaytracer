@@ -400,7 +400,7 @@ Der OptiX-Renderer startet als progressiver Pathtracer mit:
 - Environment Lighting
 - Flächenlichtern
 - Multiple Importance Sampling als geplanter Qualitätsausbau
-- optional OptiX AI Denoiser
+- optionaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt; nicht im OptiX-Pathtracing-Pfad
 
 Die Materialparameter und grundlegenden PBR-Funktionen bleiben mit dem Vulkan-Backend identisch. Da Vulkan hybrid und OptiX vollständig pfadbasiert arbeitet, wird keine bitgenaue Bildgleichheit erwartet; Materialreaktion, Farbmanagement und Kameramodell müssen jedoch übereinstimmen.
 
@@ -447,7 +447,7 @@ Der OptiX-Eintrag ist deaktiviert und zeigt einen Grund an, wenn CUDA, OptiX ode
 - Tone Mapper
 - Environment und Lichtstärken
 - Shadow-, Reflection- und GI-Qualität
-- Denoiser ein/aus
+- Vulkan-Postrender-Denoiser ein/aus
 - VSync
 
 ### Debugansichten

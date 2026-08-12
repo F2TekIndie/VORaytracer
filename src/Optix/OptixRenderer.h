@@ -29,6 +29,7 @@ public:
     [[nodiscard]] const char* unavailableReason() const override { return unavailableReason_.c_str(); }
     [[nodiscard]] const RendererStats& stats() const override { return stats_; }
     bool setGpuInteropSurface(const GpuInteropSurface& surface);
+    bool denoiseVulkanFrame(float exposure);
     void clearGpuInteropSurface();
     [[nodiscard]] bool hasGpuInteropSurface() const { return interopOutputBuffer_ != 0; }
     [[nodiscard]] std::uint32_t outputWidth() const { return width_; }
@@ -64,9 +65,9 @@ private:
     OptixProgramGroup hitProgramGroup_{};
     OptixPipeline pipeline_{};
     CUdeviceptr outputBuffer_{};
-    CUdeviceptr denoisedOutputBuffer_{};
-    CUdeviceptr albedoGuideBuffer_{};
-    CUdeviceptr normalGuideBuffer_{};
+    CUdeviceptr interopBaseBuffer_{};
+    CUdeviceptr interopInputBuffer_{};
+    CUdeviceptr interopDenoisedBuffer_{};
     CUdeviceptr interopOutputBuffer_{};
     CUexternalMemory externalMemory_{};
     CUexternalSemaphore cudaReadySemaphore_{};

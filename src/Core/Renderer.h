@@ -49,6 +49,10 @@ struct GpuInteropSurface
     void* vulkanCompleteSemaphoreHandle{};
     std::uint64_t allocationSize{};
     std::uint64_t pixelByteSize{};
+    std::uint64_t bufferByteSize{};
+    std::uint64_t inputOffset{};
+    std::uint64_t denoisedOffset{};
+    std::uint64_t displayOffset{};
     std::uint64_t generation{};
     std::uint32_t width{};
     std::uint32_t height{};
@@ -56,7 +60,8 @@ struct GpuInteropSurface
 
     [[nodiscard]] explicit operator bool() const
     {
-        return memoryHandle && cudaReadySemaphoreHandle && vulkanCompleteSemaphoreHandle && pixelByteSize > 0;
+        return memoryHandle && cudaReadySemaphoreHandle && vulkanCompleteSemaphoreHandle && pixelByteSize > 0 &&
+               bufferByteSize >= displayOffset + pixelByteSize;
     }
 };
 

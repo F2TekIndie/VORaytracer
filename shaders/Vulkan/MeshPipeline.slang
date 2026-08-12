@@ -58,7 +58,7 @@ struct FramePushConstants
     uint meshletCount;
     uint instanceCount;
     uint showMeshlets;
-    uint padding1;
+    uint postProcessInput;
     uint padding2;
 };
 
@@ -262,8 +262,11 @@ FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
     FragmentOutput output;
     float3 color = frame.skyZenithAndVisibility.w != 0.0
                        ? sampleGlobalEnvironment(input.direction) : float3(0.0);
-    color = max(color * exp2(frame.exposure), 0.0);
-    color = color / (1.0 + color);
+    if (frame.postProcessInput == 0)
+    {
+        color = max(color * exp2(frame.exposure), 0.0);
+        color = color / (1.0 + color);
+    }
     output.color = float4(color, 1.0);
     return output;
 }
@@ -464,9 +467,12 @@ FragmentOutput FragmentMain(MeshVertex input)
                                   (1.0 - saturate(input.roughness) * 0.75);
         color += reflectedRadiance * reflectionWeight;
     }
-    color *= exp2(frame.exposure);
-    color = max(color, 0.0);
-    color = color / (1.0 + color);
+    if (frame.postProcessInput == 0)
+    {
+        color *= exp2(frame.exposure);
+        color = max(color, 0.0);
+        color = color / (1.0 + color);
+    }
     output.color = float4(color, 1.0);
     return output;
 }

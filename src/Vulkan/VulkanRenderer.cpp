@@ -181,6 +181,8 @@ void VulkanRenderer::shutdown()
         sceneDescriptorSet_ = VK_NULL_HANDLE;
         for (FrameResources& frame : frames_)
         {
+            if (frame.postInFlight)
+                vkDestroyFence(device_, frame.postInFlight, nullptr);
             if (frame.inFlight)
                 vkDestroyFence(device_, frame.inFlight, nullptr);
             if (frame.imageAvailable)
@@ -267,9 +269,13 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
         check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(interoperability resize)");
         destroyGpuInteropSurface();
         const VkDeviceSize pixelByteSize = static_cast<VkDeviceSize>(width) * height * sizeof(std::uint32_t);
+        const VkDeviceSize floatImageByteSize = static_cast<VkDeviceSize>(width) * height * sizeof(Vec4);
+        const VkDeviceSize bufferByteSize = floatImageByteSize * 2 + pixelByteSize;
         VkDeviceSize allocationSize = 0;
         HANDLE memoryHandle = nullptr;
-        gpuInteropBuffer_ = createExternalBuffer(pixelByteSize, allocationSize, memoryHandle);
+        gpuInteropBuffer_ = createExternalBuffer(bufferByteSize, allocationSize, memoryHandle);
+        if (!createDenoiserInputImage(width, height))
+            throw std::runtime_error("Failed to create Vulkan denoiser input image");
         gpuInteropSurfaceInfo_.memoryHandle = memoryHandle;
         HANDLE cudaReadyHandle = nullptr;
         HANDLE vulkanCompleteHandle = nullptr;
@@ -309,6 +315,10 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
 
         gpuInteropSurfaceInfo_.allocationSize = allocationSize;
         gpuInteropSurfaceInfo_.pixelByteSize = pixelByteSize;
+        gpuInteropSurfaceInfo_.bufferByteSize = bufferByteSize;
+        gpuInteropSurfaceInfo_.inputOffset = 0;
+        gpuInteropSurfaceInfo_.denoisedOffset = floatImageByteSize;
+        gpuInteropSurfaceInfo_.displayOffset = floatImageByteSize * 2;
         gpuInteropSurfaceInfo_.generation = ++gpuInteropGeneration_;
         gpuInteropSurfaceInfo_.width = width;
         gpuInteropSurfaceInfo_.height = height;
@@ -327,6 +337,8 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
 void VulkanRenderer::destroyGpuInteropSurface()
 {
     gpuInteropFrameReady_ = false;
+    firstDenoiserInput_ = true;
+    destroyDenoiserInputImage();
     if (device_)
     {
         if (cudaReadySemaphore_)
@@ -350,6 +362,289 @@ void VulkanRenderer::destroyGpuInteropSurface()
     gpuInteropSurfaceInfo_ = {};
 }
 
+bool VulkanRenderer::createDenoiserInputImage(std::uint32_t width, std::uint32_t height)
+{
+    try
+    {
+        destroyDenoiserInputImage();
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        imageInfo.extent = {width, height, 1};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(device_, &imageInfo, nullptr, &denoiserInputImage_),
+              "vkCreateImage(Vulkan denoiser input)");
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device_, denoiserInputImage_, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device_, &allocation, nullptr, &denoiserInputImageMemory_),
+              "vkAllocateMemory(Vulkan denoiser input)");
+        check(vkBindImageMemory(device_, denoiserInputImage_, denoiserInputImageMemory_, 0),
+              "vkBindImageMemory(Vulkan denoiser input)");
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = denoiserInputImage_;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+        check(vkCreateImageView(device_, &viewInfo, nullptr, &denoiserInputImageView_),
+              "vkCreateImageView(Vulkan denoiser input)");
+        denoiserInputImageInitialized_ = false;
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        destroyDenoiserInputImage();
+        return false;
+    }
+}
+
+void VulkanRenderer::destroyDenoiserInputImage()
+{
+    if (!device_)
+        return;
+    if (denoiserInputImageView_)
+        vkDestroyImageView(device_, denoiserInputImageView_, nullptr);
+    if (denoiserInputImage_)
+        vkDestroyImage(device_, denoiserInputImage_, nullptr);
+    if (denoiserInputImageMemory_)
+        vkFreeMemory(device_, denoiserInputImageMemory_, nullptr);
+    denoiserInputImageView_ = VK_NULL_HANDLE;
+    denoiserInputImage_ = VK_NULL_HANDLE;
+    denoiserInputImageMemory_ = VK_NULL_HANDLE;
+    denoiserInputImageInitialized_ = false;
+}
+
+void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSettings& settings)
+{
+    const float aspect = static_cast<float>(swapchainExtent_.width) /
+                         static_cast<float>(std::max(swapchainExtent_.height, 1u));
+    framePushConstants_.viewProjection =
+        perspective(camera.verticalFovDegrees * kPi / 180.0f, aspect, camera.nearPlane, camera.farPlane) *
+        lookAt(camera.position, camera.target, camera.up);
+    framePushConstants_.cameraPosition = {camera.position.x, camera.position.y, camera.position.z, 1.0f};
+    const Vec3 cameraForward = normalize(camera.target - camera.position);
+    const Vec3 cameraRight = normalize(cross(cameraForward, camera.up));
+    const Vec3 cameraUp = normalize(cross(cameraRight, cameraForward));
+    framePushConstants_.cameraForwardAndFov = {cameraForward.x, cameraForward.y, cameraForward.z,
+                                               std::tan(camera.verticalFovDegrees * kPi / 360.0f)};
+    framePushConstants_.cameraRightAndAspect = {cameraRight.x, cameraRight.y, cameraRight.z, aspect};
+    framePushConstants_.cameraUp = {cameraUp.x, cameraUp.y, cameraUp.z, 0.0f};
+    const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
+    const Environment fallbackEnvironment{};
+    const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
+    framePushConstants_.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
+    framePushConstants_.lightDirectionAndMode = {light.direction.x, light.direction.y, light.direction.z,
+                                                 static_cast<float>(environment.mode)};
+    framePushConstants_.environmentParameters = {static_cast<float>(environment.hdrWidth),
+                                                  static_cast<float>(environment.hdrHeight),
+                                                  environment.intensity, environment.rotationRadians};
+    framePushConstants_.skyZenithAndVisibility = {environment.zenithColor.x, environment.zenithColor.y,
+                                                  environment.zenithColor.z,
+                                                  environment.visibleBackground ? 1.0f : 0.0f};
+    framePushConstants_.skyHorizonAndIndirect = {environment.horizonColor.x, environment.horizonColor.y,
+                                                 environment.horizonColor.z,
+                                                 settings.indirectLighting ? 1.0f : 0.0f};
+    framePushConstants_.skyGround = {environment.groundColor.x, environment.groundColor.y,
+                                     environment.groundColor.z, 0.0f};
+    framePushConstants_.rayTracedShadows = settings.rayTracedShadows && tlas_ ? 1u : 0u;
+    framePushConstants_.rayTracedReflections = settings.rayTracedReflections && tlas_ ? 1u : 0u;
+    framePushConstants_.exposure = settings.exposure;
+    framePushConstants_.meshletCount = uploadedMeshletCount_;
+    framePushConstants_.instanceCount = static_cast<std::uint32_t>(uploadedInstances_.size());
+    framePushConstants_.showMeshlets = settings.showMeshlets ? 1u : 0u;
+    framePushConstants_.padding[0] = 0u;
+}
+
+bool VulkanRenderer::renderDenoiserInput(const Camera& camera, const RenderSettings& settings)
+{
+    if (!initialized_ || !gpuInteropSurfaceInfo_ || !denoiserInputImage_)
+        return false;
+    try
+    {
+        if (resizePending_ && !recreateSwapchain())
+            return false;
+        if (gpuInteropSurfaceInfo_.width != swapchainExtent_.width ||
+            gpuInteropSurfaceInfo_.height != swapchainExtent_.height)
+            return false;
+        updateFrameConstants(camera, settings);
+        framePushConstants_.padding[0] = 1u;
+        FrameResources& frame = frames_[frameSlot_];
+        check(vkWaitForFences(device_, 1, &frame.postInFlight, VK_TRUE, UINT64_MAX),
+              "vkWaitForFences(Vulkan denoiser input)");
+        check(vkResetFences(device_, 1, &frame.postInFlight), "vkResetFences(Vulkan denoiser input)");
+        check(vkResetCommandBuffer(frame.postCommandBuffer, 0), "vkResetCommandBuffer(Vulkan denoiser input)");
+        recordDenoiserInputCommands(frame.postCommandBuffer);
+
+        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        if (!firstDenoiserInput_)
+        {
+            submit.waitSemaphoreCount = 1;
+            submit.pWaitSemaphores = &vulkanCompleteSemaphore_;
+            submit.pWaitDstStageMask = &waitStage;
+        }
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &frame.postCommandBuffer;
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &vulkanCompleteSemaphore_;
+        check(vkQueueSubmit(graphicsQueue_, 1, &submit, frame.postInFlight),
+              "vkQueueSubmit(Vulkan denoiser input)");
+        firstDenoiserInput_ = false;
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        return false;
+    }
+}
+
+void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
+{
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(commandBuffer, &begin), "vkBeginCommandBuffer(Vulkan denoiser input)");
+
+    VkBufferMemoryBarrier2 acquireBuffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    acquireBuffer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    acquireBuffer.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    acquireBuffer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    acquireBuffer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    acquireBuffer.dstQueueFamilyIndex = graphicsQueueFamily_;
+    acquireBuffer.buffer = gpuInteropBuffer_.buffer;
+    acquireBuffer.size = gpuInteropBuffer_.size;
+    VkImageMemoryBarrier2 colorBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    colorBarrier.srcStageMask = denoiserInputImageInitialized_ ? VK_PIPELINE_STAGE_2_TRANSFER_BIT : VK_PIPELINE_STAGE_2_NONE;
+    colorBarrier.srcAccessMask = denoiserInputImageInitialized_ ? VK_ACCESS_2_TRANSFER_READ_BIT : 0;
+    colorBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    colorBarrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    colorBarrier.oldLayout = denoiserInputImageInitialized_ ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                            : VK_IMAGE_LAYOUT_UNDEFINED;
+    colorBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorBarrier.image = denoiserInputImage_;
+    colorBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    colorBarrier.subresourceRange.levelCount = 1;
+    colorBarrier.subresourceRange.layerCount = 1;
+    VkImageMemoryBarrier2 depthBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    depthBarrier.srcStageMask = depthImageInitialized_ ? VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT
+                                                       : VK_PIPELINE_STAGE_2_NONE;
+    depthBarrier.srcAccessMask = depthImageInitialized_ ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0;
+    depthBarrier.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    depthBarrier.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depthBarrier.oldLayout = depthImageInitialized_ ? VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+                                                    : VK_IMAGE_LAYOUT_UNDEFINED;
+    depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthBarrier.image = depthImage_;
+    depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthBarrier.subresourceRange.levelCount = 1;
+    depthBarrier.subresourceRange.layerCount = 1;
+    const std::array imageBarriers{colorBarrier, depthBarrier};
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &acquireBuffer;
+    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(imageBarriers.size());
+    dependency.pImageMemoryBarriers = imageBarriers.data();
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    depthImageInitialized_ = true;
+
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttachment.imageView = denoiserInputImageView_;
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = {{0.008f, 0.012f, 0.022f, 1.0f}};
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depthAttachment.imageView = depthImageView_;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.clearValue.depthStencil = {1.0f, 0};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea.extent = swapchainExtent_;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &colorAttachment;
+    rendering.pDepthAttachment = &depthAttachment;
+    vkCmdBeginRendering(commandBuffer, &rendering);
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(swapchainExtent_.width);
+    viewport.height = static_cast<float>(swapchainExtent_.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{{0, 0}, swapchainExtent_};
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    if (sceneDescriptorSet_ && uploadedMeshletCount_ > 0)
+    {
+        constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                               VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, denoiserBackgroundPipeline_);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
+                                &sceneDescriptorSet_, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(FramePushConstants),
+                           &framePushConstants_);
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, denoiserMeshPipeline_);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
+                                &sceneDescriptorSet_, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(FramePushConstants),
+                           &framePushConstants_);
+        cmdDrawMeshTasks_(commandBuffer, uploadedMeshletCount_, 1, 1);
+    }
+    vkCmdEndRendering(commandBuffer);
+
+    VkImageMemoryBarrier2 toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toTransfer.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toTransfer.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer.image = denoiserInputImage_;
+    toTransfer.subresourceRange = colorBarrier.subresourceRange;
+    dependency.bufferMemoryBarrierCount = 0;
+    dependency.pBufferMemoryBarriers = nullptr;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &toTransfer;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = gpuInteropSurfaceInfo_.inputOffset;
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};
+    vkCmdCopyImageToBuffer(commandBuffer, denoiserInputImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gpuInteropBuffer_.buffer, 1, &copy);
+
+    VkBufferMemoryBarrier2 releaseBuffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    releaseBuffer.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    releaseBuffer.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    releaseBuffer.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+    releaseBuffer.srcQueueFamilyIndex = graphicsQueueFamily_;
+    releaseBuffer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    releaseBuffer.buffer = gpuInteropBuffer_.buffer;
+    releaseBuffer.size = gpuInteropBuffer_.size;
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &releaseBuffer;
+    dependency.imageMemoryBarrierCount = 0;
+    dependency.pImageMemoryBarriers = nullptr;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(Vulkan denoiser input)");
+    denoiserInputImageInitialized_ = true;
+}
+
 bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings)
 {
     if (!initialized_)
@@ -361,41 +656,7 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         if (resizePending_ && !recreateSwapchain())
             return false;
 
-        const float aspect = static_cast<float>(swapchainExtent_.width) / static_cast<float>(std::max(swapchainExtent_.height, 1u));
-        const Mat4 projection = perspective(camera.verticalFovDegrees * kPi / 180.0f, aspect, camera.nearPlane, camera.farPlane);
-        const Mat4 view = lookAt(camera.position, camera.target, camera.up);
-        framePushConstants_.viewProjection = projection * view;
-        framePushConstants_.cameraPosition = {camera.position.x, camera.position.y, camera.position.z, 1.0f};
-        const Vec3 cameraForward = normalize(camera.target - camera.position);
-        const Vec3 cameraRight = normalize(cross(cameraForward, camera.up));
-        const Vec3 cameraUp = normalize(cross(cameraRight, cameraForward));
-        framePushConstants_.cameraForwardAndFov = {cameraForward.x, cameraForward.y, cameraForward.z,
-                                                   std::tan(camera.verticalFovDegrees * kPi / 360.0f)};
-        framePushConstants_.cameraRightAndAspect = {cameraRight.x, cameraRight.y, cameraRight.z, aspect};
-        framePushConstants_.cameraUp = {cameraUp.x, cameraUp.y, cameraUp.z, 0.0f};
-        const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
-        const Environment fallbackEnvironment{};
-        const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
-        framePushConstants_.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
-        framePushConstants_.lightDirectionAndMode = {light.direction.x, light.direction.y, light.direction.z,
-                                                     static_cast<float>(environment.mode)};
-        framePushConstants_.environmentParameters = {static_cast<float>(environment.hdrWidth),
-                                                      static_cast<float>(environment.hdrHeight),
-                                                      environment.intensity, environment.rotationRadians};
-        framePushConstants_.skyZenithAndVisibility = {environment.zenithColor.x, environment.zenithColor.y,
-                                                      environment.zenithColor.z,
-                                                      environment.visibleBackground ? 1.0f : 0.0f};
-        framePushConstants_.skyHorizonAndIndirect = {environment.horizonColor.x, environment.horizonColor.y,
-                                                     environment.horizonColor.z,
-                                                     settings.indirectLighting ? 1.0f : 0.0f};
-        framePushConstants_.skyGround = {environment.groundColor.x, environment.groundColor.y,
-                                         environment.groundColor.z, 0.0f};
-        framePushConstants_.rayTracedShadows = settings.rayTracedShadows && tlas_ ? 1u : 0u;
-        framePushConstants_.rayTracedReflections = settings.rayTracedReflections && tlas_ ? 1u : 0u;
-        framePushConstants_.exposure = settings.exposure;
-        framePushConstants_.meshletCount = uploadedMeshletCount_;
-        framePushConstants_.instanceCount = static_cast<std::uint32_t>(uploadedInstances_.size());
-        framePushConstants_.showMeshlets = settings.showMeshlets ? 1u : 0u;
+        updateFrameConstants(camera, settings);
 
         ImGui::Render();
         FrameResources& frame = frames_[frameSlot_];
@@ -436,6 +697,8 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         submitInfo.signalSemaphoreCount = gpuInteropMatches ? 2u : 1u;
         submitInfo.pSignalSemaphores = signalSemaphores.data();
         check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, frame.inFlight), "vkQueueSubmit");
+        if (gpuInteropMatches)
+            firstDenoiserInput_ = false;
         gpuInteropFrameReady_ = false;
 
         VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -839,20 +1102,22 @@ bool VulkanRenderer::createCommands()
     poolInfo.queueFamilyIndex = graphicsQueueFamily_;
     check(vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_), "vkCreateCommandPool");
 
-    std::array<VkCommandBuffer, kFramesInFlight> buffers{};
+    std::array<VkCommandBuffer, kFramesInFlight * 2> buffers{};
     VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocateInfo.commandPool = commandPool_;
     allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocateInfo.commandBufferCount = kFramesInFlight;
+    allocateInfo.commandBufferCount = static_cast<std::uint32_t>(buffers.size());
     check(vkAllocateCommandBuffers(device_, &allocateInfo, buffers.data()), "vkAllocateCommandBuffers");
     for (std::uint32_t index = 0; index < kFramesInFlight; ++index)
     {
         frames_[index].commandBuffer = buffers[index];
+        frames_[index].postCommandBuffer = buffers[kFramesInFlight + index];
         VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         check(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &frames_[index].imageAvailable), "vkCreateSemaphore");
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         check(vkCreateFence(device_, &fenceInfo, nullptr, &frames_[index].inFlight), "vkCreateFence");
+        check(vkCreateFence(device_, &fenceInfo, nullptr, &frames_[index].postInFlight), "vkCreateFence(post process)");
     }
     return true;
 }
@@ -968,6 +1233,10 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = meshPipelineLayout_;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &meshPipeline_), "vkCreateGraphicsPipelines");
+        const VkFormat denoiserFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+        renderingInfo.pColorAttachmentFormats = &denoiserFormat;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &denoiserMeshPipeline_),
+              "vkCreateGraphicsPipelines(Vulkan denoiser mesh input)");
 
         const std::array backgroundStages{
             VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
@@ -989,8 +1258,13 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pVertexInputState = &backgroundVertexInput;
         pipelineInfo.pInputAssemblyState = &backgroundInputAssembly;
         pipelineInfo.pDepthStencilState = &backgroundDepth;
+        renderingInfo.pColorAttachmentFormats = &swapchainFormat_;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &backgroundPipeline_),
               "vkCreateGraphicsPipelines(background)");
+        renderingInfo.pColorAttachmentFormats = &denoiserFormat;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                        &denoiserBackgroundPipeline_),
+              "vkCreateGraphicsPipelines(Vulkan denoiser background input)");
     }
     catch (...)
     {
@@ -1103,10 +1377,16 @@ void VulkanRenderer::destroyMeshPipeline()
         vkDestroyPipeline(device_, meshPipeline_, nullptr);
     if (backgroundPipeline_)
         vkDestroyPipeline(device_, backgroundPipeline_, nullptr);
+    if (denoiserMeshPipeline_)
+        vkDestroyPipeline(device_, denoiserMeshPipeline_, nullptr);
+    if (denoiserBackgroundPipeline_)
+        vkDestroyPipeline(device_, denoiserBackgroundPipeline_, nullptr);
     if (meshPipelineLayout_)
         vkDestroyPipelineLayout(device_, meshPipelineLayout_, nullptr);
     meshPipeline_ = VK_NULL_HANDLE;
     backgroundPipeline_ = VK_NULL_HANDLE;
+    denoiserMeshPipeline_ = VK_NULL_HANDLE;
+    denoiserBackgroundPipeline_ = VK_NULL_HANDLE;
     meshPipelineLayout_ = VK_NULL_HANDLE;
 }
 
@@ -1638,7 +1918,8 @@ VulkanRenderer::GpuBuffer VulkanRenderer::createExternalBuffer(
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufferInfo.pNext = &externalInfo;
         bufferInfo.size = byteSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         check(vkCreateBuffer(device_, &bufferInfo, nullptr, &result.buffer), "vkCreateBuffer(CUDA interop)");
 
@@ -1925,6 +2206,7 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         vkCmdPipelineBarrier2(commandBuffer, &acquireDependency);
 
         VkBufferImageCopy copy{};
+        copy.bufferOffset = gpuInteropSurfaceInfo_.displayOffset;
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
         copy.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};

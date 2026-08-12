@@ -64,6 +64,15 @@ int Application::run()
             if (optixRenderer_.render(scene_.camera, settings_))
                 vulkanRenderer_.setGpuInteropFrameReady(true);
         }
+        else if (settings_.backend == BackendKind::VulkanHybrid && settings_.denoiser &&
+                 optixRenderer_.available())
+        {
+            if (vulkanRenderer_.renderDenoiserInput(scene_.camera, settings_) &&
+                optixRenderer_.denoiseVulkanFrame(settings_.exposure))
+                vulkanRenderer_.setGpuInteropFrameReady(true);
+            else
+                vulkanRenderer_.clearExternalImage();
+        }
         else
             vulkanRenderer_.clearExternalImage();
         if (!vulkanRenderer_.render(scene_.camera, settings_))
@@ -313,13 +322,15 @@ void Application::drawRenderPanel()
         ImGui::SetTooltip("Vulkan: one inline Ray Query reflection.\nOptiX: rough PBR reflection paths up to Max bounces.");
     if (ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting))
         resetCameraAccumulation();
-    if (settings_.backend != BackendKind::Optix)
+    if (settings_.backend != BackendKind::VulkanHybrid || !optixRenderer_.available())
         ImGui::BeginDisabled();
-    ImGui::Checkbox("OptiX denoiser", &settings_.denoiser);
-    if (settings_.backend != BackendKind::Optix)
+    if (ImGui::Checkbox("Vulkan post-render denoiser", &settings_.denoiser))
+        resetCameraAccumulation();
+    if (settings_.backend != BackendKind::VulkanHybrid || !optixRenderer_.available())
         ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("OptiX AI denoiser with albedo and world-normal guides.");
+        ImGui::SetTooltip("Optional NVIDIA OptiX AI denoiser applied after Vulkan rendering.\n"
+                          "The OptiX path tracer itself is always shown without denoising.");
     if (settings_.backend != BackendKind::VulkanHybrid)
         ImGui::BeginDisabled();
     ImGui::Checkbox("Meshlet debug colors", &settings_.showMeshlets);

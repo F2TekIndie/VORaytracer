@@ -35,6 +35,7 @@ public:
     [[nodiscard]] const RendererStats& stats() const override { return stats_; }
 
     void beginUiFrame();
+    bool renderDenoiserInput(const Camera& camera, const RenderSettings& settings);
     void clearExternalImage();
     bool createGpuInteropSurface(std::uint32_t width, std::uint32_t height);
     void destroyGpuInteropSurface();
@@ -49,8 +50,10 @@ private:
     struct FrameResources
     {
         VkCommandBuffer commandBuffer{VK_NULL_HANDLE};
+        VkCommandBuffer postCommandBuffer{VK_NULL_HANDLE};
         VkSemaphore imageAvailable{VK_NULL_HANDLE};
         VkFence inFlight{VK_NULL_HANDLE};
+        VkFence postInFlight{VK_NULL_HANDLE};
     };
 
     struct GpuBuffer
@@ -131,6 +134,10 @@ private:
     bool uploadDeviceLocalBuffers(std::span<const BufferUpload> uploads);
     std::uint32_t findMemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags properties) const;
     void recordCommands(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, const GpuBuffer* externalBuffer);
+    void recordDenoiserInputCommands(VkCommandBuffer commandBuffer);
+    void updateFrameConstants(const Camera& camera, const RenderSettings& settings);
+    bool createDenoiserInputImage(std::uint32_t width, std::uint32_t height);
+    void destroyDenoiserInputImage();
     GpuBuffer createExternalBuffer(VkDeviceSize byteSize, VkDeviceSize& allocationSize, HANDLE& memoryHandle) const;
     VkSemaphore createExternalSemaphore(HANDLE& semaphoreHandle) const;
     VkShaderModule loadShaderModule(const wchar_t* relativePath) const;
@@ -166,6 +173,8 @@ private:
     VkPipelineLayout meshPipelineLayout_{VK_NULL_HANDLE};
     VkPipeline meshPipeline_{VK_NULL_HANDLE};
     VkPipeline backgroundPipeline_{VK_NULL_HANDLE};
+    VkPipeline denoiserMeshPipeline_{VK_NULL_HANDLE};
+    VkPipeline denoiserBackgroundPipeline_{VK_NULL_HANDLE};
     PFN_vkCmdDrawMeshTasksEXT cmdDrawMeshTasks_{};
     VkDescriptorSetLayout sceneDescriptorSetLayout_{VK_NULL_HANDLE};
     VkDescriptorPool sceneDescriptorPool_{VK_NULL_HANDLE};
@@ -193,10 +202,15 @@ private:
     std::uint32_t uploadedTriangleCount_{};
     FramePushConstants framePushConstants_{};
     GpuBuffer gpuInteropBuffer_{};
+    VkImage denoiserInputImage_{VK_NULL_HANDLE};
+    VkDeviceMemory denoiserInputImageMemory_{VK_NULL_HANDLE};
+    VkImageView denoiserInputImageView_{VK_NULL_HANDLE};
     VkSemaphore cudaReadySemaphore_{VK_NULL_HANDLE};
     VkSemaphore vulkanCompleteSemaphore_{VK_NULL_HANDLE};
     GpuInteropSurface gpuInteropSurfaceInfo_{};
     bool gpuInteropFrameReady_{};
+    bool denoiserInputImageInitialized_{};
+    bool firstDenoiserInput_{true};
     std::uint64_t gpuInteropGeneration_{};
 
     bool initialized_{};

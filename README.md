@@ -24,7 +24,9 @@ Der ausführliche technische Plan steht in [IMPLEMENTIERUNGSPLAN.md](IMPLEMENTIE
 
 Der aktuelle vertikale Schnitt führt alle geladenen Mesh-Instanzen mit ihren Node-Transformationen zu einer GPU-Szene zusammen. Vulkan rendert deren Basis-LODs samt Materialdaten als Meshlets und baut dafür BLAS/TLAS. OptiX baut aus derselben vollständigen Geometrie ein GAS und führt echte Primärstrahlen mit direkter PBR-Beleuchtung aus. Die OptiX-Ausgabe wird zurzeit zur einfachen Diagnose über CUDA→CPU→Vulkan kopiert.
 
-Noch nicht als Produktionsausbau umgesetzt sind separate GPU-IAS-Instanzen statt zusammengeführter Weltgeometrie, GPU-Textur-Uploads, rekursive OptiX-Bounces, Reflexions-/GI-Ray-Queries, Denoising sowie Vulkan/CUDA External-Memory- und Semaphore-Interop. Diese Punkte bleiben im Implementierungsplan als nächste Ausbaustufen erhalten.
+Der aktuelle Ausbau verwendet separate Vulkan-BLAS/TLAS-Instanzen, device-local Geometrie, Reflexions-/GI-Ray-Queries
+sowie Vulkan/CUDA External-Memory- und Semaphore-Interop. Der OptiX-AI-Denoiser steht als optionaler
+Vulkan-Postrender-Schritt zur Verfügung.
 
 Der installierte Slang-Compiler 2026.14.1 kompiliert Mesh-Shader korrekt, hängt aber reproduzierbar bei einem Amplification-/Task-Shader mit `out payload`. Deshalb verwendet der aktuelle lauffähige Pfad eine zulässige Mesh-Shader-Pipeline ohne die optionale Task-Stufe. Die isolierte Task-Shader-Quelle liegt unter `shaders/Vulkan/MeshletTask.slang`.
 
@@ -66,7 +68,10 @@ Der Button „Default plastic: ON/OFF“ ersetzt beim Laden sämtliche importier
 
 Für einen automatisierten Start mit vorgewähltem OptiX-Backend kann vor dem Aufruf `VOR_BACKEND=optix` als Umgebungsvariable gesetzt werden. Im normalen Betrieb erfolgt der Wechsel über die Radio-Buttons im ImGui-Fenster „Renderer“.
 
-Der OptiX-AI-Denoiser kann im Renderer-Fenster aktiviert werden. Für automatisierte Smoke-Tests lässt er sich mit `VOR_DENOISER=1` bereits beim Start einschalten; er nutzt Albedo- und Welt-Normalen-Guides und schreibt das Ergebnis vollständig auf der GPU in den Vulkan-Interop-Puffer.
+Der OptiX-AI-Denoiser kann im Renderer-Fenster ausschließlich für das Vulkan-Backend als Postrender-Schritt
+aktiviert werden. Für automatisierte Smoke-Tests lässt er sich mit `VOR_DENOISER=1` beim Start einschalten.
+Vulkan rendert dafür lineares `RGBA32F` in ein Offscreen-Target; Übergabe, Denoising, Tone-Mapping und Präsentation
+bleiben vollständig auf der GPU. Der OptiX-Pathtracer wird immer ohne Denoising ausgegeben.
 
 „Ray-traced reflections“ aktiviert im Vulkan-Backend eine Inline-Ray-Query-Reflexion pro sichtbarem Fragment inklusive Material- und Schattenauswertung am Treffer. Im OptiX-Backend werden raue, Fresnel-gewichtete PBR-Reflexionspfade verfolgt; „Max bounces“ begrenzt dort die Pfadtiefe.
 
