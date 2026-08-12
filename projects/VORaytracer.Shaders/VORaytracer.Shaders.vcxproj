@@ -21,17 +21,6 @@
       <Outputs>$(ShaderOutputDir)Task.spv;$(ShaderOutputDir)Mesh.spv;$(ShaderOutputDir)PbrFragment.spv;$(ShaderOutputDir)BackgroundVertex.spv;$(ShaderOutputDir)BackgroundFragment.spv</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
     </CustomBuild>
-    <CustomBuild Include="$(SolutionDir)shaders\Vulkan\RayQueryLighting.slang">
-      <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
-"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -target spirv -profile spirv_1_6+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name -entry ComputeMain -stage compute -o "$(ShaderOutputDir)RayQueryLighting.spv"</Command>
-      <Outputs>$(ShaderOutputDir)RayQueryLighting.spv</Outputs>
-      <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang</AdditionalInputs>
-    </CustomBuild>
-    <CustomBuild Include="$(SolutionDir)shaders\Vulkan\ToneMap.slang">
-      <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
-"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) $(SlangCommon) -entry ComputeMain -stage compute -o "$(ShaderOutputDir)ToneMap.spv"</Command>
-      <Outputs>$(ShaderOutputDir)ToneMap.spv</Outputs>
-    </CustomBuild>
     <CustomBuild Include="$(SolutionDir)shaders\Optix\PathTracer.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
 set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH%"
@@ -41,7 +30,6 @@ set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH
     </CustomBuild>
   </ItemGroup>
   <ItemGroup>
-    <None Include="$(SolutionDir)shaders\Vulkan\MeshletTask.slang" />
     <None Include="$(SolutionDir)shaders\Shared\Pbr.slang" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

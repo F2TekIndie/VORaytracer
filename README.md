@@ -1,90 +1,127 @@
 # VORaytracer
 
-VORaytracer ist ein C++20-/Visual-Studio-Projekt für einen hybriden Vulkan-PBR-Renderer mit meshoptimizer-Meshlets, Slang-Shadern und einem optionalen NVIDIA-OptiX-Backend.
+VORaytracer ist ein nativer C++20-PBR-Renderer für Windows mit zwei umschaltbaren Renderpfaden:
 
-Der ausführliche technische Plan steht in [IMPLEMENTIERUNGSPLAN.md](IMPLEMENTIERUNGSPLAN.md).
+- Vulkan 1.3 mit Task-/Mesh-Shadern, Meshlet-Culling und Inline Ray Queries
+- NVIDIA OptiX als progressiver Pathtracer
 
-## Aktueller Funktionsstand
+Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation beider Backends bereit. Modelle werden mit Assimp geladen, mit meshoptimizer aufbereitet und von Slang-Shadern verarbeitet.
 
-- Native Visual-Studio-Solution mit x64 Debug und Release
-- GLFW-Fenster und Dear ImGui UI
-- Vulkan 1.3 mit Dynamic Rendering und Validation
-- `VK_EXT_mesh_shader` mit `vkCmdDrawMeshTasksEXT`
-- Assimp-Szenenimport und PBR-Materialmetadaten
-- meshoptimizer 1.2 für Remap, Cache, Overdraw, Vertex Fetch, LODs, Meshlets und Bounds
-- echte GPU-Storage-Buffer für Vertices, Meshlets, lokale Vertex-Indizes und gepackte Primitive
-- Vulkan-BLAS/TLAS aus der geladenen Geometrie und aktive Ray Queries für PBR-Schatten im Fragmentshader
-- Slang-zu-SPIR-V-Build für Mesh-, PBR-/Ray-Query-Fragment-, Compute-Ray-Query- und Tone-Mapping-Shader
-- Slang-zu-PTX-Build mit OptiX-Raygen-, Miss- und Closest-Hit-Programmen
-- OptiX-Triangle-GAS, SBT, progressiver Multi-Sample-Launch und gemeinsamer Metallic-Roughness-BRDF
-- OptiX-Materialtabellen pro Dreieck mit baryzentrisch interpolierten, korrekt transformierten Vertexnormalen
-- sichtbare OptiX-Ausgabe im Vulkan-Swapchain-Bild mit ImGui-Overlay
-- UI-Schalter zwischen Vulkan und OptiX sowie Kamera-/PBR-/Raytracing-Parameter
-- CPU-/Asset-Tests für Mat4, Scene-Statistiken, meshoptimizer und echten Assimp-Import
+- [Technischer Umsetzungsstand und weitere Planung](IMPLEMENTIERUNGSPLAN.md)
+- [Grafische Darstellung der Renderpfade](RENDERPFADE.md)
 
-Der aktuelle vertikale Schnitt führt alle geladenen Mesh-Instanzen mit ihren Node-Transformationen zu einer GPU-Szene zusammen. Vulkan rendert deren Basis-LODs samt Materialdaten als Meshlets und baut dafür BLAS/TLAS. OptiX baut aus derselben vollständigen Geometrie ein GAS und führt echte Primärstrahlen mit direkter PBR-Beleuchtung aus. Die OptiX-Ausgabe wird zurzeit zur einfachen Diagnose über CUDA→CPU→Vulkan kopiert.
+## Funktionsumfang
 
-Der aktuelle Ausbau verwendet separate Vulkan-BLAS/TLAS-Instanzen, device-local Geometrie, Reflexions-/GI-Ray-Queries
-sowie Vulkan/CUDA External-Memory- und Semaphore-Interop. Der OptiX-AI-Denoiser steht als optionaler
-Vulkan-Postrender-Schritt zur Verfügung.
-
-Der installierte Slang-Compiler 2026.14.1 kompiliert Mesh-Shader korrekt, hängt aber reproduzierbar bei einem Amplification-/Task-Shader mit `out payload`. Deshalb verwendet der aktuelle lauffähige Pfad eine zulässige Mesh-Shader-Pipeline ohne die optionale Task-Stufe. Die isolierte Task-Shader-Quelle liegt unter `shaders/Vulkan/MeshletTask.slang`.
+- Visual-Studio-Solution für x64 Debug und Release mit C++20
+- natives `IFileOpenDialog` für Modelle und Radiance-HDR-Dateien
+- Assimp-Import mit Szeneninstanzen, Transformationen und PBR-Materialwerten
+- automatische Kameraeinpassung nach dem Laden eines Modells
+- Orbit-, Pan- und Zoom-Navigation mit der Maus
+- gemeinsame Lichttransformation über dieselben Mausbewegungen mit gedrückter Umschalttaste
+- meshoptimizer-Meshlets, Bounds und LOD-Erzeugung
+- optional abschaltbare Remap-, Cache-, Overdraw-, Vertex-Fetch-, Bounds- und LOD-Optimierung; die für den Mesh-Shader notwendige Meshlet-Erzeugung bleibt aktiv
+- Task-/Amplification- und Mesh-Shader-Pipeline mit Frustum- und Normal-Cone-Culling auf vorhandenen Meshlet-Bounds
+- device-local Vulkan-Geometrie über Staging-Uploads
+- separate Vulkan-BLAS pro Geometrie und TLAS-Instanzen ohne getrennte `vkQueueWaitIdle()`-Stopps
+- Metallic-Roughness-PBR mit GGX, Ray-Query-Schatten und optionalen Reflexionen
+- Richtungslicht, prozeduraler Himmel oder HDR-Environment als globale Beleuchtung
+- stabiles roughnessabhängiges HDR-IBL über eine vollständige Mip-Pyramide
+- optionaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Ein- und Ausgabe
+- CUDA/Vulkan-External-Memory- und Semaphore-Interop ohne Bildkopie zur CPU
+- progressiver OptiX-Pathtracer mit Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
+- standardisiertes hellgraues Kunststoffmaterial als optionale Importüberschreibung
+- ein- und ausblendbare Bodenebene mit Standardkunststoffmaterial
+- stabile, pseudozufällige Meshlet-Debugfarbe pro Meshlet
 
 ## Voraussetzungen
 
-- Visual Studio 2026 mit C++-Toolset `v145`
-- Windows SDK 10.0.26100.0 oder kompatibel
-- Bibliotheken unter `G:\CodingLibraries`
-- CUDA 13.3 unter `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3`
-- OptiX 9.1.0 unter `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0`
-- NVIDIA-GPU mit `VK_EXT_mesh_shader`
-- Vulkan-Unterstützung für `VK_KHR_acceleration_structure` und `VK_KHR_ray_query`
+| Komponente | Erwarteter Pfad |
+|---|---|
+| Vulkan SDK | `G:\CodingLibraries\VulkanSDK` |
+| Slang | `G:\CodingLibraries\slang-14.1` |
+| Assimp | `G:\CodingLibraries\assimp\out-v145` |
+| GLFW | `G:\CodingLibraries\glfw-3.5.1` |
+| Dear ImGui | `G:\CodingLibraries\imgui` |
+| meshoptimizer | `G:\CodingLibraries\meshoptimizer` |
+| stb_image | `G:\CodingLibraries\stb\stb_image.h` |
+| CUDA | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` |
+| OptiX | `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0` |
 
-## Bauen
+Zusätzlich erforderlich sind Visual Studio mit C++-Toolset `v145`, ein kompatibles Windows SDK und eine NVIDIA-GPU mit den verwendeten Vulkan-Mesh-Shader-, Acceleration-Structure- und Ray-Query-Funktionen. Assimp wird global aus `G:\CodingLibraries` verwendet; im Projekt liegt kein eigener Assimp-Quellcode mehr.
 
-In PowerShell:
+## Bauen und starten
 
 ```powershell
 .\scripts\Build.ps1 -Configuration Debug
 .\scripts\Build.ps1 -Configuration Release
 ```
 
-Das Skript baut `VORaytracer.sln`. Assimp wird als globale Debug-/Release-Bibliothek aus
-`G:\CodingLibraries\assimp\out-v145` eingebunden; ein projektspezifischer Assimp-Build ist nicht erforderlich.
-
-## Starten
+Anschließend beispielsweise:
 
 ```powershell
 .\bin\x64\Debug\VORaytracer.App.exe
-```
-
-Im Scene-Fenster kann ein von Assimp unterstütztes Modell über seinen Dateipfad geladen werden. Ohne Datei startet die Anwendung mit einem prozeduralen Würfel, der durch meshoptimizer verarbeitet und als Meshlets gerendert wird.
-
-Nach einem erfolgreichen Dateiimport wird die Kamera automatisch auf die Welt-Bounds aller geladenen Instanzen ausgerichtet. Die Navigation funktioniert außerhalb der ImGui-Fenster mit linker Maustaste zum Orbitieren, mittlerer Maustaste zum Verschieben und dem Mausrad zum Zoomen. Über „Frame model“ im Renderer-Fenster lässt sich die automatische Einpassung erneut ausführen.
-
-Im Scene-Fenster schaltet der Button „meshoptimizer: ON/OFF“ Remapping, Cache-/Overdraw-/Vertex-Fetch-Optimierung, Meshlet-Bounds und LOD-Simplifizierung gemeinsam ein oder aus. Beim Umschalten wird das aktuelle Modell neu geladen. Nur die für die Meshshader-Ausgabe zwingende Meshlet-Partitionierung bleibt immer aktiv.
-
-Der Button „Default plastic: ON/OFF“ ersetzt beim Laden sämtliche importierten Materialien und Texturreferenzen durch ein gemeinsames hellgraues Kunststoffmaterial (`Albedo 0.75`, `Metallic 0.0`, `Roughness 0.5`) und weist es jedem Mesh zu. Auch dieser Schalter lädt die aktuelle Szene unmittelbar neu.
-
-Für einen automatisierten Start mit vorgewähltem OptiX-Backend kann vor dem Aufruf `VOR_BACKEND=optix` als Umgebungsvariable gesetzt werden. Im normalen Betrieb erfolgt der Wechsel über die Radio-Buttons im ImGui-Fenster „Renderer“.
-
-Der OptiX-AI-Denoiser kann im Renderer-Fenster ausschließlich für das Vulkan-Backend als Postrender-Schritt
-aktiviert werden. Für automatisierte Smoke-Tests lässt er sich mit `VOR_DENOISER=1` beim Start einschalten.
-Vulkan rendert dafür lineares `RGBA32F` in ein Offscreen-Target; Übergabe, Denoising, Tone-Mapping und Präsentation
-bleiben vollständig auf der GPU. Der OptiX-Pathtracer wird immer ohne Denoising ausgegeben.
-
-„Ray-traced reflections“ aktiviert im Vulkan-Backend eine Inline-Ray-Query-Reflexion pro sichtbarem Fragment inklusive Material- und Schattenauswertung am Treffer. Im OptiX-Backend werden raue, Fresnel-gewichtete PBR-Reflexionspfade verfolgt; „Max bounces“ begrenzt dort die Pfadtiefe.
-
-„Meshlet debug colors“ ersetzt im Vulkan-Backend die Materialausgabe durch eine stabile, pseudozufällige Farbe pro Meshlet. Dadurch werden Meshlet-Grenzen und die von `meshoptimizer` erzeugte Partitionierung direkt sichtbar. Für automatisierte Starts kann der Modus mit `VOR_MESHLET_DEBUG=1` aktiviert werden.
-
-Für reproduzierbare Import-Smoke-Tests kann ein Startmodell über `VOR_SCENE=<absoluter Dateipfad>` vorgegeben werden.
-
-## Tests
-
-```powershell
 .\bin\x64\Debug\VORaytracer.Tests.exe
 ```
 
-Debug-Builds aktivieren den Vulkan Validation Layer. Diagnoseausgaben erscheinen auf `stderr`.
+Ohne explizit geladene Datei startet die Anwendung mit einer prozeduralen Testszenengeometrie.
+
+## Bedienung
+
+Die Kamerasteuerung reagiert außerhalb von ImGui-Fenstern:
+
+| Eingabe | Kamera | Mit Umschalttaste |
+|---|---|---|
+| linke Maustaste ziehen | Orbit | Licht drehen |
+| mittlere Maustaste ziehen | Pan | Licht verschieben, soweit auf den Lichttyp anwendbar |
+| Mausrad | Zoom | Lichtabstand bzw. lichttypspezifischen Transformationsanteil ändern |
+
+`Frame model` passt die Kamera erneut an die Bounds der geladenen Szene an. Die Lichtmodi Richtungslicht, prozeduraler Himmel und HDR teilen sich die anwendbaren Transformationsanteile, sodass die Umschaltung die Orientierung beibehält.
+
+Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Windows-Dateidialoge für Modelle und HDR-Environments bereit.
+
+## Szenen- und Materialoptionen
+
+- `meshoptimizer`: Lädt das aktuelle Modell beim Umschalten neu. Meshlet-Erzeugung bleibt immer aktiv; zusätzliche Optimierungen folgen dem Schalter.
+- `Default plastic`: Lädt die Szene neu und überschreibt jedes importierte Material mit `Albedo 0.75`, `Metallic 0.0`, `Roughness 0.5`.
+- `Ground plane`: Blendet eine Bodenebene mit dem Standardkunststoffmaterial ein oder aus.
+- `Meshlet debug colors`: Zeigt im Vulkan-Pfad eine stabile Zufallsfarbe pro Meshlet.
+- `Ray-traced reflections`: Aktiviert Vulkan-Reflexions-Ray-Queries; im OptiX-Pfad steuert die Option die reflektierenden Sekundärpfade.
+- `Indirect lighting`: Schaltet die globale Beleuchtung durch HDR, prozeduralen Himmel oder Richtungslicht entsprechend der aktiven Konfiguration.
+
+## Unterschiede der Backends
+
+### Vulkan
+
+Vulkan ist kein progressiver Pathtracer. Jeder Frame wird direkt über Task-/Mesh-Shader, PBR-Fragmentauswertung und optionale Inline Ray Queries erzeugt. Deshalb gelten `Samples per frame` und `Max bounces` nicht für diesen Pfad. Der optionale Denoiser wird ausschließlich nach dem Vulkan-Rendering ausgeführt.
+
+Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Roughness wählt den passenden Mip-Level der Environment-Pyramide; das HDR verändert den Materialparameter selbst nicht. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Nur der Denoiser-Pfad verwendet vorher ein lineares `RGBA16F`-Offscreenbild und `HALF4`-Interop.
+
+### OptiX
+
+OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
+
+## Umgebungsvariablen für Smoke-Tests
+
+| Variable | Wirkung |
+|---|---|
+| `VOR_BACKEND=optix` | startet mit OptiX statt Vulkan |
+| `VOR_DENOISER=1` | aktiviert den Vulkan-Postrender-Denoiser |
+| `VOR_SCENE=<absoluter Pfad>` | lädt beim Start ein Modell |
+| `VOR_MESHLET_DEBUG=1` | aktiviert die Meshlet-Debugfarben |
+| `VOR_GLOBAL_LIGHT=sky` | startet mit prozeduralem Himmel |
+| `VOR_GLOBAL_LIGHT=hdr` | startet im HDR-Modus |
+| `VOR_HDR=<absoluter Pfad>` | lädt beim Start ein Radiance-HDR-Environment |
+
+## Tests und Diagnose
+
+Die Tests decken unter anderem Mathematik, Szenenstatistiken, meshoptimizer-Verarbeitung, OBJ-/FBX-Import, Standardmaterial, Bodenebene und HDR-Mip-Erzeugung ab. Debug-Builds aktivieren Vulkan Validation; CUDA-, OptiX- und Vulkan-Diagnosen erscheinen auf `stderr`.
 
 Der Slang-Hinweis `E38040` beim OptiX-Build ist erwartet: Der Raygen-Parameter wird absichtlich als Uniform im SBT-Raygen-Record abgelegt.
+
+## Bekannte Ausbaupunkte
+
+- OptiX verwendet aktuell ein zusammengeführtes Triangle-GAS; separate GAS plus IAS-Instanzen sind noch offen.
+- LOD-Stufen werden erzeugt, derzeit wird aber nur das Basis-LOD hochgeladen und gerendert.
+- Importierte Texturreferenzen sind vorhanden; die vollständige Materialtextur-Abtastung in beiden Shaderpfaden ist noch auszubauen.
+- GPU-Timestamps und detaillierte Pass-Statistiken sind noch nicht vollständig instrumentiert.
+- Das Farbmanagement verwendet derzeit ein einfaches Tone Mapping mit sRGB-Ausgabe; ein auswählbarer Filmic-Tone-Mapper ist ein möglicher Ausbau.
