@@ -270,6 +270,19 @@ int main()
                 hasMaterialFlag(MaterialFlags::Emissive) && hasMaterialFlag(MaterialFlags::Subsurface) &&
                 hasMaterialFlag(MaterialFlags::Volume),
             "PBR comparison scene covers every advanced material lobe");
+    const Mesh& referenceSphere = comparison.meshes.front();
+    const auto& referenceIndices = referenceSphere.lods.front().indices;
+    bool outwardWinding = true;
+    for (std::size_t triangle = 0; triangle + 2 < referenceIndices.size(); triangle += 3)
+    {
+        const Vertex& a = referenceSphere.vertices[referenceIndices[triangle]];
+        const Vertex& b = referenceSphere.vertices[referenceIndices[triangle + 1]];
+        const Vertex& c = referenceSphere.vertices[referenceIndices[triangle + 2]];
+        const Vec3 faceNormal = cross(b.position - a.position, c.position - a.position);
+        const Vec3 shadingNormal = a.normal + b.normal + c.normal;
+        outwardWinding = outwardWinding && dot(faceNormal, shadingNormal) > 0.0f;
+    }
+    require(outwardWinding, "PBR comparison sphere winding matches outward vertex normals");
     for (const Material& material : comparison.materials)
     {
         const GpuMaterial gpu = material.toGpu();
@@ -333,6 +346,33 @@ int main()
         }
         require(std::abs(integral - 1.0) < 2.0e-4, "Henyey-Greenstein phase normalization");
     }
+
+    const std::array<double, 4> emissiveCdfUpper{0.1, 0.35, 0.8, 1.0};
+    const auto sampleEmissiveCdf = [&](double randomValue) {
+        std::size_t low = 0;
+        std::size_t high = emissiveCdfUpper.size();
+        while (low < high)
+        {
+            const std::size_t middle = (low + high) / 2;
+            if (randomValue < emissiveCdfUpper[middle])
+                high = middle;
+            else
+                low = middle + 1;
+        }
+        return std::min(low, emissiveCdfUpper.size() - 1);
+    };
+    require(sampleEmissiveCdf(0.05) == 0 && sampleEmissiveCdf(0.10) == 1 &&
+                sampleEmissiveCdf(0.34) == 1 && sampleEmissiveCdf(0.35) == 2 &&
+                sampleEmissiveCdf(0.95) == 3,
+            "emissive triangle upper-CDF selection");
+
+    const auto ratioTrackedTransmittance = [](double sigmaT, double majorant, double distance) {
+        const double proposalSurvival = std::exp(-majorant * distance);
+        return std::exp(-sigmaT * distance) / proposalSurvival;
+    };
+    require(std::abs(ratioTrackedTransmittance(0.4, 0.7, 2.0) * std::exp(-0.7 * 2.0) -
+                     std::exp(-0.4 * 2.0)) < 1.0e-12,
+            "volume no-collision proposal cancellation");
 
     const auto furnaceReflectance = [](double roughness, double metallic, double baseColor,
                                        double viewCosine) {

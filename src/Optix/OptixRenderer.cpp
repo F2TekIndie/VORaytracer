@@ -158,6 +158,7 @@ struct LaunchParameters
     SlangStructuredBuffer albedoGuide;
     SlangStructuredBuffer normalGuide;
     SlangStructuredBuffer displayOutput;
+    SlangStructuredBuffer positions;
     SlangStructuredBuffer normals;
     SlangStructuredBuffer tangents;
     SlangStructuredBuffer uvs;
@@ -1364,6 +1365,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.albedoGuide = {};
         parameters.normalGuide = {};
         parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.positions = {vertexBuffer_, vertexCount_};
         parameters.normals = {normalBuffer_, vertexCount_};
         parameters.tangents = {tangentBuffer_, vertexCount_};
         parameters.uvs = {uvBuffer_, vertexCount_};
@@ -1402,7 +1404,9 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.environmentVisible = environment.visibleBackground ? 1u : 0u;
         parameters.environmentMipCount = environment.hasHdr() ? environment.hdrMipCount : 0u;
         parameters.environmentImportanceTotal = environment.hdrImportanceTotal;
-        parameters.emissiveLightPower = emissiveLightPower_;
+        parameters.emissiveLightPower = parameters.materialOverrideId == kInvalidMaterialId
+                                            ? emissiveLightPower_
+                                            : 0.0f;
         parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
                                            camera.verticalFovDegrees * kPi / 180.0f};
         parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,

@@ -8,6 +8,9 @@ static const uint MATERIAL_FLAG_EMISSIVE = 1u << 6;
 static const uint MATERIAL_FLAG_SUBSURFACE = 1u << 7;
 static const uint MATERIAL_FLAG_VOLUME = 1u << 8;
 static const uint INVALID_TEXTURE_ID = 0xffffffffu;
+static const uint ALPHA_MODE_OPAQUE = 0u;
+static const uint ALPHA_MODE_MASK = 1u;
+static const uint ALPHA_MODE_BLEND = 2u;
 
 struct GpuMaterial
 {

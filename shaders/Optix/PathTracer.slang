@@ -1,6 +1,7 @@
 import MaterialTypes;
 import MaterialSampling;
 import Pbr;
+import Fresnel;
 import BsdfTypes;
 import BsdfTransmission;
 import BsdfSubsurface;
@@ -52,6 +53,7 @@ struct LaunchParameters
     RWStructuredBuffer<float4> albedoGuide;
     RWStructuredBuffer<float4> normalGuide;
     RWStructuredBuffer<uint> displayOutput;
+    StructuredBuffer<float3> positions;
     StructuredBuffer<float3> normals;
     StructuredBuffer<float4> tangents;
     StructuredBuffer<float2> uvs;
@@ -108,9 +110,10 @@ float4 sampleMaterialTexture(LaunchParameters parameters, uint textureId, float2
 }
 
 SurfaceData resolveMaterialSurface(LaunchParameters parameters, GpuMaterial material, float3 position,
-                                   float3 geometricNormal, float4 tangentAndSign, float2 uv)
+                                   float3 geometricNormal, float3 shadingNormal,
+                                   float4 tangentAndSign, float2 uv)
 {
-    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, geometricNormal, tangentAndSign, uv);
+    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign, uv);
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
     samples.baseColor = sampleMaterialTexture(parameters, material.textureIndices0.x, uv, samples.baseColor);
     samples.metallicRoughness = sampleMaterialTexture(parameters, material.textureIndices0.y, uv,
@@ -129,6 +132,53 @@ SurfaceData resolveMaterialSurface(LaunchParameters parameters, GpuMaterial mate
     samples.sheenRoughness = sampleMaterialTexture(parameters, material.textureIndices2.z, uv,
                                                    samples.sheenRoughness);
     return applyBaseMaterialTextures(material, surface, samples);
+}
+
+struct ResolvedHit
+{
+    GpuMaterial material;
+    SurfaceData surface;
+    float3 position;
+    float3 geometricNormal;
+    uint materialIndex;
+};
+
+ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, RayDesc ray)
+{
+    ResolvedHit result;
+    GpuOptixInstance hitInstance = parameters.instances[payload.instanceIndex];
+    uint3 localTriangle = parameters.indices[hitInstance.geometry.y + payload.primitiveIndex];
+    uint3 triangle = localTriangle + hitInstance.geometry.x;
+    float barycentric0 = 1.0 - payload.barycentrics.x - payload.barycentrics.y;
+
+    float3 worldPosition0 = mul(hitInstance.transform, float4(parameters.positions[triangle.x], 1.0)).xyz;
+    float3 worldPosition1 = mul(hitInstance.transform, float4(parameters.positions[triangle.y], 1.0)).xyz;
+    float3 worldPosition2 = mul(hitInstance.transform, float4(parameters.positions[triangle.z], 1.0)).xyz;
+    result.geometricNormal = normalize(cross(worldPosition1 - worldPosition0, worldPosition2 - worldPosition0));
+    result.position = ray.Origin + ray.Direction * payload.hitDistance;
+
+    float3 shadingNormal = normalize(parameters.normals[triangle.x] * barycentric0 +
+                                     parameters.normals[triangle.y] * payload.barycentrics.x +
+                                     parameters.normals[triangle.z] * payload.barycentrics.y);
+    shadingNormal = normalize(mul((float3x3)hitInstance.normalTransform, shadingNormal));
+    if (dot(shadingNormal, result.geometricNormal) < 0.0)
+        shadingNormal = -shadingNormal;
+    float4 vertexTangent = parameters.tangents[triangle.x] * barycentric0 +
+                           parameters.tangents[triangle.y] * payload.barycentrics.x +
+                           parameters.tangents[triangle.z] * payload.barycentrics.y;
+    vertexTangent.xyz = normalize(mul((float3x3)hitInstance.transform, vertexTangent.xyz));
+    vertexTangent.w *= hitInstance.handedness;
+    float2 uv = parameters.uvs[triangle.x] * barycentric0 +
+                parameters.uvs[triangle.y] * payload.barycentrics.x +
+                parameters.uvs[triangle.z] * payload.barycentrics.y;
+
+    result.materialIndex = parameters.materialOverrideId != 0xffffffffu
+                               ? parameters.materialOverrideId
+                               : hitInstance.materialIndex;
+    result.material = parameters.materials[result.materialIndex];
+    result.surface = resolveMaterialSurface(parameters, result.material, result.position,
+                                            result.geometricNormal, shadingNormal, vertexTangent, uv);
+    return result;
 }
 
 uint debugHash(uint value)
@@ -194,6 +244,86 @@ float random01(uint value)
     value *= 0x846ca68b;
     value ^= value >> 16;
     return float(value & 0x00ffffff) / float(0x01000000);
+}
+
+bool skipCameraPathHit(ResolvedHit hit, float3 rayDirection, float coverageSample)
+{
+    bool frontFacing = dot(hit.geometricNormal, -rayDirection) > 0.0;
+    bool needsBackFaceForTransport = hit.surface.transmission > 0.0 || hit.surface.volumeDensity > 0.0;
+    if (!frontFacing && (hit.surface.flags & MATERIAL_FLAG_DOUBLE_SIDED) == 0u && !needsBackFaceForTransport)
+        return true;
+    uint alphaMode = hit.material.materialFlags.y;
+    if (alphaMode == ALPHA_MODE_MASK)
+        return hit.surface.alpha < hit.material.surfaceParameters.w;
+    if (alphaMode == ALPHA_MODE_BLEND)
+        return coverageSample >= hit.surface.alpha;
+    return false;
+}
+
+float3 traceVisibility(LaunchParameters parameters, RayDesc sourceRay)
+{
+    float3 visibility = float3(1.0);
+    RayDesc shadowRay = sourceRay;
+    for (uint layer = 0; layer < 32u; ++layer)
+    {
+        RadiancePayload shadowPayload;
+        shadowPayload.primitiveIndex = 0;
+        shadowPayload.instanceIndex = 0;
+        shadowPayload.barycentrics = float2(0.0);
+        shadowPayload.hitDistance = 0.0;
+        shadowPayload.hit = 0;
+        TraceRay(parameters.scene,
+                 RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
+                 0xff, 0, 1, 0, shadowRay, shadowPayload);
+        if (shadowPayload.hit == 0)
+            return visibility;
+
+        ResolvedHit hit = resolveHit(parameters, shadowPayload, shadowRay);
+        uint alphaMode = hit.material.materialFlags.y;
+        bool passThrough = alphaMode == ALPHA_MODE_MASK &&
+                           hit.surface.alpha < hit.material.surfaceParameters.w;
+        if (alphaMode == ALPHA_MODE_BLEND)
+        {
+            visibility *= 1.0 - hit.surface.alpha;
+            passThrough = true;
+        }
+        if (hit.surface.transmission > 0.0)
+        {
+            float cosine = saturate(abs(dot(hit.geometricNormal, shadowRay.Direction)));
+            float fresnel = fresnelDielectric(cosine, 1.0, hit.surface.ior);
+            visibility *= lerp(float3(1.0), hit.surface.baseColor,
+                               hit.surface.transmission * (1.0 - fresnel));
+            passThrough = true;
+        }
+        if (!passThrough)
+            return float3(0.0);
+        if (max(visibility.x, max(visibility.y, visibility.z)) <= 1e-4)
+            return float3(0.0);
+
+        float coordinateScale = max(max(abs(hit.position.x), abs(hit.position.y)), abs(hit.position.z));
+        float bias = max(0.0001, coordinateScale * 0.00001);
+        float consumed = shadowPayload.hitDistance + bias;
+        shadowRay.Origin = hit.position + shadowRay.Direction * bias;
+        shadowRay.TMin = bias * 0.5;
+        shadowRay.TMax = max(shadowRay.TMax - consumed, shadowRay.TMin);
+        if (shadowRay.TMax <= shadowRay.TMin)
+            return visibility;
+    }
+    return visibility;
+}
+
+float emissiveMeshHitPdf(LaunchParameters parameters, ResolvedHit hit, float3 rayDirection,
+                         float hitDistance)
+{
+    if (parameters.emissiveLightPower <= 0.0 || parameters.materialOverrideId != 0xffffffffu)
+        return 0.0;
+    float emissionPower = luminance(max(hit.material.emissiveAndMetallic.xyz, 0.0));
+    float cosineAtLight = abs(dot(hit.geometricNormal, -rayDirection));
+    if (emissionPower <= 0.0 || cosineAtLight <= 1e-6)
+        return 0.0;
+    float solidAnglePdf = emissionPower * hitDistance * hitDistance /
+                          max(parameters.emissiveLightPower * cosineAtLight, 1e-8);
+    return solidAnglePdf * (1.0 - environmentLightSelectionProbability(parameters));
 }
 
 float3 rotateEnvironmentDirection(float3 direction, float angle, float3 lightDirection)
@@ -361,13 +491,13 @@ uint sampleEmissiveTriangle(LaunchParameters parameters, float randomValue)
     parameters.emissiveTriangles.GetDimensions(count, stride);
     uint low = 0;
     uint high = count;
-    while (low + 1 < high)
+    while (low < high)
     {
         uint middle = (low + high) / 2;
-        if (parameters.emissiveTriangles[middle].cdfAndPower.y <= randomValue)
-            low = middle + 1;
-        else
+        if (randomValue < parameters.emissiveTriangles[middle].cdfAndPower.y)
             high = middle;
+        else
+            low = middle + 1;
     }
     return min(low, count - 1);
 }
@@ -486,26 +616,41 @@ void RayGen(LaunchParameters parameters)
         {
             diagnosticPathDepth = bounce + 1u;
             RadiancePayload payload;
-            payload.primitiveIndex = 0;
-            payload.instanceIndex = 0;
-            payload.barycentrics = float2(0.0);
-            payload.hitDistance = 0.0;
-            payload.hit = 0;
-            TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
-            if (payload.hit == 0)
+            ResolvedHit resolvedHit;
+            RayDesc traversalRay = ray;
+            float accumulatedDistance = 0.0;
+            bool resolvedSurface = false;
+            for (uint transparencyLayer = 0; transparencyLayer < 32u; ++transparencyLayer)
             {
-                if (bounce != 0 || parameters.environmentVisible != 0)
+                payload.primitiveIndex = 0;
+                payload.instanceIndex = 0;
+                payload.barycentrics = float2(0.0);
+                payload.hitDistance = 0.0;
+                payload.hit = 0;
+                TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, traversalRay, payload);
+                if (payload.hit == 0)
+                    break;
+                accumulatedDistance += payload.hitDistance;
+                resolvedHit = resolveHit(parameters, payload, traversalRay);
+                float coverageSample = random01(seed ^ ((bounce + 1u) * 0x8da6b343u) ^
+                                                ((transparencyLayer + 1u) * 0xd8163841u));
+                if (!skipCameraPathHit(resolvedHit, traversalRay.Direction, coverageSample))
                 {
-                    float3 environmentRadiance = sampleGlobalEnvironment(parameters, ray.Direction);
-                    float misWeight = 1.0;
-                    if (bounce > 0 && !previousBsdfDelta && parameters.globalLightMode == 1)
-                        misWeight = misPowerHeuristic(previousBsdfPdf,
-                                                     hdrEnvironmentPdf(parameters, ray.Direction) *
-                                                         environmentLightSelectionProbability(parameters));
-                    sampleRadiance += throughput * environmentRadiance * misWeight;
+                    payload.hitDistance = accumulatedDistance;
+                    resolvedSurface = true;
+                    break;
                 }
-                break;
+                float alphaCoordinateScale = max(max(abs(resolvedHit.position.x), abs(resolvedHit.position.y)),
+                                                 abs(resolvedHit.position.z));
+                float alphaRayBias = max(0.0001, alphaCoordinateScale * 0.00001);
+                traversalRay.Origin = resolvedHit.position + traversalRay.Direction * alphaRayBias;
+                traversalRay.TMin = alphaRayBias * 0.5;
+                traversalRay.TMax = max(traversalRay.TMax - payload.hitDistance - alphaRayBias,
+                                        traversalRay.TMin);
             }
+            if (!resolvedSurface)
+                payload.hit = 0;
+            float transportDistance = payload.hit != 0 ? payload.hitDistance : ray.TMax;
             if (mediumDepth > 1)
             {
                 float3 sigmaA = mediumAbsorption[mediumDepth - 1] +
@@ -517,10 +662,13 @@ void RayGen(LaunchParameters parameters)
                 {
                     float freeFlightRandom = random01(seed ^ ((bounce + 1) * 0xa24baed5u));
                     float freeFlightDistance = -log(max(1.0 - freeFlightRandom, 1e-7)) / majorant;
-                    if (freeFlightDistance < payload.hitDistance && max(sigmaS.x, max(sigmaS.y, sigmaS.z)) > 0.0)
+                    bool scatteringMedium = max(sigmaS.x, max(sigmaS.y, sigmaS.z)) > 0.0;
+                    if (freeFlightDistance < transportDistance && scatteringMedium)
                     {
                         float3 volumePosition = ray.Origin + ray.Direction * freeFlightDistance;
-                        throughput *= exp(-sigmaT * freeFlightDistance) * sigmaS / majorant;
+                        float proposalPdf = majorant * exp(-majorant * freeFlightDistance);
+                        throughput *= exp(-sigmaT * freeFlightDistance) * sigmaS /
+                                      max(proposalPdf, 1e-20);
                         float environmentProbability = environmentLightSelectionProbability(parameters);
                         float volumeLightSelector = random01(seed ^ ((bounce + 1) * 0x6c8e9cf5u));
                         bool chooseEnvironment = volumeLightSelector < environmentProbability ||
@@ -567,29 +715,16 @@ void RayGen(LaunchParameters parameters)
                             volumeShadowRay.Direction = volumeLightDirection;
                             volumeShadowRay.TMin = 0.00005;
                             volumeShadowRay.TMax = max(volumeLightDistance - 0.0001, 0.00005);
-                            RadiancePayload volumeShadowPayload;
-                            volumeShadowPayload.primitiveIndex = 0;
-                            volumeShadowPayload.instanceIndex = 0;
-                            volumeShadowPayload.barycentrics = float2(0.0);
-                            volumeShadowPayload.hitDistance = 0.0;
-                            volumeShadowPayload.hit = 1;
-                            TraceRay(parameters.scene,
-                                     RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                                         RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
-                                     0xff, 0, 1, 0, volumeShadowRay, volumeShadowPayload);
-                            bool volumeVisible = volumeShadowPayload.hit == 0;
-                            if (!volumeVisible)
-                            {
-                                GpuOptixInstance blocker = parameters.instances[volumeShadowPayload.instanceIndex];
-                                volumeVisible = parameters.materials[blocker.materialIndex].transmissionClearcoat.x > 0.0;
-                            }
-                            if (volumeVisible)
+                            float3 volumeVisibility = parameters.rayTracedShadows != 0
+                                                          ? traceVisibility(parameters, volumeShadowRay)
+                                                          : float3(1.0);
+                            if (max(volumeVisibility.x, max(volumeVisibility.y, volumeVisibility.z)) > 0.0)
                             {
                                 float phase = henyeyGreenstein(dot(ray.Direction, volumeLightDirection),
                                                                mediumAnisotropy[mediumDepth - 1]);
                                 float misWeight = volumeLightDelta ? 1.0 :
                                     misPowerHeuristic(volumeLightPdf, phase);
-                                sampleRadiance += throughput * volumeLightRadiance * phase *
+                                sampleRadiance += throughput * volumeLightRadiance * volumeVisibility * phase *
                                                   misWeight / volumeLightPdf;
                             }
                         }
@@ -606,55 +741,44 @@ void RayGen(LaunchParameters parameters)
                         ray.TMax = 10000.0;
                         continue;
                     }
-                    throughput *= exp(-sigmaT * payload.hitDistance);
+                    float3 transmittance = exp(-sigmaT * transportDistance);
+                    if (scatteringMedium)
+                        transmittance /= max(exp(-majorant * transportDistance), 1e-20);
+                    throughput *= transmittance;
                 }
             }
             if (subsurfaceActive)
             {
                 throughput *= subsurfaceRandomWalkTransmittance(subsurfaceWalkColor,
                                                                  subsurfaceWalkRadius,
-                                                                 payload.hitDistance);
+                                                                 transportDistance);
                 subsurfaceActive = false;
             }
-
-            GpuOptixInstance hitInstance = parameters.instances[payload.instanceIndex];
-            uint3 triangle = parameters.indices[hitInstance.geometry.y + payload.primitiveIndex] +
-                             hitInstance.geometry.x;
-            float barycentric0 = 1.0 - payload.barycentrics.x - payload.barycentrics.y;
-            float3 normal = normalize(parameters.normals[triangle.x] * barycentric0 +
-                                      parameters.normals[triangle.y] * payload.barycentrics.x +
-                                      parameters.normals[triangle.z] * payload.barycentrics.y);
-            normal = normalize(mul((float3x3)hitInstance.normalTransform, normal));
-            float4 vertexTangent = parameters.tangents[triangle.x] * barycentric0 +
-                                   parameters.tangents[triangle.y] * payload.barycentrics.x +
-                                   parameters.tangents[triangle.z] * payload.barycentrics.y;
-            vertexTangent.xyz = normalize(mul((float3x3)hitInstance.transform, vertexTangent.xyz));
-            vertexTangent.w *= hitInstance.handedness;
-            float2 uv = parameters.uvs[triangle.x] * barycentric0 +
-                        parameters.uvs[triangle.y] * payload.barycentrics.x +
-                        parameters.uvs[triangle.z] * payload.barycentrics.y;
-            float3 viewDirection = normalize(-ray.Direction);
-
-            uint materialIndex = parameters.materialOverrideId != 0xffffffffu
-                                     ? parameters.materialOverrideId
-                                     : hitInstance.materialIndex;
-            GpuMaterial material = parameters.materials[materialIndex];
-            float3 worldPosition = ray.Origin + ray.Direction * payload.hitDistance;
-            SurfaceData surface = resolveMaterialSurface(parameters, material, worldPosition, normal, vertexTangent, uv);
-            if ((surface.flags & MATERIAL_FLAG_ALPHA_MASK) != 0u && surface.alpha < material.surfaceParameters.w)
+            if (payload.hit == 0)
             {
-                float alphaCoordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
-                float alphaRayBias = max(0.0001, alphaCoordinateScale * 0.00001);
-                ray.Origin = worldPosition + ray.Direction * alphaRayBias;
-                ray.TMin = alphaRayBias * 0.5;
-                ray.TMax = 10000.0;
-                continue;
+                if (bounce != 0 || parameters.environmentVisible != 0)
+                {
+                    float3 environmentRadiance = sampleGlobalEnvironment(parameters, ray.Direction);
+                    float misWeight = 1.0;
+                    if (bounce > 0 && !previousBsdfDelta && parameters.globalLightMode == 1)
+                        misWeight = misPowerHeuristic(previousBsdfPdf,
+                                                     hdrEnvironmentPdf(parameters, ray.Direction) *
+                                                         environmentLightSelectionProbability(parameters));
+                    sampleRadiance += throughput * environmentRadiance * misWeight;
+                }
+                break;
             }
+
+            float3 viewDirection = normalize(-ray.Direction);
+            uint materialIndex = resolvedHit.materialIndex;
+            GpuMaterial material = resolvedHit.material;
+            float3 worldPosition = resolvedHit.position;
+            SurfaceData surface = resolvedHit.surface;
             bool enteringSurface = dot(surface.geometricNormal, viewDirection) >= 0.0;
             float etaI = mediumIors[mediumDepth - 1];
             float etaT = enteringSurface ? surface.ior
                                          : (mediumDepth > 1 ? mediumIors[mediumDepth - 2] : 1.0);
-            normal = surface.shadingNormal;
+            float3 normal = surface.shadingNormal;
             if (dot(normal, viewDirection) < 0.0)
             {
                 normal = -normal;
@@ -675,7 +799,15 @@ void RayGen(LaunchParameters parameters)
             }
             float coordinateScale = max(max(abs(worldPosition.x), abs(worldPosition.y)), abs(worldPosition.z));
             float rayBias = max(0.0001, coordinateScale * 0.00001);
-            sampleRadiance += throughput * surface.emissive;
+            float emissiveMisWeight = 1.0;
+            if (bounce > 0 && !previousBsdfDelta)
+            {
+                float lightPdf = emissiveMeshHitPdf(parameters, resolvedHit, ray.Direction,
+                                                    payload.hitDistance);
+                if (lightPdf > 0.0)
+                    emissiveMisWeight = misPowerHeuristic(previousBsdfPdf, lightPdf);
+            }
+            sampleRadiance += throughput * surface.emissive * emissiveMisWeight;
 
             float3 sampledLightDirection = normalize(-parameters.lightDirection.xyz);
             float3 sampledLightRadiance = parameters.lightColorAndIntensity.xyz *
@@ -714,7 +846,7 @@ void RayGen(LaunchParameters parameters)
             else
                 sampledLightPdf = max(environmentSelectionProbability, 1e-8);
 
-            float visibility = 1.0;
+            float3 visibility = float3(1.0);
             if (parameters.rayTracedShadows != 0 && sampledLightPdf > 0.0)
             {
                 RayDesc shadowRay;
@@ -723,20 +855,11 @@ void RayGen(LaunchParameters parameters)
                 shadowRay.TMin = rayBias * 0.5;
                 shadowRay.TMax = max(sampledLightDistance - rayBias, rayBias);
 
-                RadiancePayload shadowPayload;
-                shadowPayload.primitiveIndex = 0;
-                shadowPayload.instanceIndex = 0;
-                shadowPayload.barycentrics = float2(0.0);
-                shadowPayload.hitDistance = 0.0;
-                shadowPayload.hit = 1;
-                TraceRay(parameters.scene,
-                         RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-                             RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
-                         0xff, 0, 1, 0, shadowRay, shadowPayload);
-                visibility = shadowPayload.hit == 0 ? 1.0 : 0.0;
+                visibility = traceVisibility(parameters, shadowRay);
             }
             float nDotLight = saturate(dot(normal, sampledLightDirection));
-            if (visibility > 0.0 && sampledLightPdf > 0.0 && nDotLight > 0.0)
+            if (max(visibility.x, max(visibility.y, visibility.z)) > 0.0 &&
+                sampledLightPdf > 0.0 && nDotLight > 0.0)
             {
                 float3 bsdfValue = evaluateBsdfWithIors(surface, viewDirection, sampledLightDirection,
                                                         etaI, etaT);

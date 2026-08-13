@@ -595,9 +595,9 @@ Scene AssetLoader::createPbrMaterialComparisonScene(AssetLoadOptions options) co
             const std::uint32_t a = latitude * (longitudeSegments + 1) + longitude;
             const std::uint32_t b = a + longitudeSegments + 1;
             if (latitude != 0)
-                sphereLod.indices.insert(sphereLod.indices.end(), {a, b, a + 1});
+                sphereLod.indices.insert(sphereLod.indices.end(), {a, a + 1, b});
             if (latitude + 1 != latitudeSegments)
-                sphereLod.indices.insert(sphereLod.indices.end(), {a + 1, b, b + 1});
+                sphereLod.indices.insert(sphereLod.indices.end(), {a + 1, b + 1, b});
         }
     }
     referenceMesh.lods.push_back(std::move(sphereLod));

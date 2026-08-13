@@ -9,6 +9,7 @@ import BsdfDiffuse;
 import BsdfConductor;
 import BsdfClearcoat;
 import BsdfSheen;
+import BsdfAnisotropic;
 
 struct TaskPayload
 {
@@ -190,9 +191,9 @@ float4 sampleMaterialTexture(uint textureId, float2 uv, float4 fallback)
 }
 
 SurfaceData resolveMaterialSurface(GpuMaterial material, float3 position, float3 geometricNormal,
-                                   float4 tangentAndSign, float2 uv)
+                                   float3 shadingNormal, float4 tangentAndSign, float2 uv)
 {
-    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, geometricNormal, tangentAndSign, uv);
+    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign, uv);
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
     samples.baseColor = sampleMaterialTexture(material.textureIndices0.x, uv, samples.baseColor);
     samples.metallicRoughness = sampleMaterialTexture(material.textureIndices0.y, uv, samples.metallicRoughness);
@@ -208,6 +209,74 @@ SurfaceData resolveMaterialSurface(GpuMaterial material, float3 position, float3
     samples.sheenColor = sampleMaterialTexture(material.textureIndices2.y, uv, samples.sheenColor);
     samples.sheenRoughness = sampleMaterialTexture(material.textureIndices2.z, uv, samples.sheenRoughness);
     return applyBaseMaterialTextures(material, surface, samples);
+}
+
+struct CandidateMaterial
+{
+    float opacity;
+    uint alphaMode;
+    bool accepted;
+    bool doubleSided;
+};
+
+CandidateMaterial resolveCandidateMaterial(uint instanceIndex, uint primitiveIndex, float2 barycentrics)
+{
+    CandidateMaterial result;
+    GpuInstance instance = sceneInstances[instanceIndex];
+    GpuMaterial material = loadMaterial(instance.materialIndex);
+    uint triangleOffset = instance.geometry.y + primitiveIndex * 3;
+    uint3 triangle = uint3(geometryIndices[triangleOffset], geometryIndices[triangleOffset + 1],
+                           geometryIndices[triangleOffset + 2]);
+    float barycentric0 = 1.0 - barycentrics.x - barycentrics.y;
+    float2 uv = sceneVertices[instance.geometry.x + triangle.x].uv.xy * barycentric0 +
+                sceneVertices[instance.geometry.x + triangle.y].uv.xy * barycentrics.x +
+                sceneVertices[instance.geometry.x + triangle.z].uv.xy * barycentrics.y;
+    float textureAlpha = material.textureIndices0.x == INVALID_TEXTURE_ID
+                             ? 1.0
+                             : materialTextures[NonUniformResourceIndex(material.textureIndices0.x)].SampleLevel(
+                                   materialTextureSampler, uv, 0.0).w;
+    result.opacity = saturate(material.baseColorFactor.w * textureAlpha);
+    result.alphaMode = material.materialFlags.y;
+    result.accepted = result.alphaMode != ALPHA_MODE_MASK || result.opacity >= material.surfaceParameters.w;
+    result.doubleSided = materialHasFlag(material, MATERIAL_FLAG_DOUBLE_SIDED);
+    return result;
+}
+
+float3 evaluateRealtimeSurfaceBsdf(SurfaceData surface, float3 viewDirection, float3 lightDirection)
+{
+    float3 result = evaluateBsdf(surface, viewDirection, lightDirection);
+    if (surface.subsurface <= 0.0 || dot(surface.shadingNormal, lightDirection) <= 0.0)
+        return result;
+    float3 halfwayVector = viewDirection + lightDirection;
+    if (dot(halfwayVector, halfwayVector) <= 1e-10)
+        return result;
+    float3 halfway = normalize(halfwayVector);
+    float3 f0 = lerp(float3(dielectricF0(surface.ior)), surface.baseColor, surface.metallic);
+    float3 fresnel = fresnelSchlick(saturate(dot(halfway, viewDirection)), f0);
+    float3 diffuse = (1.0 - fresnel) * (1.0 - surface.metallic) *
+                     (1.0 - surface.transmission) * evaluateLambert(surface.baseColor);
+    float clearcoatAttenuation = 1.0 - clearcoatFresnel(surface, viewDirection, lightDirection);
+    float3 removableDiffuse = diffuse * clearcoatAttenuation * sheenEnergyScale(surface);
+    return max(result - removableDiffuse * surface.subsurface, 0.0);
+}
+
+float effectiveEnvironmentRoughness(SurfaceData surface, float3 reflectionDirection)
+{
+    if (abs(surface.anisotropy) <= 1e-4)
+        return surface.roughness;
+    float3 tangent;
+    float3 bitangent;
+    anisotropicBasis(surface, tangent, bitangent);
+    float2 alphas = anisotropicAlphas(surface);
+    float tangentProjection = dot(reflectionDirection, tangent);
+    float bitangentProjection = dot(reflectionDirection, bitangent);
+    float projectionLength = tangentProjection * tangentProjection + bitangentProjection * bitangentProjection;
+    if (projectionLength <= 1e-8)
+        return surface.roughness;
+    float directionalAlpha = sqrt((tangentProjection * tangentProjection * alphas.x * alphas.x +
+                                   bitangentProjection * bitangentProjection * alphas.y * alphas.y) /
+                                  projectionLength);
+    return clamp(sqrt(max(directionalAlpha, 0.001)), 0.02, 1.0);
 }
 
 float3 rotateEnvironmentDirection(float3 direction)
@@ -466,7 +535,7 @@ void MeshMain(
 }
 
 [shader("fragment")]
-FragmentOutput FragmentMain(MeshVertex input)
+FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
 {
     FragmentOutput output;
     if (frame.showMeshlets == 1u)
@@ -475,9 +544,17 @@ FragmentOutput FragmentMain(MeshVertex input)
         return output;
     }
     GpuMaterial material = loadMaterial(input.materialId);
-    SurfaceData surface = resolveMaterialSurface(material, input.worldPosition, normalize(input.worldNormal),
-                                                 input.worldTangent, input.uv);
-    if ((surface.flags & MATERIAL_FLAG_ALPHA_MASK) != 0 && surface.alpha < material.surfaceParameters.w)
+    if (!frontFacing && !materialHasFlag(material, MATERIAL_FLAG_DOUBLE_SIDED))
+        discard;
+    float3 interpolatedNormal = normalize(input.worldNormal);
+    float3 geometricNormal = cross(ddx(input.worldPosition), ddy(input.worldPosition));
+    geometricNormal = dot(geometricNormal, geometricNormal) > 1e-12
+                          ? normalize(geometricNormal) : interpolatedNormal;
+    if (dot(geometricNormal, interpolatedNormal) < 0.0)
+        geometricNormal = -geometricNormal;
+    SurfaceData surface = resolveMaterialSurface(material, input.worldPosition, geometricNormal,
+                                                 interpolatedNormal, input.worldTangent, input.uv);
+    if (material.materialFlags.y == ALPHA_MODE_MASK && surface.alpha < material.surfaceParameters.w)
         discard;
     float3 normal = surface.shadingNormal;
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
@@ -490,7 +567,7 @@ FragmentOutput FragmentMain(MeshVertex input)
     if (frame.showMeshlets > 1u)
     {
         output.color = float4(surfaceDebugColor(frame.showMeshlets - 1u, surface, material,
-                                                effectiveMaterialId(input.materialId), normalize(input.worldNormal),
+                                                effectiveMaterialId(input.materialId), geometricNormal,
                                                 viewDirection), 1.0);
         return output;
     }
@@ -508,15 +585,30 @@ FragmentOutput FragmentMain(MeshVertex input)
         shadowRay.Direction = lightDirection;
         shadowRay.TMin = rayBias * 0.5;
         shadowRay.TMax = max(lightDistance - rayBias, rayBias);
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                 RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
         query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, shadowRay);
-        query.Proceed();
-        visibility = query.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+        while (query.Proceed())
+        {
+            CandidateMaterial candidate = resolveCandidateMaterial(query.CandidateInstanceID(),
+                                                                    query.CandidatePrimitiveIndex(),
+                                                                    query.CandidateTriangleBarycentrics());
+            if (!candidate.accepted)
+                continue;
+            if (candidate.alphaMode == ALPHA_MODE_BLEND)
+            {
+                visibility *= 1.0 - candidate.opacity;
+                continue;
+            }
+            query.CommitNonOpaqueTriangleHit();
+        }
+        if (query.CommittedStatus() != COMMITTED_NOTHING)
+            visibility = 0.0;
     }
     float3 directRadiance = globalLightMode == 1
                                 ? float3(0.0)
                                 : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
-    float3 color = evaluateBsdf(surface, viewDirection, lightDirection) *
+    float3 color = evaluateRealtimeSurfaceBsdf(surface, viewDirection, lightDirection) *
                    saturate(dot(normal, lightDirection)) * directRadiance;
     color += surface.emissive;
     if (surface.subsurface > 0.0)
@@ -530,9 +622,16 @@ FragmentOutput FragmentMain(MeshVertex input)
         thicknessRay.Direction = -normal;
         thicknessRay.TMin = rayBias * 0.5;
         thicknessRay.TMax = max(surface.subsurfaceRadius * 12.0, rayBias);
-        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> thicknessQuery;
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> thicknessQuery;
         thicknessQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, thicknessRay);
-        thicknessQuery.Proceed();
+        while (thicknessQuery.Proceed())
+        {
+            CandidateMaterial candidate = resolveCandidateMaterial(thicknessQuery.CandidateInstanceID(),
+                                                                    thicknessQuery.CandidatePrimitiveIndex(),
+                                                                    thicknessQuery.CandidateTriangleBarycentrics());
+            if (candidate.accepted && candidate.alphaMode != ALPHA_MODE_BLEND)
+                thicknessQuery.CommitNonOpaqueTriangleHit();
+        }
         if (thicknessQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
             thickness = thicknessQuery.CommittedRayT();
         float3 subsurfaceRadiance = globalLightMode == 1 ? sampleDiffuseEnvironment(-normal) : directRadiance;
@@ -542,7 +641,15 @@ FragmentOutput FragmentMain(MeshVertex input)
     if (frame.skyHorizonAndIndirect.w != 0.0 && surface.metallic < 0.999)
     {
         float3 indirectRadiance = sampleDiffuseEnvironment(normal);
-        color += indirectRadiance * baseColor * (1.0 - surface.metallic) * surface.occlusion;
+        float nDotV = saturate(dot(normal, viewDirection));
+        float3 diffuseF0 = lerp(float3(dielectricF0(surface.ior)), baseColor, surface.metallic);
+        float3 diffuseFresnel = fresnelSchlickRoughness(nDotV, diffuseF0, surface.roughness);
+        float clearcoatAttenuation = 1.0 - surface.clearcoat *
+            fresnelSchlick(nDotV, float3(0.04)).x;
+        float3 diffuseWeight = (1.0 - diffuseFresnel) * (1.0 - surface.metallic) *
+                               (1.0 - surface.transmission) * (1.0 - surface.subsurface) *
+                               sheenEnergyScale(surface) * clearcoatAttenuation;
+        color += indirectRadiance * baseColor * diffuseWeight * surface.occlusion;
     }
     if (frame.rayTracedReflections != 0)
     {
@@ -553,12 +660,22 @@ FragmentOutput FragmentMain(MeshVertex input)
         reflectionRay.Direction = normalize(reflect(-viewDirection, normal));
         reflectionRay.TMin = rayBias * 0.5;
         reflectionRay.TMax = 10000.0;
-        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectionQuery;
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectionQuery;
         reflectionQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, reflectionRay);
-        reflectionQuery.Proceed();
+        while (reflectionQuery.Proceed())
+        {
+            CandidateMaterial candidate = resolveCandidateMaterial(reflectionQuery.CandidateInstanceID(),
+                                                                    reflectionQuery.CandidatePrimitiveIndex(),
+                                                                    reflectionQuery.CandidateTriangleBarycentrics());
+            if (!candidate.accepted || (!candidate.doubleSided &&
+                                        !reflectionQuery.CandidateTriangleFrontFace()))
+                continue;
+            reflectionQuery.CommitNonOpaqueTriangleHit();
+        }
 
+        float environmentRoughness = effectiveEnvironmentRoughness(surface, reflectionRay.Direction);
         float3 environmentReflection = samplePrefilteredEnvironment(reflectionRay.Direction,
-                                                                     surface.roughness);
+                                                                     environmentRoughness);
         float3 reflectedRadiance = environmentReflection;
         if (reflectionQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {
@@ -576,6 +693,16 @@ FragmentOutput FragmentMain(MeshVertex input)
                                          sceneVertices[hitInstance.geometry.x + triangle.y].normal.xyz * barycentrics.x +
                                          sceneVertices[hitInstance.geometry.x + triangle.z].normal.xyz * barycentrics.y);
             hitNormal = normalize(mul((float3x3)hitInstance.normalTransform, hitNormal));
+            float3 hitPosition0 = mul(hitInstance.transform,
+                                      float4(sceneVertices[hitInstance.geometry.x + triangle.x].position.xyz, 1.0)).xyz;
+            float3 hitPosition1 = mul(hitInstance.transform,
+                                      float4(sceneVertices[hitInstance.geometry.x + triangle.y].position.xyz, 1.0)).xyz;
+            float3 hitPosition2 = mul(hitInstance.transform,
+                                      float4(sceneVertices[hitInstance.geometry.x + triangle.z].position.xyz, 1.0)).xyz;
+            float3 hitGeometricNormal = normalize(cross(hitPosition1 - hitPosition0,
+                                                        hitPosition2 - hitPosition0));
+            if (dot(hitNormal, hitGeometricNormal) < 0.0)
+                hitNormal = -hitNormal;
             float3 reflectedViewDirection = normalize(-reflectionRay.Direction);
             float3 hitPosition = reflectionRay.Origin + reflectionRay.Direction * reflectionQuery.CommittedRayT();
             float2 hitUv = sceneVertices[hitInstance.geometry.x + triangle.x].uv.xy * barycentric0 +
@@ -586,7 +713,8 @@ FragmentOutput FragmentMain(MeshVertex input)
                                 sceneVertices[hitInstance.geometry.x + triangle.z].tangent * barycentrics.y;
             hitTangent.xyz = normalize(mul((float3x3)hitInstance.transform, hitTangent.xyz));
             hitTangent.w *= hitInstance.scaleAndFlags.z;
-            SurfaceData hitSurface = resolveMaterialSurface(hitMaterial, hitPosition, hitNormal, hitTangent, hitUv);
+            SurfaceData hitSurface = resolveMaterialSurface(hitMaterial, hitPosition, hitGeometricNormal,
+                                                            hitNormal, hitTangent, hitUv);
             hitNormal = hitSurface.shadingNormal;
             if (dot(hitNormal, reflectedViewDirection) < 0.0)
             {
@@ -606,37 +734,80 @@ FragmentOutput FragmentMain(MeshVertex input)
                 reflectedShadowRay.Direction = hitLightDirection;
                 reflectedShadowRay.TMin = hitRayBias * 0.5;
                 reflectedShadowRay.TMax = max(hitLightDistance - hitRayBias, hitRayBias);
-                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectedShadowQuery;
+                RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                         RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectedShadowQuery;
                 reflectedShadowQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, reflectedShadowRay);
-                reflectedShadowQuery.Proceed();
-                hitVisibility = reflectedShadowQuery.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+                while (reflectedShadowQuery.Proceed())
+                {
+                    CandidateMaterial candidate = resolveCandidateMaterial(
+                        reflectedShadowQuery.CandidateInstanceID(),
+                        reflectedShadowQuery.CandidatePrimitiveIndex(),
+                        reflectedShadowQuery.CandidateTriangleBarycentrics());
+                    if (!candidate.accepted)
+                        continue;
+                    if (candidate.alphaMode == ALPHA_MODE_BLEND)
+                    {
+                        hitVisibility *= 1.0 - candidate.opacity;
+                        continue;
+                    }
+                    reflectedShadowQuery.CommitNonOpaqueTriangleHit();
+                }
+                if (reflectedShadowQuery.CommittedStatus() != COMMITTED_NOTHING)
+                    hitVisibility = 0.0;
             }
             float3 hitDirectRadiance = globalLightMode == 1
                                            ? float3(0.0)
                                            : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
-            float3 localReflection = evaluateBsdf(hitSurface, reflectedViewDirection, hitLightDirection) *
+            float3 localReflection = evaluateRealtimeSurfaceBsdf(hitSurface, reflectedViewDirection,
+                                                                 hitLightDirection) *
                                      saturate(dot(hitNormal, hitLightDirection)) * hitDirectRadiance;
             if (frame.skyHorizonAndIndirect.w != 0.0)
                 localReflection += sampleDiffuseEnvironment(hitNormal) * hitSurface.baseColor *
-                                   (1.0 - hitSurface.metallic) * hitSurface.occlusion / PI;
+                                   (1.0 - hitSurface.metallic) * (1.0 - hitSurface.transmission) *
+                                   (1.0 - hitSurface.subsurface) * hitSurface.occlusion;
             localReflection += hitSurface.emissive;
+            if (hitMaterial.materialFlags.y == ALPHA_MODE_BLEND)
+                localReflection = lerp(environmentReflection, localReflection, hitSurface.alpha);
 
             // A single ray can only represent a sharp local reflection. Fade it into the
             // prefiltered environment once the material lobe is too wide for that sample.
-            float localReflectionWeight = 1.0 - smoothstep(0.12, 0.58, saturate(surface.roughness));
+            float localReflectionWeight = 1.0 - smoothstep(0.12, 0.58, environmentRoughness);
             reflectedRadiance = lerp(environmentReflection, localReflection, localReflectionWeight);
         }
-        float3 reflectionF0 = lerp(float3(0.04), baseColor, surface.metallic);
+        float3 reflectionF0 = lerp(float3(dielectricF0(surface.ior)), baseColor, surface.metallic);
         float3 reflectionWeight = fresnelSchlickRoughness(saturate(dot(normal, viewDirection)),
-                                                          reflectionF0, surface.roughness);
-        color += reflectedRadiance * reflectionWeight;
+                                                           reflectionF0, environmentRoughness);
+        float clearcoatBaseAttenuation = 1.0 - surface.clearcoat *
+            fresnelSchlick(saturate(dot(surface.clearcoatNormal, viewDirection)), float3(0.04)).x;
+        color += reflectedRadiance * reflectionWeight * clearcoatBaseAttenuation *
+                 sheenEnergyScale(surface);
+
+        if (surface.clearcoat > 0.0)
+        {
+            float3 clearcoatDirection = normalize(reflect(-viewDirection, surface.clearcoatNormal));
+            float3 clearcoatEnvironment = samplePrefilteredEnvironment(clearcoatDirection,
+                                                                        surface.clearcoatRoughness);
+            float clearcoatWeight = surface.clearcoat *
+                fresnelSchlick(saturate(dot(surface.clearcoatNormal, viewDirection)), float3(0.04)).x;
+            color += clearcoatEnvironment * clearcoatWeight;
+        }
+        if (sheenMaximumColor(surface) > 0.0)
+        {
+            float3 sheenDirection = normalize(reflect(-viewDirection, normal));
+            float3 sheenEnvironment = samplePrefilteredEnvironment(sheenDirection,
+                                                                    surface.sheenRoughness);
+            float grazing = 1.0 - saturate(dot(normal, viewDirection));
+            float sheenWeight = 0.2 + 0.3 * surface.sheenRoughness;
+            color += sheenEnvironment * surface.sheenColor * sheenWeight *
+                     (0.25 + 0.75 * grazing * grazing);
+        }
     }
     if (surface.transmission > 0.0)
     {
         float3 internalDirection;
         bool entered = refractDielectric(-viewDirection, normal, 1.0 / surface.ior, internalDirection);
-        float3 transmittedRadiance = sampleGlobalEnvironment(entered ? internalDirection
-                                                                      : reflect(-viewDirection, normal));
+        float3 transmittedRadiance = samplePrefilteredEnvironment(
+            entered ? internalDirection : reflect(-viewDirection, normal), surface.roughness);
         float travelDistance = 0.0;
         if (entered)
         {
@@ -648,9 +819,16 @@ FragmentOutput FragmentMain(MeshVertex input)
             transmissionRay.Direction = internalDirection;
             transmissionRay.TMin = rayBias * 0.5;
             transmissionRay.TMax = 10000.0;
-            RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> transmissionQuery;
+            RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> transmissionQuery;
             transmissionQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, transmissionRay);
-            transmissionQuery.Proceed();
+            while (transmissionQuery.Proceed())
+            {
+                CandidateMaterial candidate = resolveCandidateMaterial(transmissionQuery.CandidateInstanceID(),
+                                                                        transmissionQuery.CandidatePrimitiveIndex(),
+                                                                        transmissionQuery.CandidateTriangleBarycentrics());
+                if (candidate.accepted && candidate.alphaMode != ALPHA_MODE_BLEND)
+                    transmissionQuery.CommitNonOpaqueTriangleHit();
+            }
             if (transmissionQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
             {
                 travelDistance = transmissionQuery.CommittedRayT();
@@ -660,35 +838,39 @@ FragmentOutput FragmentMain(MeshVertex input)
                                            geometryIndices[exitOffset + 2]);
                 float2 exitBarycentrics = transmissionQuery.CommittedTriangleBarycentrics();
                 float exitBarycentric0 = 1.0 - exitBarycentrics.x - exitBarycentrics.y;
-                float3 exitNormal = normalize(
-                    sceneVertices[exitInstance.geometry.x + exitTriangle.x].normal.xyz * exitBarycentric0 +
-                    sceneVertices[exitInstance.geometry.x + exitTriangle.y].normal.xyz * exitBarycentrics.x +
-                    sceneVertices[exitInstance.geometry.x + exitTriangle.z].normal.xyz * exitBarycentrics.y);
-                exitNormal = normalize(mul((float3x3)exitInstance.normalTransform, exitNormal));
+                float3 exitPosition0 = mul(exitInstance.transform,
+                    float4(sceneVertices[exitInstance.geometry.x + exitTriangle.x].position.xyz, 1.0)).xyz;
+                float3 exitPosition1 = mul(exitInstance.transform,
+                    float4(sceneVertices[exitInstance.geometry.x + exitTriangle.y].position.xyz, 1.0)).xyz;
+                float3 exitPosition2 = mul(exitInstance.transform,
+                    float4(sceneVertices[exitInstance.geometry.x + exitTriangle.z].position.xyz, 1.0)).xyz;
+                float3 exitNormal = normalize(cross(exitPosition1 - exitPosition0,
+                                                    exitPosition2 - exitPosition0));
                 if (dot(-internalDirection, exitNormal) < 0.0)
                     exitNormal = -exitNormal;
                 float3 exitDirection;
                 if (!refractDielectric(internalDirection, exitNormal, surface.ior, exitDirection))
                     exitDirection = reflect(internalDirection, exitNormal);
-                transmittedRadiance = sampleGlobalEnvironment(exitDirection);
+                transmittedRadiance = samplePrefilteredEnvironment(exitDirection, surface.roughness);
             }
         }
         float fresnel = fresnelDielectric(saturate(dot(normal, viewDirection)), 1.0, surface.ior);
         float3 transmittance = beerLambert(absorptionCoefficient(surface), travelDistance);
+        if (surface.volumeDensity > 0.0 && travelDistance > 0.0)
+        {
+            float3 sigmaT = (surface.volumeAbsorption + surface.volumeScattering) * surface.volumeDensity;
+            float3 volumeTransmittance = exp(-sigmaT * travelDistance);
+            float3 fogLighting = globalLightMode == 1 ? sampleDiffuseEnvironment(normal)
+                                                      : frame.lightColorAndIntensity.xyz *
+                                                            frame.lightColorAndIntensity.w;
+            float3 scatteringAlbedo = surface.volumeScattering /
+                                      max(surface.volumeAbsorption + surface.volumeScattering,
+                                          float3(1e-5));
+            transmittedRadiance = transmittedRadiance * volumeTransmittance +
+                                  fogLighting * scatteringAlbedo * (1.0 - volumeTransmittance);
+        }
         color = lerp(color, transmittedRadiance * transmittance * surface.baseColor,
                      surface.transmission * (1.0 - fresnel));
-    }
-    if (surface.volumeDensity > 0.0)
-    {
-        float viewDistance = length(frame.cameraPosition.xyz - input.worldPosition);
-        float3 sigmaT = (surface.volumeAbsorption + surface.volumeScattering) * surface.volumeDensity;
-        float3 transmittance = exp(-sigmaT * viewDistance);
-        float3 fogLighting = globalLightMode == 1 ? sampleDiffuseEnvironment(normal)
-                                                  : frame.lightColorAndIntensity.xyz *
-                                                        frame.lightColorAndIntensity.w;
-        float3 scatteringAlbedo = surface.volumeScattering /
-                                  max(surface.volumeAbsorption + surface.volumeScattering, float3(1e-5));
-        color = color * transmittance + fogLighting * scatteringAlbedo * (1.0 - transmittance);
     }
     if (frame.postProcessInput == 0)
     {
@@ -696,6 +878,6 @@ FragmentOutput FragmentMain(MeshVertex input)
         color = max(color, 0.0);
         color = color / (1.0 + color);
     }
-    output.color = float4(color, 1.0);
+    output.color = float4(color, material.materialFlags.y == ALPHA_MODE_BLEND ? surface.alpha : 1.0);
     return output;
 }

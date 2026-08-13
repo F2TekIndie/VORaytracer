@@ -39,6 +39,10 @@ SurfaceData applyBaseMaterialTextures(
     SurfaceData surface,
     MaterialTextureSamples samples)
 {
+    float3 originalNormal = surface.shadingNormal;
+    float3 originalTangent = surface.tangent;
+    float3 originalBitangent = surface.bitangent;
+    float tangentSign = dot(cross(originalNormal, originalTangent), originalBitangent) < 0.0 ? -1.0 : 1.0;
     surface.baseColor *= max(samples.baseColor.xyz, 0.0);
     surface.alpha *= saturate(samples.baseColor.w);
     surface.roughness = clamp(surface.roughness * saturate(samples.metallicRoughness.y), 0.02, 1.0);
@@ -59,13 +63,23 @@ SurfaceData applyBaseMaterialTextures(
         surface.shadingNormal = normalize(surface.tangent * tangentNormal.x +
                                           surface.bitangent * tangentNormal.y +
                                           surface.shadingNormal * tangentNormal.z);
+        float3 mappedTangent = originalTangent - surface.shadingNormal *
+                                                   dot(surface.shadingNormal, originalTangent);
+        if (dot(mappedTangent, mappedTangent) <= 1e-10)
+            mappedTangent = cross(abs(surface.shadingNormal.z) < 0.999
+                                      ? float3(0.0, 0.0, 1.0)
+                                      : float3(0.0, 1.0, 0.0),
+                                  surface.shadingNormal);
+        surface.tangent = normalize(mappedTangent);
+        surface.bitangent = normalize(cross(surface.shadingNormal, surface.tangent)) * tangentSign;
+        surface.clearcoatNormal = surface.shadingNormal;
     }
     if (material.textureIndices2.x != INVALID_TEXTURE_ID)
     {
         float3 tangentNormal = normalize(samples.clearcoatNormal.xyz * 2.0 - 1.0);
-        surface.clearcoatNormal = normalize(surface.tangent * tangentNormal.x +
-                                            surface.bitangent * tangentNormal.y +
-                                            surface.shadingNormal * tangentNormal.z);
+        surface.clearcoatNormal = normalize(originalTangent * tangentNormal.x +
+                                            originalBitangent * tangentNormal.y +
+                                            originalNormal * tangentNormal.z);
     }
     if (material.textureIndices2.w != INVALID_TEXTURE_ID)
     {
@@ -75,6 +89,6 @@ SurfaceData applyBaseMaterialTextures(
         surface.anisotropy = clamp(surface.anisotropy * saturate(samples.anisotropy.z), -0.99, 0.99);
     }
     surface.sheenColor *= max(samples.sheenColor.xyz, 0.0);
-    surface.sheenRoughness = saturate(surface.sheenRoughness * saturate(samples.sheenRoughness.x));
+    surface.sheenRoughness = saturate(surface.sheenRoughness * saturate(samples.sheenRoughness.w));
     return surface;
 }
