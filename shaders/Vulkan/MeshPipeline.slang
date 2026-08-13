@@ -98,6 +98,7 @@ struct MeshVertex
     float4 worldTangent : TANGENT0;
     nointerpolation uint materialId : TEXCOORD1;
     nointerpolation uint meshletIndex : TEXCOORD2;
+    nointerpolation uint instanceIndex : TEXCOORD3;
 };
 
 struct FragmentOutput
@@ -244,20 +245,10 @@ CandidateMaterial resolveCandidateMaterial(uint instanceIndex, uint primitiveInd
 
 float3 evaluateRealtimeSurfaceBsdf(SurfaceData surface, float3 viewDirection, float3 lightDirection)
 {
-    float3 result = evaluateBsdf(surface, viewDirection, lightDirection);
-    if (surface.subsurface <= 0.0 || dot(surface.shadingNormal, lightDirection) <= 0.0)
-        return result;
-    float3 halfwayVector = viewDirection + lightDirection;
-    if (dot(halfwayVector, halfwayVector) <= 1e-10)
-        return result;
-    float3 halfway = normalize(halfwayVector);
-    float3 f0 = lerp(float3(dielectricF0(surface.ior)), surface.baseColor, surface.metallic);
-    float3 fresnel = fresnelSchlick(saturate(dot(halfway, viewDirection)), f0);
-    float3 diffuse = (1.0 - fresnel) * (1.0 - surface.metallic) *
-                     (1.0 - surface.transmission) * evaluateLambert(surface.baseColor);
-    float clearcoatAttenuation = 1.0 - clearcoatFresnel(surface, viewDirection, lightDirection);
-    float3 removableDiffuse = diffuse * clearcoatAttenuation * sheenEnergyScale(surface);
-    return max(result - removableDiffuse * surface.subsurface, 0.0);
+    bool entering = dot(surface.geometricNormal, viewDirection) >= 0.0;
+    return evaluateBsdfWithSubsurfaceMix(surface, viewDirection, lightDirection,
+                                         entering ? 1.0 : surface.ior,
+                                         entering ? surface.ior : 1.0);
 }
 
 float effectiveEnvironmentRoughness(SurfaceData surface, float3 reflectionDirection)
@@ -369,16 +360,26 @@ float3 sampleGlobalEnvironment(float3 direction)
     return float3(0.0);
 }
 
-float hdrSpecularMipLevel(float roughness)
+float radicalInverseBase2(uint bits)
 {
-    if (frame.environmentMipCount <= 1)
-        return 0.0;
-    float maximumMip = float(frame.environmentMipCount - 1);
-    float angularFootprintInTexels = max(roughness * roughness * frame.environmentParameters.x /
-                                         (2.0 * PI), 1.0);
-    float footprintMip = log2(angularFootprintInTexels) + 0.5;
-    float perceptualMip = roughness * maximumMip * 1.75;
-    return min(max(footprintMip, perceptualMip), maximumMip);
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xaaaaaaaau) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xccccccccu) >> 2u);
+    bits = ((bits & 0x0f0f0f0fu) << 4u) | ((bits & 0xf0f0f0f0u) >> 4u);
+    bits = ((bits & 0x00ff00ffu) << 8u) | ((bits & 0xff00ff00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+float2 environmentSample(uint index, uint count)
+{
+    return float2((float(index) + 0.5) / float(count), radicalInverseBase2(index));
+}
+
+void directionBasis(float3 normal, out float3 tangent, out float3 bitangent)
+{
+    tangent = normalize(cross(abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                                       : float3(0.0, 1.0, 0.0), normal));
+    bitangent = cross(normal, tangent);
 }
 
 float3 sampleDiffuseEnvironment(float3 normal)
@@ -386,15 +387,25 @@ float3 sampleDiffuseEnvironment(float3 normal)
     uint mode = uint(frame.lightDirectionAndMode.w + 0.5);
     if (mode == 1)
     {
-        float hemisphereFootprint = max(frame.environmentParameters.x / (2.0 * PI), 1.0);
-        float mipLevel = min(log2(hemisphereFootprint), float(max(frame.environmentMipCount, 1u) - 1));
-        return sampleHdrEnvironmentLod(normal, mipLevel) * frame.environmentParameters.z;
+        static const uint sampleCount = 4u;
+        float3 tangent;
+        float3 bitangent;
+        directionBasis(normalize(normal), tangent, bitangent);
+        float3 irradianceOverPi = float3(0.0);
+        for (uint index = 0; index < sampleCount; ++index)
+        {
+            float2 xi = environmentSample(index, sampleCount);
+            float radius = sqrt(xi.x);
+            float phi = 2.0 * PI * xi.y;
+            float3 direction = normalize(tangent * (radius * cos(phi)) +
+                                         bitangent * (radius * sin(phi)) +
+                                         normal * sqrt(max(1.0 - xi.x, 0.0)));
+            irradianceOverPi += sampleHdrEnvironment(direction);
+        }
+        return irradianceOverPi * (frame.environmentParameters.z / float(sampleCount));
     }
     if (mode == 0)
-    {
-        float directionalBounce = 0.015 + 0.035 * saturate(normal.y);
-        return frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * directionalBounce;
-    }
+        return float3(0.0);
     return sampleGlobalEnvironment(normal);
 }
 
@@ -403,8 +414,37 @@ float3 samplePrefilteredEnvironment(float3 reflectionDirection, float roughness)
     reflectionDirection = normalize(reflectionDirection);
     roughness = saturate(roughness);
     if (uint(frame.lightDirectionAndMode.w + 0.5) == 1)
-        return sampleHdrEnvironmentLod(reflectionDirection, hdrSpecularMipLevel(roughness)) *
-               frame.environmentParameters.z;
+    {
+        if (roughness <= 0.025)
+            return sampleHdrEnvironment(reflectionDirection) * frame.environmentParameters.z;
+        static const uint sampleCount = 4u;
+        float3 tangent;
+        float3 bitangent;
+        directionBasis(reflectionDirection, tangent, bitangent);
+        float alpha = max(roughness * roughness, 0.001);
+        float alphaSquared = alpha * alpha;
+        float3 radiance = float3(0.0);
+        float totalWeight = 0.0;
+        for (uint index = 0; index < sampleCount; ++index)
+        {
+            float2 xi = environmentSample(index, sampleCount);
+            float phi = 2.0 * PI * xi.x;
+            float cosineTheta = sqrt((1.0 - xi.y) /
+                                     max(1.0 + (alphaSquared - 1.0) * xi.y, 1e-6));
+            float sineTheta = sqrt(max(1.0 - cosineTheta * cosineTheta, 0.0));
+            float3 halfway = normalize(tangent * (cos(phi) * sineTheta) +
+                                       bitangent * (sin(phi) * sineTheta) +
+                                       reflectionDirection * cosineTheta);
+            float3 direction = normalize(reflect(-reflectionDirection, halfway));
+            float weight = saturate(dot(reflectionDirection, direction));
+            if (weight > 0.0)
+            {
+                radiance += sampleHdrEnvironment(direction) * weight;
+                totalWeight += weight;
+            }
+        }
+        return radiance * (frame.environmentParameters.z / max(totalWeight, 1e-6));
+    }
     return sampleGlobalEnvironment(reflectionDirection);
 }
 
@@ -526,6 +566,7 @@ void MeshMain(
         vertices[outputVertex].uv = source.uv.xy;
         vertices[outputVertex].materialId = meshlet.materialIndex;
         vertices[outputVertex].meshletIndex = meshletIndex;
+        vertices[outputVertex].instanceIndex = meshlet.instanceIndex;
     }
     for (uint outputTriangle = threadIndex; outputTriangle < meshlet.triangleCount; outputTriangle += 32)
     {
@@ -556,6 +597,12 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                                                  interpolatedNormal, input.worldTangent, input.uv);
     if (material.materialFlags.y == ALPHA_MODE_MASK && surface.alpha < material.surfaceParameters.w)
         discard;
+    if (material.materialFlags.y == ALPHA_MODE_BLEND)
+    {
+        float dither = frac(52.9829189 * frac(dot(input.position.xy, float2(0.06711056, 0.00583715))));
+        if (surface.alpha <= dither)
+            discard;
+    }
     float3 normal = surface.shadingNormal;
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
     if (dot(normal, viewDirection) < 0.0)
@@ -595,6 +642,8 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                                                                     query.CandidateTriangleBarycentrics());
             if (!candidate.accepted)
                 continue;
+            if (!candidate.doubleSided && !query.CandidateTriangleFrontFace())
+                continue;
             if (candidate.alphaMode == ALPHA_MODE_BLEND)
             {
                 visibility *= 1.0 - candidate.opacity;
@@ -629,7 +678,8 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
             CandidateMaterial candidate = resolveCandidateMaterial(thicknessQuery.CandidateInstanceID(),
                                                                     thicknessQuery.CandidatePrimitiveIndex(),
                                                                     thicknessQuery.CandidateTriangleBarycentrics());
-            if (candidate.accepted && candidate.alphaMode != ALPHA_MODE_BLEND)
+            if (thicknessQuery.CandidateInstanceID() == input.instanceIndex && candidate.accepted &&
+                candidate.alphaMode != ALPHA_MODE_BLEND)
                 thicknessQuery.CommitNonOpaqueTriangleHit();
         }
         if (thicknessQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
@@ -670,6 +720,15 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
             if (!candidate.accepted || (!candidate.doubleSided &&
                                         !reflectionQuery.CandidateTriangleFrontFace()))
                 continue;
+            if (candidate.alphaMode == ALPHA_MODE_BLEND)
+            {
+                uint coverageHash = meshletHash(reflectionQuery.CandidateInstanceID() * 0x9e3779b9u ^
+                                                reflectionQuery.CandidatePrimitiveIndex() * 0x85ebca6bu ^
+                                                uint(input.position.x) * 0xc2b2ae35u ^ uint(input.position.y));
+                float coverageSample = float(coverageHash & 0x00ffffffu) / float(0x01000000u);
+                if (candidate.opacity <= coverageSample)
+                    continue;
+            }
             reflectionQuery.CommitNonOpaqueTriangleHit();
         }
 
@@ -745,6 +804,8 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                         reflectedShadowQuery.CandidateTriangleBarycentrics());
                     if (!candidate.accepted)
                         continue;
+                    if (!candidate.doubleSided && !reflectedShadowQuery.CandidateTriangleFrontFace())
+                        continue;
                     if (candidate.alphaMode == ALPHA_MODE_BLEND)
                     {
                         hitVisibility *= 1.0 - candidate.opacity;
@@ -766,9 +827,6 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                                    (1.0 - hitSurface.metallic) * (1.0 - hitSurface.transmission) *
                                    (1.0 - hitSurface.subsurface) * hitSurface.occlusion;
             localReflection += hitSurface.emissive;
-            if (hitMaterial.materialFlags.y == ALPHA_MODE_BLEND)
-                localReflection = lerp(environmentReflection, localReflection, hitSurface.alpha);
-
             // A single ray can only represent a sharp local reflection. Fade it into the
             // prefiltered environment once the material lobe is too wide for that sample.
             float localReflectionWeight = 1.0 - smoothstep(0.12, 0.58, environmentRoughness);
@@ -826,7 +884,8 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                 CandidateMaterial candidate = resolveCandidateMaterial(transmissionQuery.CandidateInstanceID(),
                                                                         transmissionQuery.CandidatePrimitiveIndex(),
                                                                         transmissionQuery.CandidateTriangleBarycentrics());
-                if (candidate.accepted && candidate.alphaMode != ALPHA_MODE_BLEND)
+                if (transmissionQuery.CandidateInstanceID() == input.instanceIndex && candidate.accepted &&
+                    candidate.alphaMode != ALPHA_MODE_BLEND)
                     transmissionQuery.CommitNonOpaqueTriangleHit();
             }
             if (transmissionQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
@@ -878,6 +937,6 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
         color = max(color, 0.0);
         color = color / (1.0 + color);
     }
-    output.color = float4(color, material.materialFlags.y == ALPHA_MODE_BLEND ? surface.alpha : 1.0);
+    output.color = float4(color, 1.0);
     return output;
 }

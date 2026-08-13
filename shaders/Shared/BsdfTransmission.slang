@@ -88,3 +88,46 @@ bool sampleRoughTransmissionDirection(SurfaceData surface, float3 viewDirection,
                                surface.shadingNormal * localHalfway.z);
     return refractDielectric(-viewDirection, halfway, etaI / etaT, direction);
 }
+
+bool roughTransmissionHalfwayIsTir(float3 viewDirection, float3 halfway, float etaI, float etaT)
+{
+    float3 ignoredDirection;
+    return !refractDielectric(-viewDirection, halfway, etaI / etaT, ignoredDirection);
+}
+
+float3 evaluateRoughTransmissionTirReflection(SurfaceData surface, float3 viewDirection,
+                                               float3 lightDirection, float etaI, float etaT)
+{
+    float nDotV = saturate(dot(surface.shadingNormal, viewDirection));
+    float nDotL = saturate(dot(surface.shadingNormal, lightDirection));
+    float3 halfwayVector = viewDirection + lightDirection;
+    if (surface.transmission <= 0.0 || nDotV <= 0.0 || nDotL <= 0.0 ||
+        dot(halfwayVector, halfwayVector) <= 1e-10)
+        return float3(0.0);
+    float3 halfway = normalize(halfwayVector);
+    if (!roughTransmissionHalfwayIsTir(viewDirection, halfway, etaI, etaT))
+        return float3(0.0);
+    float distribution = distributionGgx(surface.shadingNormal, halfway, surface.roughness);
+    float geometry = ggxG2(nDotV, nDotL, ggxAlpha(surface.roughness));
+    float interfaceRatio = (etaT - etaI) / max(etaT + etaI, 1e-6);
+    float approximateFresnel = fresnelSchlick(saturate(dot(viewDirection, halfway)),
+                                               float3(interfaceRatio * interfaceRatio)).x;
+    float missingTirReflection = surface.transmission * (1.0 - surface.metallic) *
+                                 (1.0 - approximateFresnel);
+    return missingTirReflection * distribution * geometry /
+           max(4.0 * nDotV * nDotL, 1e-6);
+}
+
+float roughTransmissionTirReflectionPdf(SurfaceData surface, float3 viewDirection,
+                                         float3 lightDirection, float etaI, float etaT)
+{
+    float3 halfwayVector = viewDirection + lightDirection;
+    if (surface.transmission <= 0.0 || dot(surface.shadingNormal, viewDirection) <= 0.0 ||
+        dot(surface.shadingNormal, lightDirection) <= 0.0 || dot(halfwayVector, halfwayVector) <= 1e-10)
+        return 0.0;
+    float3 halfway = normalize(halfwayVector);
+    if (!roughTransmissionHalfwayIsTir(viewDirection, halfway, etaI, etaT))
+        return 0.0;
+    return ggxVisibleNormalPdf(surface.shadingNormal, viewDirection, halfway, surface.roughness) /
+           max(4.0 * abs(dot(viewDirection, halfway)), 1e-6);
+}

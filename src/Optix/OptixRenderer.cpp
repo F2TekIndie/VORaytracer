@@ -137,8 +137,11 @@ struct alignas(16) GpuEmissiveTriangle
     Vec4 position2;
     Vec4 emissionAndArea;
     Vec4 cdfAndPower;
+    Vec4 uv0Uv1;
+    Vec4 uv2AndPadding;
+    std::array<std::uint32_t, 4> materialData;
 };
-static_assert(sizeof(GpuEmissiveTriangle) == 80);
+static_assert(sizeof(GpuEmissiveTriangle) == 128);
 
 struct alignas(16) GpuOptixInstance
 {
@@ -192,7 +195,6 @@ struct LaunchParameters
     float environmentIntensity;
     float environmentRotation;
     std::uint32_t environmentVisible;
-    std::uint32_t environmentMipCount;
     float environmentImportanceTotal;
     float emissiveLightPower;
     std::uint32_t importancePadding[2];
@@ -926,6 +928,9 @@ bool OptixRenderer::buildSceneAcceleration()
                 const Vec3 position0 = worldPoint(positions[instance.geometry[0] + indices[triangleBase + 0]]);
                 const Vec3 position1 = worldPoint(positions[instance.geometry[0] + indices[triangleBase + 1]]);
                 const Vec3 position2 = worldPoint(positions[instance.geometry[0] + indices[triangleBase + 2]]);
+                const Vec2 uv0 = uvs[instance.geometry[0] + indices[triangleBase + 0]];
+                const Vec2 uv1 = uvs[instance.geometry[0] + indices[triangleBase + 1]];
+                const Vec2 uv2 = uvs[instance.geometry[0] + indices[triangleBase + 2]];
                 const float area = 0.5f * length(cross(position1 - position0, position2 - position0));
                 const float power = luminance * area;
                 if (power <= 1.0e-10f)
@@ -936,7 +941,13 @@ bool OptixRenderer::buildSceneAcceleration()
                                              {position1.x, position1.y, position1.z, 1.0f},
                                              {position2.x, position2.y, position2.z, 1.0f},
                                              {material.emissive.x, material.emissive.y, material.emissive.z, area},
-                                             {previousPower, emissiveTotalPower, power, 0.0f}});
+                                             {previousPower, emissiveTotalPower, power, 0.0f},
+                                             {uv0.x, uv0.y, uv1.x, uv1.y},
+                                             {uv2.x, uv2.y, 0.0f, 0.0f},
+                                             {material.emissiveTexture >= 0
+                                                  ? static_cast<std::uint32_t>(material.emissiveTexture)
+                                                  : kInvalidTextureId,
+                                              material.doubleSided ? 1u : 0u, materialIndex, 0u}});
             }
         }
         if (emissiveTriangles.empty())
@@ -1402,7 +1413,6 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.environmentIntensity = environment.intensity;
         parameters.environmentRotation = environment.rotationRadians;
         parameters.environmentVisible = environment.visibleBackground ? 1u : 0u;
-        parameters.environmentMipCount = environment.hasHdr() ? environment.hdrMipCount : 0u;
         parameters.environmentImportanceTotal = environment.hdrImportanceTotal;
         parameters.emissiveLightPower = parameters.materialOverrideId == kInvalidMaterialId
                                             ? emissiveLightPower_

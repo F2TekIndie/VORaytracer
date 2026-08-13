@@ -10,11 +10,6 @@ float3 subsurfaceDiffusionProfile(SurfaceData surface, float distance)
     return max(surface.subsurfaceColor, 0.0) * profile;
 }
 
-float3 subsurfaceRandomWalkTransmittance(float3 color, float radius, float distance)
-{
-    return max(color, 0.0) * exp(-max(distance, 0.0) / max(radius, 1e-4));
-}
-
 float3 evaluateSubsurfaceApproximation(SurfaceData surface, float3 viewDirection, float3 lightDirection,
                                        float thickness)
 {

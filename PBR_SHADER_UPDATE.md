@@ -235,7 +235,6 @@ shaders/Shared/
 ├── BsdfTypes.slang
 ├── BsdfDiffuse.slang
 ├── BsdfConductor.slang
-├── BsdfDielectric.slang
 ├── BsdfClearcoat.slang
 ├── BsdfTransmission.slang
 ├── BsdfAnisotropic.slang
@@ -339,7 +338,7 @@ Abnahmekriterium: Eine lackierte dielektrische und eine lackierte metallische Re
 
 ### Mediumzustand
 
-OptiX erhält einen expliziten Medium- beziehungsweise IOR-Stack für verschachtelte transparente Objekte. Mindestens Luft und ein geschlossenes Objekt müssen korrekt unterstützt werden.
+OptiX erhält einen expliziten Medium- beziehungsweise IOR-Stack für verschachtelte transparente Objekte. Mindestens Luft und ein geschlossenes Objekt müssen korrekt unterstützt werden. Mikrofacettenbedingte Totalreflexion wird als Reflexionsbeitrag mit zur Sampling-Verteilung passender PDF behandelt.
 
 ### Absorption
 
@@ -415,7 +414,7 @@ Die Implementierung erfolgt in zwei Stufen:
 
 ### Stufe B: OptiX
 
-- zunächst Random-Walk-Subsurface oder ein begrenztes Diffusionsmodell
+- begrenzter analoger Random Walk mit freier Weglänge, Streufarbe und Russian Roulette
 - Eintritt, interner Transport und Austritt mit konsistentem Durchsatz
 - robustes Ray Origin Offset und Selbstschnitt-Vermeidung
 - Russian Roulette für lange interne Wege

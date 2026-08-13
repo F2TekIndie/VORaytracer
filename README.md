@@ -28,7 +28,7 @@ Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation 
 - bindless Vulkan-Materialtexturen und CUDA-Mipmapped-Texture-Objects für Base Color, Metallic-Roughness, Normal, AO, Emissive und spezialisierte Loben
 - Vulkan-GGX-Auswertung mit Ray-Query-Schatten, Reflexionen sowie begrenzten Echtzeitapproximationen für Transmission, Subsurface und Volumen
 - Richtungslicht, prozeduraler Himmel oder HDR-Environment als globale Beleuchtung
-- stabiles roughnessabhängiges HDR-IBL über eine vollständige Mip-Pyramide
+- roughnessabhängiges HDR-IBL mit Cosine-Irradiance- und GGX-Importance-Faltung im Vulkan-Shader
 - optionaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Ein- und Ausgabe
 - CUDA/Vulkan-External-Memory- und Semaphore-Interop ohne Bildkopie zur CPU
 - progressiver OptiX-Pathtracer mit GGX-VNDF, NEE/MIS für HDR, Richtungs- und Mesh-Lichter, Medium-Stack, Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
@@ -103,11 +103,11 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 
 Vulkan ist kein progressiver Pathtracer. Jeder Frame wird direkt über Task-/Mesh-Shader, PBR-Fragmentauswertung und optionale Inline Ray Queries erzeugt. Deshalb gelten `Samples per frame` und `Max bounces` nicht für diesen Pfad. Der optionale Denoiser wird ausschließlich nach dem Vulkan-Rendering ausgeführt.
 
-Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Roughness wählt den passenden Mip-Level der Environment-Pyramide; das HDR verändert den Materialparameter selbst nicht. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Nur der Denoiser-Pfad verwendet vorher ein lineares `RGBA16F`-Offscreenbild und `HALF4`-Interop.
+Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Der Fragmentshader faltet das Environment über deterministische Cosine- beziehungsweise GGX-Importance-Samples; Roughness verändert dabei die GGX-Verteilung, nicht den Materialparameter. Alpha-Blend-Materialien verwenden sortierunabhängige dithered Coverage mit regulärem Depth-Write. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Nur der Denoiser-Pfad verwendet vorher ein lineares `RGBA16F`-Offscreenbild und `HALF4`-Interop.
 
 ### OptiX
 
-OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
+OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Ray-Cone-Footprints wählen die Mip-Level der CUDA-Texturen. Reflexions- und indirekte Transportloben werden entsprechend ihrer UI-Schalter mit jeweils konsistenter Evaluation und PDF gesampelt. Subsurface verwendet einen instanzgebundenen, begrenzten Random Walk. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
 Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enthält die Szeneninstanzen und ihre Transformationen.
 
 ## Umgebungsvariablen für Smoke-Tests
@@ -118,6 +118,8 @@ Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enth�
 | `VOR_DENOISER=1` | aktiviert den Vulkan-Postrender-Denoiser |
 | `VOR_SCENE=<absoluter Pfad>` | lädt beim Start ein Modell |
 | `VOR_MESHLET_DEBUG=1` | aktiviert die Meshlet-Debugfarben |
+| `VOR_REFLECTIONS=0` | deaktiviert reflektierende Sekundärpfade für automatisierte Tests |
+| `VOR_INDIRECT_LIGHTING=0` | deaktiviert diffuse/transmissive Sekundärpfade für automatisierte Tests |
 | `VOR_DEFAULT_PLASTIC=1` | startet mit der nichtdestruktiven Default-Plastic-Materialüberschreibung |
 | `VOR_GLOBAL_LIGHT=sky` | startet mit prozeduralem Himmel |
 | `VOR_GLOBAL_LIGHT=hdr` | startet im HDR-Modus |

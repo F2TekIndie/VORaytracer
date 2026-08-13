@@ -308,6 +308,10 @@ bool Application::initialize()
     if (const char* requestedMeshletDebug = std::getenv("VOR_MESHLET_DEBUG");
         requestedMeshletDebug && std::strcmp(requestedMeshletDebug, "1") == 0)
         settings_.showMeshlets = true;
+    if (const char* requestedReflections = std::getenv("VOR_REFLECTIONS"); requestedReflections)
+        settings_.rayTracedReflections = std::strcmp(requestedReflections, "0") != 0;
+    if (const char* requestedIndirect = std::getenv("VOR_INDIRECT_LIGHTING"); requestedIndirect)
+        settings_.indirectLighting = std::strcmp(requestedIndirect, "0") != 0;
     if (const char* requestedDebugView = std::getenv("VOR_DEBUG_VIEW"); requestedDebugView && *requestedDebugView)
     {
         const unsigned long value = std::strtoul(requestedDebugView, nullptr, 10);

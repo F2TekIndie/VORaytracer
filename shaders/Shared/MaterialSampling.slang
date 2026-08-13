@@ -63,6 +63,10 @@ SurfaceData applyBaseMaterialTextures(
         surface.shadingNormal = normalize(surface.tangent * tangentNormal.x +
                                           surface.bitangent * tangentNormal.y +
                                           surface.shadingNormal * tangentNormal.z);
+        float geometricAlignment = dot(surface.shadingNormal, surface.geometricNormal);
+        if (geometricAlignment <= 1e-4)
+            surface.shadingNormal = normalize(surface.shadingNormal +
+                                              surface.geometricNormal * (1e-4 - geometricAlignment));
         float3 mappedTangent = originalTangent - surface.shadingNormal *
                                                    dot(surface.shadingNormal, originalTangent);
         if (dot(mappedTangent, mappedTangent) <= 1e-10)
@@ -80,6 +84,10 @@ SurfaceData applyBaseMaterialTextures(
         surface.clearcoatNormal = normalize(originalTangent * tangentNormal.x +
                                             originalBitangent * tangentNormal.y +
                                             originalNormal * tangentNormal.z);
+        float clearcoatAlignment = dot(surface.clearcoatNormal, surface.geometricNormal);
+        if (clearcoatAlignment <= 1e-4)
+            surface.clearcoatNormal = normalize(surface.clearcoatNormal +
+                                                surface.geometricNormal * (1e-4 - clearcoatAlignment));
     }
     if (material.textureIndices2.w != INVALID_TEXTURE_ID)
     {

@@ -34,6 +34,9 @@ struct GpuEmissiveTriangle
     float4 position2;
     float4 emissionAndArea;
     float4 cdfAndPower;
+    float4 uv0Uv1;
+    float4 uv2AndPadding;
+    uint4 materialData;
 };
 
 struct GpuOptixInstance
@@ -86,7 +89,6 @@ struct LaunchParameters
     float environmentIntensity;
     float environmentRotation;
     uint environmentVisible;
-    uint environmentMipCount;
     float environmentImportanceTotal;
     float emissiveLightPower;
     uint2 importancePadding;
@@ -101,36 +103,44 @@ struct LaunchParameters
     float4 skyGround;
 };
 
-float4 sampleMaterialTexture(LaunchParameters parameters, uint textureId, float2 uv, float4 fallback)
+float4 sampleMaterialTexture(LaunchParameters parameters, uint textureId, float2 uv, float4 fallback,
+                             float textureLod)
 {
     return textureId == INVALID_TEXTURE_ID
                ? fallback
                : parameters.materialTextureTable.textures[textureId].SampleLevel(
-                     parameters.materialTextureTable.sampler, uv, 0.0);
+                     parameters.materialTextureTable.sampler, uv, max(textureLod, 0.0));
 }
 
 SurfaceData resolveMaterialSurface(LaunchParameters parameters, GpuMaterial material, float3 position,
                                    float3 geometricNormal, float3 shadingNormal,
-                                   float4 tangentAndSign, float2 uv)
+                                   float4 tangentAndSign, float2 uv, float textureLod)
 {
     SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign, uv);
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
-    samples.baseColor = sampleMaterialTexture(parameters, material.textureIndices0.x, uv, samples.baseColor);
+    samples.baseColor = sampleMaterialTexture(parameters, material.textureIndices0.x, uv, samples.baseColor,
+                                               textureLod);
     samples.metallicRoughness = sampleMaterialTexture(parameters, material.textureIndices0.y, uv,
-                                                      samples.metallicRoughness);
-    samples.normal = sampleMaterialTexture(parameters, material.textureIndices0.z, uv, samples.normal);
-    samples.emissive = sampleMaterialTexture(parameters, material.textureIndices0.w, uv, samples.emissive);
-    samples.occlusion = sampleMaterialTexture(parameters, material.textureIndices1.x, uv, samples.occlusion);
-    samples.transmission = sampleMaterialTexture(parameters, material.textureIndices1.y, uv, samples.transmission);
-    samples.clearcoat = sampleMaterialTexture(parameters, material.textureIndices1.z, uv, samples.clearcoat);
+                                                      samples.metallicRoughness, textureLod);
+    samples.normal = sampleMaterialTexture(parameters, material.textureIndices0.z, uv, samples.normal, textureLod);
+    samples.emissive = sampleMaterialTexture(parameters, material.textureIndices0.w, uv, samples.emissive,
+                                              textureLod);
+    samples.occlusion = sampleMaterialTexture(parameters, material.textureIndices1.x, uv, samples.occlusion,
+                                               textureLod);
+    samples.transmission = sampleMaterialTexture(parameters, material.textureIndices1.y, uv, samples.transmission,
+                                                  textureLod);
+    samples.clearcoat = sampleMaterialTexture(parameters, material.textureIndices1.z, uv, samples.clearcoat,
+                                               textureLod);
     samples.clearcoatRoughness = sampleMaterialTexture(parameters, material.textureIndices1.w, uv,
-                                                       samples.clearcoatRoughness);
+                                                       samples.clearcoatRoughness, textureLod);
     samples.clearcoatNormal = sampleMaterialTexture(parameters, material.textureIndices2.x, uv,
-                                                    samples.clearcoatNormal);
-    samples.anisotropy = sampleMaterialTexture(parameters, material.textureIndices2.w, uv, samples.anisotropy);
-    samples.sheenColor = sampleMaterialTexture(parameters, material.textureIndices2.y, uv, samples.sheenColor);
+                                                    samples.clearcoatNormal, textureLod);
+    samples.anisotropy = sampleMaterialTexture(parameters, material.textureIndices2.w, uv, samples.anisotropy,
+                                                textureLod);
+    samples.sheenColor = sampleMaterialTexture(parameters, material.textureIndices2.y, uv, samples.sheenColor,
+                                                textureLod);
     samples.sheenRoughness = sampleMaterialTexture(parameters, material.textureIndices2.z, uv,
-                                                   samples.sheenRoughness);
+                                                   samples.sheenRoughness, textureLod);
     return applyBaseMaterialTextures(material, surface, samples);
 }
 
@@ -141,9 +151,10 @@ struct ResolvedHit
     float3 position;
     float3 geometricNormal;
     uint materialIndex;
+    uint instanceIndex;
 };
 
-ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, RayDesc ray)
+ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, RayDesc ray, float textureLod)
 {
     ResolvedHit result;
     GpuOptixInstance hitInstance = parameters.instances[payload.instanceIndex];
@@ -176,8 +187,9 @@ ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, Ray
                                ? parameters.materialOverrideId
                                : hitInstance.materialIndex;
     result.material = parameters.materials[result.materialIndex];
+    result.instanceIndex = payload.instanceIndex;
     result.surface = resolveMaterialSurface(parameters, result.material, result.position,
-                                            result.geometricNormal, shadingNormal, vertexTangent, uv);
+                                            result.geometricNormal, shadingNormal, vertexTangent, uv, textureLod);
     return result;
 }
 
@@ -278,10 +290,15 @@ float3 traceVisibility(LaunchParameters parameters, RayDesc sourceRay)
         if (shadowPayload.hit == 0)
             return visibility;
 
-        ResolvedHit hit = resolveHit(parameters, shadowPayload, shadowRay);
+        float shadowTextureLod = log2(max(shadowPayload.hitDistance * 0.05, 1.0));
+        ResolvedHit hit = resolveHit(parameters, shadowPayload, shadowRay, shadowTextureLod);
         uint alphaMode = hit.material.materialFlags.y;
-        bool passThrough = alphaMode == ALPHA_MODE_MASK &&
-                           hit.surface.alpha < hit.material.surfaceParameters.w;
+        bool frontFacing = dot(hit.geometricNormal, -shadowRay.Direction) > 0.0;
+        bool needsBackFaceForTransport = hit.surface.transmission > 0.0 || hit.surface.volumeDensity > 0.0;
+        bool passThrough = !frontFacing && (hit.surface.flags & MATERIAL_FLAG_DOUBLE_SIDED) == 0u &&
+                           !needsBackFaceForTransport;
+        passThrough = passThrough || (alphaMode == ALPHA_MODE_MASK &&
+                                      hit.surface.alpha < hit.material.surfaceParameters.w);
         if (alphaMode == ALPHA_MODE_BLEND)
         {
             visibility *= 1.0 - hit.surface.alpha;
@@ -318,7 +335,9 @@ float emissiveMeshHitPdf(LaunchParameters parameters, ResolvedHit hit, float3 ra
     if (parameters.emissiveLightPower <= 0.0 || parameters.materialOverrideId != 0xffffffffu)
         return 0.0;
     float emissionPower = luminance(max(hit.material.emissiveAndMetallic.xyz, 0.0));
-    float cosineAtLight = abs(dot(hit.geometricNormal, -rayDirection));
+    float signedCosineAtLight = dot(hit.geometricNormal, -rayDirection);
+    float cosineAtLight = (hit.surface.flags & MATERIAL_FLAG_DOUBLE_SIDED) != 0u
+                              ? abs(signedCosineAtLight) : max(signedCosineAtLight, 0.0);
     if (emissionPower <= 0.0 || cosineAtLight <= 1e-6)
         return 0.0;
     float solidAnglePdf = emissionPower * hitDistance * hitDistance /
@@ -538,11 +557,20 @@ MeshLightSample sampleEmissiveMesh(LaunchParameters parameters, float3 position,
     sample.direction = toLight / sample.distance;
     float3 lightNormal = normalize(cross(triangle.position1.xyz - triangle.position0.xyz,
                                          triangle.position2.xyz - triangle.position0.xyz));
-    float cosineAtLight = abs(dot(lightNormal, -sample.direction));
+    float signedCosineAtLight = dot(lightNormal, -sample.direction);
+    bool doubleSided = triangle.materialData.y != 0u;
+    float cosineAtLight = doubleSided ? abs(signedCosineAtLight) : max(signedCosineAtLight, 0.0);
+    if (cosineAtLight <= 1e-6)
+        return sample;
     float selectionPdf = triangle.cdfAndPower.z / max(parameters.emissiveLightPower, 1e-8);
     float areaPdf = selectionPdf / max(triangle.emissionAndArea.w, 1e-8);
     sample.pdf = areaPdf * distanceSquared / max(cosineAtLight, 1e-6);
-    sample.radiance = triangle.emissionAndArea.xyz;
+    float2 uv = triangle.uv0Uv1.xy * barycentric0 + triangle.uv0Uv1.zw * barycentric1 +
+                triangle.uv2AndPadding.xy * barycentric2;
+    float textureLod = log2(max(sample.distance * 0.05, 1.0));
+    float3 emissiveTexture = sampleMaterialTexture(parameters, triangle.materialData.x, uv,
+                                                    float4(1.0), textureLod).xyz;
+    sample.radiance = triangle.emissionAndArea.xyz * max(emissiveTexture, 0.0);
     return sample;
 }
 
@@ -604,6 +632,10 @@ void RayGen(LaunchParameters parameters)
         bool subsurfaceActive = false;
         float3 subsurfaceWalkColor = float3(1.0);
         float subsurfaceWalkRadius = 1.0;
+        uint subsurfaceInstanceIndex = 0xffffffffu;
+        uint subsurfaceWalkSteps = 0u;
+        float rayConeWidth = 0.0;
+        float rayConeSpread = 2.0 * tanHalfFov / float(max(parameters.outputSize.y, 1u));
         mediumIors[0] = 1.0;
         mediumAbsorption[0] = float3(0.0);
         mediumVolumeAbsorption[0] = float3(0.0);
@@ -631,7 +663,9 @@ void RayGen(LaunchParameters parameters)
                 if (payload.hit == 0)
                     break;
                 accumulatedDistance += payload.hitDistance;
-                resolvedHit = resolveHit(parameters, payload, traversalRay);
+                float textureFootprint = rayConeWidth + accumulatedDistance * rayConeSpread;
+                float textureLod = log2(max(textureFootprint * 1024.0, 1.0));
+                resolvedHit = resolveHit(parameters, payload, traversalRay, textureLod);
                 float coverageSample = random01(seed ^ ((bounce + 1u) * 0x8da6b343u) ^
                                                 ((transparencyLayer + 1u) * 0xd8163841u));
                 if (!skipCameraPathHit(resolvedHit, traversalRay.Direction, coverageSample))
@@ -651,6 +685,54 @@ void RayGen(LaunchParameters parameters)
             if (!resolvedSurface)
                 payload.hit = 0;
             float transportDistance = payload.hit != 0 ? payload.hitDistance : ray.TMax;
+            if (subsurfaceActive)
+            {
+                if (payload.hit != 0 && resolvedHit.instanceIndex != subsurfaceInstanceIndex)
+                    break;
+                float extinction = 1.0 / max(subsurfaceWalkRadius, 1e-4);
+                float freeFlightRandom = random01(seed ^ ((bounce + 1u) * 0xb5297a4du) ^
+                                                  ((subsurfaceWalkSteps + 1u) * 0x68e31da4u));
+                float freeFlightDistance = -log(max(1.0 - freeFlightRandom, 1e-7)) / extinction;
+                if (freeFlightDistance < transportDistance)
+                {
+                    float3 scatterPosition = ray.Origin + ray.Direction * freeFlightDistance;
+                    throughput *= saturate(subsurfaceWalkColor);
+                    ++subsurfaceWalkSteps;
+                    if (subsurfaceWalkSteps >= 3u)
+                    {
+                        float survival = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.2, 0.9);
+                        if (random01(seed ^ ((bounce + 1u) * 0x1b56c4e9u)) > survival)
+                            break;
+                        throughput /= survival;
+                    }
+                    float3 scatterDirection = sampleHenyeyGreenstein(
+                        ray.Direction, 0.0,
+                        float2(random01(seed ^ ((bounce + 1u) * 0x7f4a7c15u)),
+                               random01(seed ^ ((bounce + 1u) * 0x94d049bbu))));
+                    rayConeWidth += freeFlightDistance * rayConeSpread;
+                    rayConeSpread = max(rayConeSpread, 0.25);
+                    previousBsdfPdf = 1.0 / (4.0 * PI);
+                    previousBsdfDelta = true;
+                    ray.Origin = scatterPosition + scatterDirection * 0.0001;
+                    ray.Direction = scatterDirection;
+                    ray.TMin = 0.00005;
+                    ray.TMax = 10000.0;
+                    continue;
+                }
+                subsurfaceActive = false;
+                previousBsdfDelta = true;
+                if (payload.hit != 0)
+                {
+                    float exitScale = max(max(abs(resolvedHit.position.x), abs(resolvedHit.position.y)),
+                                          abs(resolvedHit.position.z));
+                    float exitBias = max(0.0001, exitScale * 0.00001);
+                    rayConeWidth += transportDistance * rayConeSpread;
+                    ray.Origin = resolvedHit.position + ray.Direction * exitBias;
+                    ray.TMin = exitBias * 0.5;
+                    ray.TMax = 10000.0;
+                    continue;
+                }
+            }
             if (mediumDepth > 1)
             {
                 float3 sigmaA = mediumAbsorption[mediumDepth - 1] +
@@ -735,6 +817,8 @@ void RayGen(LaunchParameters parameters)
                         previousBsdfPdf = henyeyGreenstein(dot(ray.Direction, phaseDirection),
                                                            mediumAnisotropy[mediumDepth - 1]);
                         previousBsdfDelta = false;
+                        rayConeWidth += freeFlightDistance * rayConeSpread;
+                        rayConeSpread = max(rayConeSpread, 0.25);
                         ray.Origin = volumePosition + phaseDirection * 0.0001;
                         ray.Direction = phaseDirection;
                         ray.TMin = 0.00005;
@@ -746,13 +830,6 @@ void RayGen(LaunchParameters parameters)
                         transmittance /= max(exp(-majorant * transportDistance), 1e-20);
                     throughput *= transmittance;
                 }
-            }
-            if (subsurfaceActive)
-            {
-                throughput *= subsurfaceRandomWalkTransmittance(subsurfaceWalkColor,
-                                                                 subsurfaceWalkRadius,
-                                                                 transportDistance);
-                subsurfaceActive = false;
             }
             if (payload.hit == 0)
             {
@@ -847,22 +924,23 @@ void RayGen(LaunchParameters parameters)
                 sampledLightPdf = max(environmentSelectionProbability, 1e-8);
 
             float3 visibility = float3(1.0);
+            float signedNDotLight = dot(normal, sampledLightDirection);
             if (parameters.rayTracedShadows != 0 && sampledLightPdf > 0.0)
             {
                 RayDesc shadowRay;
-                shadowRay.Origin = worldPosition + normal * rayBias;
+                shadowRay.Origin = worldPosition + (signedNDotLight >= 0.0 ? normal : -normal) * rayBias;
                 shadowRay.Direction = sampledLightDirection;
                 shadowRay.TMin = rayBias * 0.5;
                 shadowRay.TMax = max(sampledLightDistance - rayBias, rayBias);
 
                 visibility = traceVisibility(parameters, shadowRay);
             }
-            float nDotLight = saturate(dot(normal, sampledLightDirection));
+            float nDotLight = abs(signedNDotLight);
             if (max(visibility.x, max(visibility.y, visibility.z)) > 0.0 &&
                 sampledLightPdf > 0.0 && nDotLight > 0.0)
             {
-                float3 bsdfValue = evaluateBsdfWithIors(surface, viewDirection, sampledLightDirection,
-                                                        etaI, etaT);
+                float3 bsdfValue = evaluateBsdfWithSubsurfaceMix(surface, viewDirection,
+                                                                  sampledLightDirection, etaI, etaT);
                 float bsdfPdf = evaluateBsdfPdfWithIors(surface, viewDirection, sampledLightDirection,
                                                         etaI, etaT);
                 float misWeight = sampledLightDelta ? 1.0 : misPowerHeuristic(sampledLightPdf, bsdfPdf);
@@ -884,8 +962,12 @@ void RayGen(LaunchParameters parameters)
                 subsurfaceWalkColor = surface.subsurfaceColor;
                 subsurfaceWalkRadius = surface.subsurfaceRadius;
                 subsurfaceActive = true;
+                subsurfaceInstanceIndex = resolvedHit.instanceIndex;
+                subsurfaceWalkSteps = 0u;
                 previousBsdfPdf = abs(dot(normal, inwardDirection)) / PI;
-                previousBsdfDelta = false;
+                previousBsdfDelta = true;
+                rayConeWidth += payload.hitDistance * rayConeSpread;
+                rayConeSpread = max(rayConeSpread, 0.25);
                 ray.Origin = worldPosition - normal * rayBias;
                 ray.Direction = inwardDirection;
                 ray.TMin = rayBias * 0.5;
@@ -893,20 +975,25 @@ void RayGen(LaunchParameters parameters)
                 continue;
             }
 
-            float lobeRandom = parameters.rayTracedReflections != 0
-                                   ? random01(seed ^ ((bounce + 1) * 0x51ed270bu))
-                                   : 0.0;
-            BsdfSample bsdfSample = sampleBsdfWithIors(
+            float lobeRandom = random01(seed ^ ((bounce + 1) * 0x51ed270bu));
+            bool enableDiffuseTransport = parameters.indirectLighting != 0;
+            bool enableReflectionTransport = parameters.rayTracedReflections != 0;
+            bool enableTransmissionTransport = parameters.indirectLighting != 0;
+            BsdfSample bsdfSample = sampleBsdfWithIorsControlled(
                 surface, viewDirection,
                 float2(random01(seed ^ ((bounce + 1) * 0x68bc21ebu)),
                        random01(seed ^ ((bounce + 1) * 0x02e5be93u))),
-                lobeRandom, etaI, etaT);
+                lobeRandom, etaI, etaT, enableDiffuseTransport, enableReflectionTransport,
+                enableTransmissionTransport);
             if (bsdfSample.pdf <= 0.0 || max(bsdfSample.weight.x, max(bsdfSample.weight.y,
                                                                       bsdfSample.weight.z)) <= 0.0)
                 break;
             throughput *= bsdfSample.weight;
             previousBsdfPdf = bsdfSample.pdf;
             previousBsdfDelta = bsdfSample.delta;
+            rayConeWidth += payload.hitDistance * rayConeSpread;
+            rayConeSpread = max(rayConeSpread, bsdfSample.transmission ? surface.roughness * 0.15
+                                                                       : surface.roughness * 0.25);
             if (bsdfSample.transmission)
             {
                 if (enteringSurface && mediumDepth < 8)
