@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Core/Material.h"
 #include "Core/Math.h"
 
 #include <algorithm>
@@ -60,6 +61,17 @@ struct TextureReference
 {
     std::filesystem::path path;
     bool srgb{};
+    std::uint32_t width{};
+    std::uint32_t height{};
+    std::uint32_t mipCount{};
+    std::vector<std::uint32_t> mipOffsets;
+    std::vector<std::uint8_t> rgba8Pixels;
+
+    [[nodiscard]] bool valid() const
+    {
+        return width > 0 && height > 0 && mipCount > 0 && mipOffsets.size() == mipCount &&
+               !rgba8Pixels.empty();
+    }
 };
 
 struct Material
@@ -72,6 +84,23 @@ struct Material
     float normalScale{1.0f};
     float occlusionStrength{1.0f};
     float alphaCutoff{0.5f};
+    float transmission{};
+    float indexOfRefraction{1.5f};
+    float clearcoat{};
+    float clearcoatRoughness{};
+    float anisotropy{};
+    float anisotropyRotation{};
+    Vec3 sheenColor{};
+    float sheenRoughness{};
+    Vec3 absorptionColor{1.0f, 1.0f, 1.0f};
+    float absorptionDistance{1.0e30f};
+    float subsurface{};
+    Vec3 subsurfaceColor{1.0f, 1.0f, 1.0f};
+    float subsurfaceRadius{1.0f};
+    Vec3 volumeAbsorption{};
+    float volumeDensity{};
+    Vec3 volumeScattering{};
+    float volumeAnisotropy{};
     AlphaMode alphaMode{AlphaMode::Opaque};
     bool doubleSided{};
     std::int32_t baseColorTexture{-1};
@@ -79,6 +108,16 @@ struct Material
     std::int32_t metallicRoughnessTexture{-1};
     std::int32_t occlusionTexture{-1};
     std::int32_t emissiveTexture{-1};
+    std::int32_t transmissionTexture{-1};
+    std::int32_t clearcoatTexture{-1};
+    std::int32_t clearcoatRoughnessTexture{-1};
+    std::int32_t clearcoatNormalTexture{-1};
+    std::int32_t sheenColorTexture{-1};
+    std::int32_t sheenRoughnessTexture{-1};
+    std::int32_t anisotropyTexture{-1};
+
+    [[nodiscard]] MaterialFlags flags() const;
+    [[nodiscard]] GpuMaterial toGpu() const;
 };
 
 struct Instance
@@ -122,6 +161,9 @@ struct Environment
     GlobalLightMode mode{GlobalLightMode::Directional};
     std::filesystem::path hdrPath;
     std::vector<Vec4> hdrPixels;
+    std::vector<float> hdrConditionalCdf;
+    std::vector<float> hdrMarginalCdf;
+    float hdrImportanceTotal{};
     std::uint32_t hdrWidth{};
     std::uint32_t hdrHeight{};
     std::uint32_t hdrMipCount{};

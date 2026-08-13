@@ -10,6 +10,6 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="$(SolutionDir)config\Common.props" />
   <ItemGroup><ClCompile Include="$(SolutionDir)src\Core\Log.cpp" /><ClCompile Include="$(SolutionDir)src\Core\Scene.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="$(SolutionDir)src\Core\Log.h" /><ClInclude Include="$(SolutionDir)src\Core\Math.h" /><ClInclude Include="$(SolutionDir)src\Core\Renderer.h" /><ClInclude Include="$(SolutionDir)src\Core\Scene.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="$(SolutionDir)src\Core\Log.h" /><ClInclude Include="$(SolutionDir)src\Core\Material.h" /><ClInclude Include="$(SolutionDir)src\Core\Math.h" /><ClInclude Include="$(SolutionDir)src\Core\Renderer.h" /><ClInclude Include="$(SolutionDir)src\Core\Scene.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

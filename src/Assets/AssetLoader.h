@@ -27,6 +27,7 @@ public:
     AssetLoadResult load(const std::filesystem::path& path, AssetLoadOptions options = {}) const;
     bool loadHdrEnvironment(const std::filesystem::path& path, Environment& environment, std::string& error) const;
     Scene createProceduralCube(AssetLoadOptions options = {}) const;
+    Scene createPbrMaterialComparisonScene(AssetLoadOptions options = {}) const;
     static std::uint32_t ensureDefaultPlasticMaterial(Scene& scene);
     static void setDefaultPlasticOverride(Scene& scene, bool enabled);
 

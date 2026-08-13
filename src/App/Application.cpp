@@ -186,6 +186,11 @@ int Application::run()
         return 1;
     }
 
+    std::uint64_t testFrameLimit = 0;
+    if (const char* testFrames = std::getenv("VOR_TEST_FRAMES"); testFrames && *testFrames)
+        testFrameLimit = std::strtoull(testFrames, nullptr, 10);
+    std::uint64_t renderedFrames = 0;
+    bool renderLoopSucceeded = true;
     while (!glfwWindowShouldClose(window_))
     {
         glfwPollEvents();
@@ -225,8 +230,12 @@ int Application::run()
 
         if (settings_.backend == BackendKind::Optix && optixRenderer_.available())
         {
-            if (optixRenderer_.render(scene_.camera, settings_))
-                vulkanRenderer_.setGpuInteropFrameReady(true);
+            if (!optixRenderer_.render(scene_.camera, settings_))
+            {
+                renderLoopSucceeded = false;
+                break;
+            }
+            vulkanRenderer_.setGpuInteropFrameReady(true);
         }
         else if (settings_.backend == BackendKind::VulkanHybrid && settings_.denoiser &&
                  optixRenderer_.available())
@@ -240,11 +249,23 @@ int Application::run()
         else
             vulkanRenderer_.clearExternalImage();
         if (!vulkanRenderer_.render(scene_.camera, settings_))
+        {
+            renderLoopSucceeded = false;
             break;
+        }
+        ++renderedFrames;
+        if (testFrameLimit > 0 && renderedFrames >= testFrameLimit)
+            glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
 
+    const RendererStats& finalStats = settings_.backend == BackendKind::Optix && optixRenderer_.available()
+                                          ? optixRenderer_.stats() : vulkanRenderer_.stats();
+    log(LogLevel::Info, "Render summary: " + std::to_string(renderedFrames) + " frames, CPU " +
+                            std::to_string(finalStats.frameMilliseconds) + " ms, GPU " +
+                            std::to_string(finalStats.gpuMilliseconds) + " ms, scene " +
+                            std::to_string(finalStats.gpuSceneBytes) + " bytes");
     shutdown();
-    return 0;
+    return renderLoopSucceeded ? 0 : 1;
 }
 
 bool Application::initialize()
@@ -287,6 +308,12 @@ bool Application::initialize()
     if (const char* requestedMeshletDebug = std::getenv("VOR_MESHLET_DEBUG");
         requestedMeshletDebug && std::strcmp(requestedMeshletDebug, "1") == 0)
         settings_.showMeshlets = true;
+    if (const char* requestedDebugView = std::getenv("VOR_DEBUG_VIEW"); requestedDebugView && *requestedDebugView)
+    {
+        const unsigned long value = std::strtoul(requestedDebugView, nullptr, 10);
+        if (value <= static_cast<unsigned long>(DebugView::PathDepth))
+            settings_.debugView = static_cast<DebugView>(value);
+    }
     if (const char* requestedDefaultPlastic = std::getenv("VOR_DEFAULT_PLASTIC");
         requestedDefaultPlastic && std::strcmp(requestedDefaultPlastic, "1") == 0)
         defaultPlasticEnabled_ = true;
@@ -295,7 +322,10 @@ bool Application::initialize()
         .enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
         .addGroundPlane = groundPlaneEnabled_,
     };
-    scene_ = assetLoader_.createProceduralCube(loadOptions);
+    const char* comparisonScene = std::getenv("VOR_PBR_COMPARISON");
+    scene_ = comparisonScene && std::strcmp(comparisonScene, "1") == 0
+                 ? assetLoader_.createPbrMaterialComparisonScene(loadOptions)
+                 : assetLoader_.createProceduralCube(loadOptions);
     frameCameraToScene();
     if (const char* requestedGlobalLight = std::getenv("VOR_GLOBAL_LIGHT"); requestedGlobalLight)
     {
@@ -325,6 +355,88 @@ bool Application::initialize()
         }
         else
             statusMessage_ = "Startup import failed: " + result.error;
+    }
+    if (const char* materialPreset = std::getenv("VOR_MATERIAL_PRESET"); materialPreset)
+    {
+        if (std::strcmp(materialPreset, "clearcoat") == 0)
+        {
+            for (Material& material : scene_.materials)
+            {
+                material.clearcoat = 1.0f;
+                material.clearcoatRoughness = 0.12f;
+            }
+        }
+        else if (std::strcmp(materialPreset, "glass") == 0)
+        {
+            for (Material& material : scene_.materials)
+            {
+                material.baseColor = {0.96f, 0.99f, 1.0f, 1.0f};
+                material.metallic = 0.0f;
+                material.roughness = 0.08f;
+                material.transmission = 1.0f;
+                material.indexOfRefraction = 1.5f;
+                material.absorptionColor = {0.72f, 0.90f, 0.98f};
+                material.absorptionDistance = 2.0f;
+            }
+        }
+        else if (std::strcmp(materialPreset, "anisotropic") == 0)
+        {
+            for (Material& material : scene_.materials)
+            {
+                material.baseColor = {0.55f, 0.18f, 0.06f, 1.0f};
+                material.metallic = 1.0f;
+                material.roughness = 0.32f;
+                material.anisotropy = 0.85f;
+                material.anisotropyRotation = 0.35f;
+            }
+        }
+        else if (std::strcmp(materialPreset, "cloth") == 0)
+        {
+            for (Material& material : scene_.materials)
+            {
+                material.baseColor = {0.18f, 0.025f, 0.035f, 1.0f};
+                material.metallic = 0.0f;
+                material.roughness = 0.72f;
+                material.sheenColor = {0.75f, 0.18f, 0.22f};
+                material.sheenRoughness = 0.58f;
+            }
+        }
+        else if (std::strcmp(materialPreset, "emissive") == 0 && !scene_.materials.empty())
+        {
+            Material& material = scene_.materials.front();
+            material.baseColor = {0.06f, 0.06f, 0.06f, 1.0f};
+            material.emissive = {12.0f, 4.0f, 1.0f};
+            material.metallic = 0.0f;
+            material.roughness = 0.45f;
+        }
+        else if (std::strcmp(materialPreset, "wax") == 0)
+        {
+            for (Material& material : scene_.materials)
+            {
+                material.baseColor = {0.72f, 0.12f, 0.06f, 1.0f};
+                material.metallic = 0.0f;
+                material.roughness = 0.5f;
+                material.subsurface = 0.85f;
+                material.subsurfaceColor = {1.0f, 0.22f, 0.12f};
+                material.subsurfaceRadius = 0.55f;
+            }
+        }
+        else if (std::strcmp(materialPreset, "volume") == 0)
+        {
+            for (Material& material : scene_.materials)
+            {
+                material.baseColor = {0.9f, 0.96f, 1.0f, 1.0f};
+                material.metallic = 0.0f;
+                material.roughness = 0.12f;
+                material.transmission = 1.0f;
+                material.indexOfRefraction = 1.05f;
+                material.absorptionColor = {1.0f, 1.0f, 1.0f};
+                material.volumeAbsorption = {0.08f, 0.03f, 0.01f};
+                material.volumeScattering = {0.32f, 0.38f, 0.45f};
+                material.volumeDensity = 0.8f;
+                material.volumeAnisotropy = 0.35f;
+            }
+        }
     }
     AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
     vulkanRenderer_.setScene(&scene_);
@@ -377,6 +489,19 @@ void Application::drawMainMenu()
             vulkanRenderer_.setScene(&scene_);
             optixRenderer_.setScene(&scene_);
             statusMessage_ = "Loaded procedural cube";
+        }
+        if (ImGui::MenuItem("PBR material comparison"))
+        {
+            Environment environment = std::move(scene_.environment);
+            scene_ = assetLoader_.createPbrMaterialComparisonScene(
+                {.enableOptionalMeshoptimizerPasses = meshoptimizerEnabled_,
+                 .addGroundPlane = groundPlaneEnabled_});
+            scene_.environment = std::move(environment);
+            defaultPlasticEnabled_ = false;
+            frameCameraToScene();
+            vulkanRenderer_.setScene(&scene_);
+            optixRenderer_.setScene(&scene_);
+            statusMessage_ = "Loaded PBR material comparison scene";
         }
         if (ImGui::MenuItem("Exit"))
             glfwSetWindowShouldClose(window_, GLFW_TRUE);
@@ -462,7 +587,147 @@ void Application::drawScenePanel()
             ImGui::BulletText("%s (mesh %u)", instance.name.c_str(), instance.meshIndex);
         ImGui::TreePop();
     }
+    drawMaterialEditor();
     ImGui::End();
+}
+
+void Application::drawMaterialEditor()
+{
+    if (!ImGui::TreeNode("Material editor"))
+        return;
+    if (scene_.meshes.empty() || scene_.materials.empty())
+    {
+        ImGui::TextDisabled("No editable material");
+        ImGui::TreePop();
+        return;
+    }
+
+    selectedMeshIndex_ = std::min(selectedMeshIndex_, static_cast<std::uint32_t>(scene_.meshes.size() - 1));
+    selectedMaterialIndex_ = std::min(selectedMaterialIndex_, static_cast<std::uint32_t>(scene_.materials.size() - 1));
+    if (ImGui::BeginCombo("Mesh", scene_.meshes[selectedMeshIndex_].name.c_str()))
+    {
+        for (std::uint32_t index = 0; index < scene_.meshes.size(); ++index)
+        {
+            if (ImGui::Selectable(scene_.meshes[index].name.c_str(), selectedMeshIndex_ == index))
+            {
+                selectedMeshIndex_ = index;
+                selectedMaterialIndex_ = std::min(scene_.meshes[index].materialIndex,
+                                                   static_cast<std::uint32_t>(scene_.materials.size() - 1));
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Mesh& mesh = scene_.meshes[selectedMeshIndex_];
+    const std::uint32_t assignedMaterial = std::min(mesh.materialIndex,
+                                                     static_cast<std::uint32_t>(scene_.materials.size() - 1));
+    if (ImGui::BeginCombo("Assigned material", scene_.materials[assignedMaterial].name.c_str()))
+    {
+        for (std::uint32_t index = 0; index < scene_.materials.size(); ++index)
+        {
+            if (ImGui::Selectable(scene_.materials[index].name.c_str(), assignedMaterial == index))
+            {
+                mesh.materialIndex = index;
+                selectedMaterialIndex_ = index;
+                vulkanRenderer_.setScene(&scene_);
+                optixRenderer_.setScene(&scene_);
+                statusMessage_ = "Updated mesh material assignment";
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    if (ImGui::BeginCombo("Edit material", scene_.materials[selectedMaterialIndex_].name.c_str()))
+    {
+        for (std::uint32_t index = 0; index < scene_.materials.size(); ++index)
+        {
+            if (ImGui::Selectable(scene_.materials[index].name.c_str(), selectedMaterialIndex_ == index))
+                selectedMaterialIndex_ = index;
+        }
+        ImGui::EndCombo();
+    }
+
+    Material& material = scene_.materials[selectedMaterialIndex_];
+    ImGui::TextDisabled("Vulkan: bounded transmission, thickness SSS and homogeneous fog approximations.");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("OptiX evaluates the full stochastic BSDF/medium transport.\n"
+                          "Vulkan remains non-progressive and uses a fixed real-time Ray Query budget.");
+    const Vec3 previousEmissive = material.emissive;
+    bool changed = false;
+    changed |= ImGui::ColorEdit4("Base color", &material.baseColor.x);
+    changed |= ImGui::ColorEdit3("Emissive", &material.emissive.x, ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+    changed |= ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Roughness", &material.roughness, 0.02f, 1.0f);
+    changed |= ImGui::DragFloat("Normal scale", &material.normalScale, 0.01f, 0.0f, 4.0f);
+    changed |= ImGui::SliderFloat("AO strength", &material.occlusionStrength, 0.0f, 1.0f);
+    int alphaMode = static_cast<int>(material.alphaMode);
+    static constexpr const char* alphaModeNames[] = {"Opaque", "Mask", "Blend"};
+    if (ImGui::Combo("Alpha mode", &alphaMode, alphaModeNames, static_cast<int>(std::size(alphaModeNames))))
+    {
+        material.alphaMode = static_cast<AlphaMode>(alphaMode);
+        changed = true;
+    }
+    changed |= ImGui::SliderFloat("Alpha cutoff", &material.alphaCutoff, 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Transmission", &material.transmission, 0.0f, 1.0f);
+    changed |= ImGui::DragFloat("IOR", &material.indexOfRefraction, 0.01f, 1.0f, 3.0f);
+    changed |= ImGui::SliderFloat("Clearcoat", &material.clearcoat, 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Clearcoat roughness", &material.clearcoatRoughness, 0.02f, 1.0f);
+    changed |= ImGui::SliderFloat("Anisotropy", &material.anisotropy, -0.99f, 0.99f);
+    changed |= ImGui::SliderFloat("Anisotropy rotation", &material.anisotropyRotation, 0.0f, 1.0f);
+    changed |= ImGui::ColorEdit3("Sheen color", &material.sheenColor.x);
+    changed |= ImGui::SliderFloat("Sheen roughness", &material.sheenRoughness, 0.0f, 1.0f);
+    changed |= ImGui::ColorEdit3("Absorption color", &material.absorptionColor.x);
+    changed |= ImGui::DragFloat("Absorption distance", &material.absorptionDistance, 0.05f, 0.0001f, 10000.0f);
+    changed |= ImGui::SliderFloat("Subsurface", &material.subsurface, 0.0f, 1.0f);
+    changed |= ImGui::ColorEdit3("Subsurface color", &material.subsurfaceColor.x);
+    changed |= ImGui::DragFloat("Subsurface radius", &material.subsurfaceRadius, 0.01f, 0.001f, 100.0f);
+    changed |= ImGui::ColorEdit3("Volume absorption", &material.volumeAbsorption.x,
+                                 ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+    changed |= ImGui::ColorEdit3("Volume scattering", &material.volumeScattering.x,
+                                 ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
+    changed |= ImGui::DragFloat("Volume density", &material.volumeDensity, 0.01f, 0.0f, 100.0f);
+    changed |= ImGui::SliderFloat("Volume anisotropy", &material.volumeAnisotropy, -0.99f, 0.99f);
+    changed |= ImGui::Checkbox("Double sided", &material.doubleSided);
+
+    if (ImGui::TreeNode("Texture assignments"))
+    {
+        ImGui::Text("Base color: %d | Normal: %d | Metallic-Roughness: %d", material.baseColorTexture,
+                    material.normalTexture, material.metallicRoughnessTexture);
+        ImGui::Text("AO: %d | Emissive: %d | Transmission: %d", material.occlusionTexture,
+                    material.emissiveTexture, material.transmissionTexture);
+        ImGui::Text("Clearcoat: %d | Roughness: %d | Normal: %d", material.clearcoatTexture,
+                    material.clearcoatRoughnessTexture, material.clearcoatNormalTexture);
+        ImGui::Text("Sheen color: %d | Roughness: %d | Anisotropy: %d", material.sheenColorTexture,
+                    material.sheenRoughnessTexture, material.anisotropyTexture);
+        ImGui::TreePop();
+    }
+    ImGui::TextDisabled("Factor edits update only the resident GPU material buffers.");
+
+    if (changed)
+    {
+        material.baseColor.x = std::max(material.baseColor.x, 0.0f);
+        material.baseColor.y = std::max(material.baseColor.y, 0.0f);
+        material.baseColor.z = std::max(material.baseColor.z, 0.0f);
+        material.emissive.x = std::max(material.emissive.x, 0.0f);
+        material.emissive.y = std::max(material.emissive.y, 0.0f);
+        material.emissive.z = std::max(material.emissive.z, 0.0f);
+        const bool emissionChanged = previousEmissive.x != material.emissive.x ||
+                                     previousEmissive.y != material.emissive.y ||
+                                     previousEmissive.z != material.emissive.z;
+        if (emissionChanged || !vulkanRenderer_.updateMaterial(selectedMaterialIndex_) ||
+            !optixRenderer_.updateMaterial(selectedMaterialIndex_))
+        {
+            // Emission changes also rebuild the OptiX mesh-light CDF. The CPU scene is not re-imported.
+            vulkanRenderer_.setScene(&scene_);
+            optixRenderer_.setScene(&scene_);
+        }
+        else
+        {
+            vulkanRenderer_.resetAccumulation();
+            optixRenderer_.resetAccumulation();
+        }
+        statusMessage_ = "Updated material GPU data: " + material.name;
+    }
+    ImGui::TreePop();
 }
 
 void Application::drawRenderPanel()
@@ -518,6 +783,19 @@ void Application::drawRenderPanel()
         ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Shows every Vulkan meshlet with a stable pseudo-random color.");
+    static constexpr const char* debugViewNames[] = {
+        "Beauty", "Base color", "Metallic", "Roughness", "Shading normal", "Geometric normal",
+        "Tangent", "Bitangent", "AO", "Emissive", "Diffuse lobe", "Specular lobe", "Clearcoat lobe",
+        "Sheen lobe", "Transmission lobe", "BSDF PDF", "Material ID", "Texture IDs", "Medium", "Path depth"};
+    int debugView = static_cast<int>(settings_.debugView);
+    if (ImGui::Combo("Debug view", &debugView, debugViewNames,
+                     static_cast<int>(std::size(debugViewNames))))
+    {
+        settings_.debugView = static_cast<DebugView>(debugView);
+        resetCameraAccumulation();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Shared material diagnostics. Vulkan transmission, subsurface and volume views show the documented real-time approximations.");
 
     ImGui::SeparatorText("Global light");
     int globalLightMode = static_cast<int>(scene_.environment.mode);
@@ -605,6 +883,7 @@ void Application::drawStatsPanel()
     ImGui::Begin("Performance");
     ImGui::Text("Device: %s", stats.deviceName.c_str());
     ImGui::Text("CPU frame: %.3f ms", stats.frameMilliseconds);
+    ImGui::Text("GPU render: %.3f ms", stats.gpuMilliseconds);
     ImGui::Text("Frame: %llu", static_cast<unsigned long long>(stats.frameIndex));
     if (settings_.backend == BackendKind::Optix)
         ImGui::Text("Accumulated samples: %llu", static_cast<unsigned long long>(stats.accumulatedSamples));
@@ -612,6 +891,11 @@ void Application::drawStatsPanel()
         ImGui::TextDisabled("Accumulated samples: n/a (real-time Vulkan)");
     ImGui::Text("Meshlets: %u / %u", stats.visibleMeshlets, stats.totalMeshlets);
     ImGui::Text("Rays: %llu", static_cast<unsigned long long>(stats.tracedRays));
+    ImGui::Text("GPU scene: %.2f MiB", static_cast<double>(stats.gpuSceneBytes) / (1024.0 * 1024.0));
+    ImGui::Text("Materials: %u (%.2f KiB)", stats.residentMaterials,
+                static_cast<double>(stats.materialBytes) / 1024.0);
+    ImGui::Text("Textures: %u / %u (%.2f MiB)", stats.residentTextures, stats.descriptorCapacity,
+                static_cast<double>(stats.textureBytes) / (1024.0 * 1024.0));
     ImGui::Text("Ray Query feature: %s", vulkanRenderer_.rayQueryAvailable() ? "yes" : "no");
     ImGui::Text("Task Shader feature: %s", vulkanRenderer_.taskShaderAvailable() ? "yes" : "no");
     ImGui::End();

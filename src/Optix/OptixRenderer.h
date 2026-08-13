@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace vor
 {
@@ -22,6 +23,7 @@ public:
     bool initialize(GLFWwindow* window) override;
     void shutdown() override;
     void setScene(const Scene* scene) override;
+    bool updateMaterial(std::uint32_t materialIndex) override;
     void resize(std::uint32_t width, std::uint32_t height) override;
     void resetAccumulation() override;
     bool render(const Camera& camera, const RenderSettings& settings) override;
@@ -49,6 +51,8 @@ private:
     void destroyPipeline();
     bool buildSceneAcceleration();
     void destroySceneAcceleration();
+    bool uploadTextureResources();
+    void destroyTextureResources();
     bool updateShaderBindingTable(const Camera& camera, const RenderSettings& settings);
     void setError(std::string message);
 
@@ -57,6 +61,8 @@ private:
     CUcontext cudaContext_{};
     CUstream cudaStream_{};
     CUevent launchParameterCopyComplete_{};
+    CUevent launchTimingStart_{};
+    CUevent launchTimingEnd_{};
     OptixDeviceContext optixContext_{};
     OptixModule module_{};
     OptixProgramGroup raygenProgramGroup_{};
@@ -78,15 +84,30 @@ private:
     CUdeviceptr hitRecord_{};
     CUdeviceptr vertexBuffer_{};
     CUdeviceptr normalBuffer_{};
+    CUdeviceptr tangentBuffer_{};
+    CUdeviceptr uvBuffer_{};
     CUdeviceptr indexBuffer_{};
-    CUdeviceptr triangleMaterialIndexBuffer_{};
+    CUdeviceptr instanceBuffer_{};
     CUdeviceptr materialBuffer_{};
+    CUdeviceptr emissiveTriangleBuffer_{};
     CUdeviceptr environmentBuffer_{};
+    CUdeviceptr environmentConditionalCdfBuffer_{};
+    CUdeviceptr environmentMarginalCdfBuffer_{};
+    CUdeviceptr textureTableBuffer_{};
+    std::vector<CUmipmappedArray> textureArrays_;
+    std::vector<CUtexObject> textureObjects_;
     std::size_t vertexCount_{};
     std::size_t triangleCount_{};
     std::size_t materialCount_{};
+    std::size_t instanceCount_{};
+    std::size_t emissiveTriangleCount_{};
+    float emissiveLightPower_{};
     std::size_t environmentPixelCount_{};
+    std::size_t environmentConditionalCdfCount_{};
+    std::size_t environmentMarginalCdfCount_{};
     CUdeviceptr gasBuffer_{};
+    CUdeviceptr iasInstanceBuffer_{};
+    std::vector<CUdeviceptr> meshGasBuffers_;
     OptixTraversableHandle gasHandle_{};
     OptixDenoiser denoiser_{};
     CUdeviceptr denoiserState_{};
@@ -97,6 +118,7 @@ private:
     std::uint64_t interopGeneration_{};
     bool firstInteropLaunch_{true};
     bool launchParameterCopyPending_{};
+    bool launchTimingPending_{};
     bool interopBgra_{true};
     std::uint32_t width_{1};
     std::uint32_t height_{1};

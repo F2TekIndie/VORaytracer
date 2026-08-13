@@ -191,6 +191,9 @@ void VulkanRenderer::shutdown()
         }
         if (commandPool_)
             vkDestroyCommandPool(device_, commandPool_, nullptr);
+        if (timestampQueryPool_)
+            vkDestroyQueryPool(device_, timestampQueryPool_, nullptr);
+        timestampQueryPool_ = VK_NULL_HANDLE;
         destroySwapchain();
         vkDestroyDevice(device_, nullptr);
     }
@@ -225,6 +228,18 @@ void VulkanRenderer::setScene(const Scene* scene)
     if (device_)
         uploadSceneResources();
     resetAccumulation();
+}
+
+bool VulkanRenderer::updateMaterial(std::uint32_t materialIndex)
+{
+    if (!device_ || !scene_ || !materialBuffer_.buffer || materialIndex >= scene_->materials.size())
+        return false;
+    const GpuMaterial material = scene_->materials[materialIndex].toGpu();
+    const VkDeviceSize destinationOffset = static_cast<VkDeviceSize>(materialIndex) * sizeof(GpuMaterial);
+    if (destinationOffset + sizeof(GpuMaterial) > materialBuffer_.size)
+        return false;
+    const BufferUpload upload{&materialBuffer_, &material, sizeof(GpuMaterial), destinationOffset};
+    return uploadDeviceLocalBuffers(std::span{&upload, 1});
 }
 
 void VulkanRenderer::resize(std::uint32_t width, std::uint32_t height)
@@ -310,8 +325,15 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
         VkSubmitInfo ownershipSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         ownershipSubmit.commandBufferCount = 1;
         ownershipSubmit.pCommandBuffers = &ownershipCommand;
-        check(vkQueueSubmit(graphicsQueue_, 1, &ownershipSubmit, VK_NULL_HANDLE), "vkQueueSubmit(CUDA ownership)");
-        check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(CUDA ownership)");
+        VkFenceCreateInfo ownershipFenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence ownershipFence = VK_NULL_HANDLE;
+        check(vkCreateFence(device_, &ownershipFenceInfo, nullptr, &ownershipFence),
+              "vkCreateFence(CUDA ownership)");
+        check(vkQueueSubmit(graphicsQueue_, 1, &ownershipSubmit, ownershipFence),
+              "vkQueueSubmit(CUDA ownership)");
+        check(vkWaitForFences(device_, 1, &ownershipFence, VK_TRUE, UINT64_MAX),
+              "vkWaitForFences(CUDA ownership)");
+        vkDestroyFence(device_, ownershipFence, nullptr);
         vkFreeCommandBuffers(device_, commandPool_, 1, &ownershipCommand);
 
         gpuInteropSurfaceInfo_.allocationSize = allocationSize;
@@ -465,7 +487,11 @@ void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSett
     framePushConstants_.materialOverrideId =
         scene_ && scene_->materialOverrideId < scene_->materials.size() ? scene_->materialOverrideId
                                                                         : kInvalidMaterialId;
-    framePushConstants_.showMeshlets = settings.showMeshlets ? 1u : 0u;
+    framePushConstants_.showMeshlets = settings.showMeshlets
+                                           ? 1u
+                                           : settings.debugView == DebugView::Beauty
+                                                 ? 0u
+                                                 : static_cast<std::uint32_t>(settings.debugView) + 1u;
     framePushConstants_.padding[0] = 0u;
     framePushConstants_.padding[1] = environment.hasHdr() ? environment.hdrMipCount : 0u;
 }
@@ -666,6 +692,16 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
         ImGui::Render();
         FrameResources& frame = frames_[frameSlot_];
         check(vkWaitForFences(device_, 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        if (timestampQueryWritten_[frameSlot_])
+        {
+            std::array<std::uint64_t, 2> timestamps{};
+            const VkResult timestampResult = vkGetQueryPoolResults(
+                device_, timestampQueryPool_, frameSlot_ * 2, 2, sizeof(timestamps), timestamps.data(),
+                sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+            if (timestampResult == VK_SUCCESS && timestamps[1] >= timestamps[0])
+                stats_.gpuMilliseconds = static_cast<float>(timestamps[1] - timestamps[0]) *
+                                         timestampPeriodNanoseconds_ * 1.0e-6f;
+        }
 
         std::uint32_t imageIndex = 0;
         VkResult acquireResult = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, frame.imageAvailable, VK_NULL_HANDLE, &imageIndex);
@@ -863,6 +899,7 @@ bool VulkanRenderer::selectPhysicalDevice()
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physicalDevice_, &properties);
     stats_.deviceName = properties.deviceName;
+    timestampPeriodNanoseconds_ = properties.limits.timestampPeriod;
     return true;
 }
 
@@ -888,14 +925,14 @@ bool VulkanRenderer::createDevice()
     VkPhysicalDeviceAccelerationStructureFeaturesKHR availableAcceleration{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT availableMesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceVulkan13Features available13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features available12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features available11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    VkPhysicalDeviceBufferDeviceAddressFeatures availableBufferAddress{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
 
     VkPhysicalDeviceFeatures2 available{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     available.pNext = &available13;
-    available13.pNext = &available11;
-    available11.pNext = &availableBufferAddress;
-    availableBufferAddress.pNext = &availableMesh;
+    available13.pNext = &available12;
+    available12.pNext = &available11;
+    available11.pNext = &availableMesh;
     if (rayQueryExtensions)
     {
         availableMesh.pNext = &availableAcceleration;
@@ -903,11 +940,14 @@ bool VulkanRenderer::createDevice()
     }
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &available);
 
-    if (!available13.dynamicRendering || !available13.synchronization2 || !availableMesh.meshShader ||
-        !availableMesh.taskShader || !available11.shaderDrawParameters)
-        throw std::runtime_error("Required Vulkan 1.3 dynamic rendering/synchronization or task/mesh shader features are missing");
+    if (!available13.dynamicRendering || !available13.synchronization2 ||
+        !available13.shaderDemoteToHelperInvocation || !availableMesh.meshShader ||
+        !availableMesh.taskShader || !available11.shaderDrawParameters ||
+        !available.features.shaderSampledImageArrayDynamicIndexing ||
+        !available12.shaderSampledImageArrayNonUniformIndexing || !available12.descriptorBindingPartiallyBound)
+        throw std::runtime_error("Required Vulkan rendering, mesh-shader, or bindless texture features are missing");
     taskShaderAvailable_ = true;
-    rayQueryAvailable_ = rayQueryExtensions && availableBufferAddress.bufferDeviceAddress &&
+    rayQueryAvailable_ = rayQueryExtensions && available12.bufferDeviceAddress &&
                          availableAcceleration.accelerationStructure && availableRayQuery.rayQuery;
     if (!rayQueryAvailable_)
         throw std::runtime_error("The Vulkan backend requires acceleration structures and VK_KHR_ray_query");
@@ -931,15 +971,18 @@ bool VulkanRenderer::createDevice()
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceVulkan13Features features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features features11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddress{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
-    features13.pNext = &features11;
+    features13.shaderDemoteToHelperInvocation = VK_TRUE;
+    features13.pNext = &features12;
+    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    features12.descriptorBindingPartiallyBound = VK_TRUE;
+    features12.bufferDeviceAddress = rayQueryAvailable_ ? VK_TRUE : VK_FALSE;
+    features12.pNext = &features11;
     features11.shaderDrawParameters = VK_TRUE;
-    features11.pNext = &bufferDeviceAddress;
-    bufferDeviceAddress.bufferDeviceAddress = rayQueryAvailable_ ? VK_TRUE : VK_FALSE;
-    bufferDeviceAddress.pNext = &meshFeatures;
+    features11.pNext = &meshFeatures;
     meshFeatures.meshShader = VK_TRUE;
     meshFeatures.taskShader = taskShaderAvailable_ ? VK_TRUE : VK_FALSE;
     if (rayQueryAvailable_)
@@ -952,6 +995,9 @@ bool VulkanRenderer::createDevice()
 
     VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     createInfo.pNext = &features13;
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    createInfo.pEnabledFeatures = &enabledFeatures;
     createInfo.queueCreateInfoCount = 1;
     createInfo.pQueueCreateInfos = &queueInfo;
     createInfo.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
@@ -1105,6 +1151,11 @@ bool VulkanRenderer::createSwapchain()
 
 bool VulkanRenderer::createCommands()
 {
+    VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryInfo.queryCount = kFramesInFlight * 2;
+    check(vkCreateQueryPool(device_, &queryInfo, nullptr, &timestampQueryPool_), "vkCreateQueryPool(timestamps)");
+
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = graphicsQueueFamily_;
@@ -1132,7 +1183,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 11> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -1162,7 +1213,22 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[8].descriptorCount = 1;
     bindings[8].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[9].binding = 9;
+    bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[9].descriptorCount = kMaxMaterialTextures;
+    bindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[10].binding = 10;
+    bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    bindings[10].descriptorCount = 1;
+    bindings[10].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    std::array<VkDescriptorBindingFlags, 11> bindingFlags{};
+    bindingFlags[9] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    bindingFlagsInfo.bindingCount = static_cast<std::uint32_t>(bindingFlags.size());
+    bindingFlagsInfo.pBindingFlags = bindingFlags.data();
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.pNext = &bindingFlagsInfo;
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
@@ -1170,6 +1236,8 @@ bool VulkanRenderer::createSceneDescriptors()
     const std::array poolSizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, 1},
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;
@@ -1422,14 +1490,250 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(sceneInstanceBuffer_);
     destroyBuffer(environmentBuffer_);
     destroyBuffer(materialBuffer_);
+    destroyTextureResources();
     uploadedGeometries_.clear();
     uploadedInstances_.clear();
     uploadedMeshletCount_ = 0;
     uploadedVertexCount_ = 0;
     uploadedTriangleCount_ = 0;
+    stats_.gpuSceneBytes = 0;
+    stats_.textureBytes = 0;
+    stats_.materialBytes = 0;
+    stats_.residentTextures = 0;
+    stats_.residentMaterials = 0;
     sceneDescriptorSet_ = VK_NULL_HANDLE;
     if (sceneDescriptorPool_)
         vkResetDescriptorPool(device_, sceneDescriptorPool_, 0);
+}
+
+void VulkanRenderer::destroyTextureResources()
+{
+    if (!device_)
+        return;
+    if (materialTextureSampler_)
+        vkDestroySampler(device_, materialTextureSampler_, nullptr);
+    materialTextureSampler_ = VK_NULL_HANDLE;
+    for (GpuTexture& texture : materialTextures_)
+    {
+        if (texture.view)
+            vkDestroyImageView(device_, texture.view, nullptr);
+        if (texture.image)
+            vkDestroyImage(device_, texture.image, nullptr);
+        if (texture.memory)
+            vkFreeMemory(device_, texture.memory, nullptr);
+    }
+    materialTextures_.clear();
+}
+
+bool VulkanRenderer::uploadTextureResources()
+{
+    TextureReference fallback{};
+    fallback.srgb = false;
+    fallback.width = 1;
+    fallback.height = 1;
+    fallback.mipCount = 1;
+    fallback.mipOffsets = {0};
+    fallback.rgba8Pixels = {255, 255, 255, 255};
+    std::vector<const TextureReference*> sources;
+    if (scene_ && !scene_->textures.empty())
+    {
+        if (scene_->textures.size() > kMaxMaterialTextures)
+            throw std::runtime_error("Scene exceeds the Vulkan bindless material texture limit");
+        sources.reserve(scene_->textures.size());
+        for (const TextureReference& texture : scene_->textures)
+            sources.push_back(texture.valid() ? &texture : &fallback);
+    }
+    else
+        sources.push_back(&fallback);
+
+    GpuBuffer staging{};
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    try
+    {
+        std::vector<VkDeviceSize> offsets(sources.size());
+        VkDeviceSize stagingSize = 0;
+        materialTextures_.resize(sources.size());
+        for (std::size_t index = 0; index < sources.size(); ++index)
+        {
+            const TextureReference& source = *sources[index];
+            stagingSize = (stagingSize + 3u) & ~VkDeviceSize{3u};
+            offsets[index] = stagingSize;
+            stagingSize += source.rgba8Pixels.size();
+
+            GpuTexture& texture = materialTextures_[index];
+            VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = source.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            imageInfo.extent = {source.width, source.height, 1};
+            imageInfo.mipLevels = source.mipCount;
+            imageInfo.arrayLayers = 1;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            check(vkCreateImage(device_, &imageInfo, nullptr, &texture.image), "vkCreateImage(material texture)");
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(device_, texture.image, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            check(vkAllocateMemory(device_, &allocation, nullptr, &texture.memory),
+                  "vkAllocateMemory(material texture)");
+            check(vkBindImageMemory(device_, texture.image, texture.memory, 0),
+                  "vkBindImageMemory(material texture)");
+        }
+
+        staging.size = stagingSize;
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufferInfo.size = stagingSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        check(vkCreateBuffer(device_, &bufferInfo, nullptr, &staging.buffer), "vkCreateBuffer(texture staging)");
+        VkMemoryRequirements stagingRequirements{};
+        vkGetBufferMemoryRequirements(device_, staging.buffer, &stagingRequirements);
+        VkMemoryAllocateInfo stagingAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        stagingAllocation.allocationSize = stagingRequirements.size;
+        stagingAllocation.memoryTypeIndex = findMemoryType(
+            stagingRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkAllocateMemory(device_, &stagingAllocation, nullptr, &staging.memory),
+              "vkAllocateMemory(texture staging)");
+        check(vkBindBufferMemory(device_, staging.buffer, staging.memory, 0),
+              "vkBindBufferMemory(texture staging)");
+        void* mapped = nullptr;
+        check(vkMapMemory(device_, staging.memory, 0, stagingSize, 0, &mapped), "vkMapMemory(texture staging)");
+        for (std::size_t index = 0; index < sources.size(); ++index)
+            std::memcpy(static_cast<std::byte*>(mapped) + offsets[index], sources[index]->rgba8Pixels.data(),
+                        sources[index]->rgba8Pixels.size());
+        vkUnmapMemory(device_, staging.memory);
+
+        VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        commandAllocation.commandPool = commandPool_;
+        commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandAllocation.commandBufferCount = 1;
+        check(vkAllocateCommandBuffers(device_, &commandAllocation, &command),
+              "vkAllocateCommandBuffers(texture upload)");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(texture upload)");
+
+        std::vector<VkImageMemoryBarrier2> toTransfer(sources.size());
+        for (std::size_t index = 0; index < sources.size(); ++index)
+        {
+            VkImageMemoryBarrier2& barrier = toTransfer[index];
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.image = materialTextures_[index].image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = sources[index]->mipCount;
+            barrier.subresourceRange.layerCount = 1;
+        }
+        VkDependencyInfo toTransferDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        toTransferDependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(toTransfer.size());
+        toTransferDependency.pImageMemoryBarriers = toTransfer.data();
+        vkCmdPipelineBarrier2(command, &toTransferDependency);
+
+        for (std::size_t index = 0; index < sources.size(); ++index)
+        {
+            const TextureReference& source = *sources[index];
+            std::vector<VkBufferImageCopy> copies(source.mipCount);
+            std::uint32_t width = source.width;
+            std::uint32_t height = source.height;
+            for (std::uint32_t mip = 0; mip < source.mipCount; ++mip)
+            {
+                VkBufferImageCopy& copy = copies[mip];
+                copy.bufferOffset = offsets[index] + source.mipOffsets[mip];
+                copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copy.imageSubresource.mipLevel = mip;
+                copy.imageSubresource.layerCount = 1;
+                copy.imageExtent = {width, height, 1};
+                width = std::max(width / 2, 1u);
+                height = std::max(height / 2, 1u);
+            }
+            vkCmdCopyBufferToImage(command, staging.buffer, materialTextures_[index].image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   static_cast<std::uint32_t>(copies.size()), copies.data());
+        }
+
+        std::vector<VkImageMemoryBarrier2> toShader(sources.size());
+        for (std::size_t index = 0; index < sources.size(); ++index)
+        {
+            VkImageMemoryBarrier2& barrier = toShader[index];
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.image = materialTextures_[index].image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = sources[index]->mipCount;
+            barrier.subresourceRange.layerCount = 1;
+        }
+        VkDependencyInfo toShaderDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        toShaderDependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(toShader.size());
+        toShaderDependency.pImageMemoryBarriers = toShader.data();
+        vkCmdPipelineBarrier2(command, &toShaderDependency);
+        check(vkEndCommandBuffer(command), "vkEndCommandBuffer(texture upload)");
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        check(vkCreateFence(device_, &fenceInfo, nullptr, &fence), "vkCreateFence(texture upload)");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &command;
+        check(vkQueueSubmit(graphicsQueue_, 1, &submit, fence), "vkQueueSubmit(texture upload)");
+        check(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(texture upload)");
+
+        for (std::size_t index = 0; index < sources.size(); ++index)
+        {
+            VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewInfo.image = materialTextures_[index].image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = sources[index]->srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.levelCount = sources[index]->mipCount;
+            viewInfo.subresourceRange.layerCount = 1;
+            check(vkCreateImageView(device_, &viewInfo, nullptr, &materialTextures_[index].view),
+                  "vkCreateImageView(material texture)");
+        }
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+        check(vkCreateSampler(device_, &samplerInfo, nullptr, &materialTextureSampler_),
+              "vkCreateSampler(material textures)");
+
+        vkDestroyFence(device_, fence, nullptr);
+        fence = VK_NULL_HANDLE;
+        vkFreeCommandBuffers(device_, commandPool_, 1, &command);
+        command = VK_NULL_HANDLE;
+        vkDestroyBuffer(device_, staging.buffer, nullptr);
+        vkFreeMemory(device_, staging.memory, nullptr);
+        return true;
+    }
+    catch (...)
+    {
+        if (fence)
+            vkDestroyFence(device_, fence, nullptr);
+        if (command)
+            vkFreeCommandBuffers(device_, commandPool_, 1, &command);
+        if (staging.buffer)
+            vkDestroyBuffer(device_, staging.buffer, nullptr);
+        if (staging.memory)
+            vkFreeMemory(device_, staging.memory, nullptr);
+        destroyTextureResources();
+        throw;
+    }
 }
 
 bool VulkanRenderer::uploadSceneResources()
@@ -1469,14 +1773,9 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t materialIndex;
         std::uint32_t padding[3];
     };
-    struct alignas(16) GpuMaterial
-    {
-        Vec4 baseColorAndMetallic;
-        Vec4 emissiveAndRoughness;
-    };
     static_assert(sizeof(GpuMeshlet) == 64);
     static_assert(sizeof(GpuInstance) == 176);
-    static_assert(sizeof(GpuMaterial) == 32);
+    static_assert(sizeof(GpuMaterial) == 224);
     struct RasterMeshRange
     {
         std::uint32_t firstMeshlet{};
@@ -1550,13 +1849,17 @@ bool VulkanRenderer::uploadSceneResources()
         const float scaleZ = length(Vec3{transform.m[8], transform.m[9], transform.m[10]});
         const float maxScale = std::max({scaleX, scaleY, scaleZ});
         const float minScale = std::min({scaleX, scaleY, scaleZ});
+        const float determinant = transform.m[0] * (transform.m[5] * transform.m[10] - transform.m[9] * transform.m[6]) -
+                                  transform.m[4] * (transform.m[1] * transform.m[10] - transform.m[9] * transform.m[2]) +
+                                  transform.m[8] * (transform.m[1] * transform.m[6] - transform.m[5] * transform.m[2]);
+        const float transformHandedness = determinant < 0.0f ? -1.0f : 1.0f;
         const std::uint32_t gpuInstanceIndex = static_cast<std::uint32_t>(gpuInstances.size());
         const UploadedGeometry& geometry = uploadedGeometries_[meshToGeometry[meshIndex]];
         const Mesh& mesh = scene_->meshes[meshIndex];
         const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
         gpuInstances.push_back({transform,
                                 normalTransformMatrix(transform),
-                                {maxScale, minScale, 0.0f, 0.0f},
+                                {maxScale, minScale, transformHandedness, 0.0f},
                                 {geometry.vertexOffset, geometry.indexOffset, geometry.indexCount, 0},
                                 materialIndex,
                                 {}});
@@ -1585,15 +1888,13 @@ bool VulkanRenderer::uploadSceneResources()
         return true;
 
     if (scene_->materials.empty())
-        gpuMaterials.push_back({{1.0f, 1.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f}});
+        gpuMaterials.push_back(Material{}.toGpu());
     else
     {
         gpuMaterials.reserve(scene_->materials.size());
         for (const Material& material : scene_->materials)
         {
-            gpuMaterials.push_back({{material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
-                                    {material.emissive.x, material.emissive.y, material.emissive.z,
-                                     material.roughness}});
+            gpuMaterials.push_back(material.toGpu());
         }
     }
 
@@ -1627,6 +1928,8 @@ bool VulkanRenderer::uploadSceneResources()
     };
     if (!uploadDeviceLocalBuffers(uploads))
         throw std::runtime_error("Failed to stage Vulkan scene geometry into device-local memory");
+    if (!uploadTextureResources())
+        throw std::runtime_error("Failed to upload Vulkan material textures");
     uploadedVertexCount_ = static_cast<std::uint32_t>(vertices.size());
     uploadedTriangleCount_ = static_cast<std::uint32_t>(geometryIndices.size() / 3);
     if (!buildAccelerationStructures())
@@ -1647,7 +1950,7 @@ bool VulkanRenderer::uploadSceneResources()
         {environmentBuffer_.buffer, 0, environmentBuffer_.size},
         {materialBuffer_.buffer, 0, materialBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 9> writes{};
+    std::array<VkWriteDescriptorSet, 11> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1691,9 +1994,47 @@ bool VulkanRenderer::uploadSceneResources()
     writes[8].descriptorCount = 1;
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].pBufferInfo = &bufferInfos[7];
+    std::vector<VkDescriptorImageInfo> textureInfos(materialTextures_.size());
+    for (std::size_t index = 0; index < materialTextures_.size(); ++index)
+    {
+        textureInfos[index].imageView = materialTextures_[index].view;
+        textureInfos[index].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[9].dstSet = sceneDescriptorSet_;
+    writes[9].dstBinding = 9;
+    writes[9].descriptorCount = static_cast<std::uint32_t>(textureInfos.size());
+    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[9].pImageInfo = textureInfos.data();
+    VkDescriptorImageInfo samplerInfo{};
+    samplerInfo.sampler = materialTextureSampler_;
+    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[10].dstSet = sceneDescriptorSet_;
+    writes[10].dstBinding = 10;
+    writes[10].descriptorCount = 1;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[10].pImageInfo = &samplerInfo;
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
+    stats_.materialBytes = materialBuffer_.size;
+    stats_.residentMaterials = static_cast<std::uint32_t>(gpuMaterials.size());
+    stats_.residentTextures = static_cast<std::uint32_t>(materialTextures_.size());
+    stats_.descriptorCapacity = kMaxMaterialTextures;
+    stats_.textureBytes = 0;
+    if (scene_ && !scene_->textures.empty())
+    {
+        for (const TextureReference& texture : scene_->textures)
+            stats_.textureBytes += texture.rgba8Pixels.size();
+    }
+    else
+        stats_.textureBytes = 4;
+    stats_.gpuSceneBytes = vertexBuffer_.size + meshletBuffer_.size + meshletVertexBuffer_.size +
+                           meshletTriangleBuffer_.size + geometryIndexBuffer_.size + sceneInstanceBuffer_.size +
+                           environmentBuffer_.size + materialBuffer_.size + accelerationInstanceBuffer_.size +
+                           tlasStorage_.size + stats_.textureBytes;
+    for (const BlasResource& blas : blases_)
+        stats_.gpuSceneBytes += blas.storage.size;
     log(LogLevel::Info, "Vulkan scene upload: " + std::to_string(uploadedVertexCount_) + " unique vertices, " +
                             std::to_string(uploadedTriangleCount_) + " unique triangles, " +
                             std::to_string(uploadedGeometries_.size()) + " BLAS geometries, " +
@@ -2080,7 +2421,7 @@ bool VulkanRenderer::uploadDeviceLocalBuffers(std::span<const BufferUpload> uplo
         {
             const BufferUpload& upload = uploads[index];
             if (!upload.destination || !upload.destination->buffer || !upload.data || upload.size == 0 ||
-                upload.size > upload.destination->size)
+                upload.destinationOffset + upload.size > upload.destination->size)
                 throw std::runtime_error("Invalid device-local buffer upload");
             stagingSize = (stagingSize + 15u) & ~VkDeviceSize{15u};
             offsets[index] = stagingSize;
@@ -2119,7 +2460,7 @@ bool VulkanRenderer::uploadDeviceLocalBuffers(std::span<const BufferUpload> uplo
         check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(staging batch)");
         for (std::size_t index = 0; index < uploads.size(); ++index)
         {
-            VkBufferCopy copy{offsets[index], 0, uploads[index].size};
+            VkBufferCopy copy{offsets[index], uploads[index].destinationOffset, uploads[index].size};
             vkCmdCopyBuffer(command, staging.buffer, uploads[index].destination->buffer, 1, &copy);
         }
         std::vector<VkBufferMemoryBarrier2> barriers;
@@ -2130,10 +2471,12 @@ bool VulkanRenderer::uploadDeviceLocalBuffers(std::span<const BufferUpload> uplo
             barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
             barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                                   VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+                                   VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
+                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
             barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
                                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
             barrier.buffer = upload.destination->buffer;
+            barrier.offset = upload.destinationOffset;
             barrier.size = upload.size;
             barriers.push_back(barrier);
         }
@@ -2191,6 +2534,10 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+    const std::uint32_t timestampBase = frameSlot_ * 2;
+    vkCmdResetQueryPool(commandBuffer, timestampQueryPool_, timestampBase, 2);
+    vkCmdWriteTimestamp2(commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                         timestampQueryPool_, timestampBase);
 
     VkImageMemoryBarrier2 toTarget{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     toTarget.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
@@ -2335,7 +2682,10 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &toPresent;
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    vkCmdWriteTimestamp2(commandBuffer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                         timestampQueryPool_, timestampBase + 1);
     check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    timestampQueryWritten_[frameSlot_] = true;
     swapchainImageInitialized_[imageIndex] = true;
 }
 

@@ -24,15 +24,20 @@ Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation 
 - Task-/Amplification- und Mesh-Shader-Pipeline mit Frustum- und Normal-Cone-Culling auf vorhandenen Meshlet-Bounds
 - device-local Vulkan-Geometrie über Staging-Uploads
 - separate Vulkan-BLAS pro Geometrie und TLAS-Instanzen ohne getrennte `vkQueueWaitIdle()`-Stopps
-- Metallic-Roughness-PBR mit GGX, Ray-Query-Schatten und optionalen Reflexionen
+- gemeinsames modulares Slang-PBR-System für Metallic-Roughness, Clearcoat, Glas/Absorption, Anisotropie, Sheen, Emission, Subsurface und homogene Volumen
+- bindless Vulkan-Materialtexturen und CUDA-Mipmapped-Texture-Objects für Base Color, Metallic-Roughness, Normal, AO, Emissive und spezialisierte Loben
+- Vulkan-GGX-Auswertung mit Ray-Query-Schatten, Reflexionen sowie begrenzten Echtzeitapproximationen für Transmission, Subsurface und Volumen
 - Richtungslicht, prozeduraler Himmel oder HDR-Environment als globale Beleuchtung
 - stabiles roughnessabhängiges HDR-IBL über eine vollständige Mip-Pyramide
 - optionaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Ein- und Ausgabe
 - CUDA/Vulkan-External-Memory- und Semaphore-Interop ohne Bildkopie zur CPU
-- progressiver OptiX-Pathtracer mit Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
+- progressiver OptiX-Pathtracer mit GGX-VNDF, NEE/MIS für HDR, Richtungs- und Mesh-Lichter, Medium-Stack, Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
+- wiederverwendbare OptiX-GAS pro Mesh und IAS-Szeneninstanzen ohne Geometrie-Flattening
 - standardisiertes hellgraues Kunststoffmaterial als nichtdestruktive Laufzeitüberschreibung
 - ein- und ausblendbare Bodenebene mit Standardkunststoffmaterial
 - stabile, pseudozufällige Meshlet-Debugfarbe pro Meshlet
+- PBR-Materialvergleichsszene, Materialeditor mit gezielten 224-Byte-GPU-Updates und gemeinsame Material-Debugansichten
+- asynchrone Vulkan-Timestamps und CUDA-Events sowie GPU-Speicher-/Descriptorstatistiken im Performance-Fenster
 
 ## Voraussetzungen
 
@@ -79,6 +84,7 @@ Die Kamerasteuerung reagiert außerhalb von ImGui-Fenstern:
 `Frame model` passt die Kamera erneut an die Bounds der geladenen Szene an. Die Lichtmodi Richtungslicht, prozeduraler Himmel und HDR teilen sich die anwendbaren Transformationsanteile, sodass die Umschaltung die Orientierung beibehält.
 
 Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Windows-Dateidialoge für Modelle und HDR-Environments bereit.
+`PBR material comparison` lädt ein Raster mit Referenzmaterialien für sämtliche implementierten Loben.
 
 ## Szenen- und Materialoptionen
 
@@ -88,6 +94,8 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 - `Meshlet debug colors`: Zeigt im Vulkan-Pfad eine stabile Zufallsfarbe pro Meshlet.
 - `Ray-traced reflections`: Aktiviert Vulkan-Reflexions-Ray-Queries; im OptiX-Pfad steuert die Option die reflektierenden Sekundärpfade.
 - `Indirect lighting`: Schaltet die globale Beleuchtung durch HDR, prozeduralen Himmel oder Richtungslicht entsprechend der aktiven Konfiguration.
+- `Material editor`: Wählt Mesh und Material, zeigt Texturzuweisungen und bearbeitet sämtliche PBR-Faktoren. Faktoränderungen übertragen nur den betroffenen GPU-Materialeintrag; Emissionsänderungen bauen zusätzlich die Mesh-Licht-CDF neu auf.
+- `Debug view`: Zeigt Base Color, Metallic, Roughness, Normalen, Tangenten, AO, Emission, einzelne Loben, PDF, IDs, Medium und OptiX-Pfadtiefe.
 
 ## Unterschiede der Backends
 
@@ -100,6 +108,7 @@ Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Roughness w�
 ### OptiX
 
 OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
+Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enthält die Szeneninstanzen und ihre Transformationen.
 
 ## Umgebungsvariablen für Smoke-Tests
 
@@ -113,17 +122,19 @@ OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` 
 | `VOR_GLOBAL_LIGHT=sky` | startet mit prozeduralem Himmel |
 | `VOR_GLOBAL_LIGHT=hdr` | startet im HDR-Modus |
 | `VOR_HDR=<absoluter Pfad>` | lädt beim Start ein Radiance-HDR-Environment |
+| `VOR_PBR_COMPARISON=1` | startet mit der vollständigen PBR-Materialvergleichsszene |
+| `VOR_DEBUG_VIEW=0..19` | wählt Beauty oder eine Material-/Pfaddiagnose |
+| `VOR_TEST_FRAMES=<Anzahl>` | beendet einen automatischen GPU-Smoke-Test nach der angegebenen Framezahl |
 
 ## Tests und Diagnose
 
-Die Tests decken unter anderem Mathematik, Szenenstatistiken, meshoptimizer-Verarbeitung, OBJ-/FBX-Import, Standardmaterial, Bodenebene und HDR-Mip-Erzeugung ab. Debug-Builds aktivieren Vulkan Validation; CUDA-, OptiX- und Vulkan-Diagnosen erscheinen auf `stderr`.
+Die Tests decken unter anderem Layouts, Materialkonvertierung, Texturfarbräume und -deduplizierung, Szenenstatistiken, meshoptimizer-Verarbeitung, OBJ-/FBX-Import, HDR-Importance-Verteilungen, Fresnel/TIR, Beer-Lambert, Henyey-Greenstein-Normalisierung, White-Furnace-Energiegrenzen und NaN/Inf-Sweeps ab. Debug-Builds aktivieren Vulkan Validation; CUDA-, OptiX- und Vulkan-Diagnosen erscheinen auf `stderr`.
 
 Der Slang-Hinweis `E38040` beim OptiX-Build ist erwartet: Der Raygen-Parameter wird absichtlich als Uniform im SBT-Raygen-Record abgelegt.
 
-## Bekannte Ausbaupunkte
+## Bewusste Grenzen
 
-- OptiX verwendet aktuell ein zusammengeführtes Triangle-GAS; separate GAS plus IAS-Instanzen sind noch offen.
 - LOD-Stufen werden erzeugt, derzeit wird aber nur das Basis-LOD hochgeladen und gerendert.
-- Importierte Texturreferenzen sind vorhanden; die vollständige Materialtextur-Abtastung in beiden Shaderpfaden ist noch auszubauen.
-- GPU-Timestamps und detaillierte Pass-Statistiken sind noch nicht vollständig instrumentiert.
-- Das Farbmanagement verwendet derzeit ein einfaches Tone Mapping mit sRGB-Ausgabe; ein auswählbarer Filmic-Tone-Mapper ist ein möglicher Ausbau.
+- Vulkan bleibt nicht-progressiv: Transmission, Subsurface und Volumen verwenden klar gekennzeichnete Echtzeitapproximationen; der vollständige stochastische Transport liegt im OptiX-Pfad.
+- Volumen sind homogen; heterogene Dichtefelder und mehrschichtige Hautmodelle sind nicht Bestandteil dieses Updates.
+- Das Farbmanagement verwendet ein kompaktes Tone Mapping mit sRGB-Ausgabe; ein auswählbarer Filmic-Tone-Mapper bleibt ein möglicher Ausbau.

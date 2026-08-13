@@ -15,6 +15,30 @@ enum class BackendKind : std::uint32_t
     Optix,
 };
 
+enum class DebugView : std::uint32_t
+{
+    Beauty,
+    BaseColor,
+    Metallic,
+    Roughness,
+    ShadingNormal,
+    GeometricNormal,
+    Tangent,
+    Bitangent,
+    Occlusion,
+    Emissive,
+    DiffuseLobe,
+    SpecularLobe,
+    ClearcoatLobe,
+    SheenLobe,
+    TransmissionLobe,
+    BsdfPdf,
+    MaterialId,
+    TextureIds,
+    Medium,
+    PathDepth,
+};
+
 struct RenderSettings
 {
     BackendKind backend{BackendKind::VulkanHybrid};
@@ -28,6 +52,7 @@ struct RenderSettings
     bool denoiser{false};
     bool vsync{true};
     bool showMeshlets{false};
+    DebugView debugView{DebugView::Beauty};
 };
 
 struct RendererStats
@@ -40,6 +65,12 @@ struct RendererStats
     std::uint32_t visibleMeshlets{};
     std::uint32_t totalMeshlets{};
     std::uint64_t tracedRays{};
+    std::uint64_t gpuSceneBytes{};
+    std::uint64_t textureBytes{};
+    std::uint64_t materialBytes{};
+    std::uint32_t residentTextures{};
+    std::uint32_t residentMaterials{};
+    std::uint32_t descriptorCapacity{};
 };
 
 struct GpuInteropSurface
@@ -72,6 +103,7 @@ public:
     virtual bool initialize(GLFWwindow* window) = 0;
     virtual void shutdown() = 0;
     virtual void setScene(const Scene* scene) = 0;
+    virtual bool updateMaterial(std::uint32_t materialIndex) = 0;
     virtual void resize(std::uint32_t width, std::uint32_t height) = 0;
     virtual void resetAccumulation() = 0;
     virtual bool render(const Camera& camera, const RenderSettings& settings) = 0;

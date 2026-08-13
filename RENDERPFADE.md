@@ -7,12 +7,15 @@ Diese Übersicht zeigt, welche Daten beide Backends teilen und wo sich Vulkan un
 ```mermaid
 flowchart LR
     Model["Modell über IFileOpenDialog"] --> Assimp["Assimp-Import"]
-    Assimp --> Scene["Gemeinsame CPU-Szene<br/>Meshes, Instanzen, Materialien"]
+    Assimp --> Scene["Gemeinsame CPU-Szene<br/>Meshes, Instanzen, GpuMaterial"]
+    Assimp --> Textures["Inhalts- und farbraumbewusster<br/>CPU-Texturcache mit Mips"]
     Scene --> Meshopt["meshoptimizer<br/>Remap, Cache, Meshlets, Bounds, LODs"]
     HDR["Radiance HDR über IFileOpenDialog"] --> STB["stb_image<br/>Float-Decodierung"]
     STB --> Mips["HDR-Mip-Pyramide<br/>Diffuse und spiegelnde IBL"]
     Meshopt --> VulkanData["Vulkan-Ressourcen"]
     Meshopt --> OptixData["CUDA-/OptiX-Ressourcen"]
+    Textures --> VulkanData
+    Textures --> OptixData
     Mips --> VulkanData
     Mips --> OptixData
 ```
@@ -33,11 +36,12 @@ flowchart TD
     Geometry --> BLAS["Separate BLAS pro Geometrie"]
     BLAS --> TLAS["TLAS mit Szeneninstanzen"]
 
-    Mesh --> Fragment["Fragment-Shader<br/>Metallic-Roughness-PBR"]
+    Mesh --> Fragment["Fragment-Shader<br/>gemeinsame modulare PBR-Auswertung"]
     TLAS --> Queries["Inline Ray Queries<br/>Schatten und optionale Reflexionen"]
     Light["Richtungslicht,<br/>prozeduraler Himmel oder HDR"] --> Fragment
     Queries --> Fragment
-    Fragment --> Denoise{"Vulkan-Denoiser aktiv?"}
+    Fragment --> Approx["Begrenzte Echtzeitapproximationen<br/>Transmission, SSS, Volumen"]
+    Approx --> Denoise{"Vulkan-Denoiser aktiv?"}
     Denoise -->|Nein| ToneMap["Tone Mapping im Fragmentshader<br/>direkt ins Swapchain-Image"]
     Denoise -->|Ja| HDRImage["Lineares Vulkan-Offscreenbild<br/>RGBA16F"]
     HDRImage --> ExtHalf["Vulkan Image → exportierter<br/>persistenter HALF4-Buffer"]
@@ -60,21 +64,23 @@ Wichtige Eigenschaften:
 - Ohne Denoiser rendert und tonemappt der Fragmentshader direkt ins Swapchain-Image.
 - Mit Denoiser bleiben Denoising, Tone Mapping und Bildübergabe vollständig auf der GPU.
 - Persistente External-Memory-Zuordnung und Semaphoren vermeiden CPU-Wartepunkte und Map/Unmap pro Frame.
+- Materialfaktoren werden bei UI-Änderungen als einzelner 224-Byte-Bereich in den device-local Materialbuffer übertragen.
+- Debugansichten greifen vor der Beleuchtung auf dieselben aufgelösten `SurfaceData` wie das Beauty-Rendering zu.
 
 ## OptiX: progressiver Pathtracer
 
 ```mermaid
 flowchart TD
-    Scene["Gemeinsame Szene, Kamera,<br/>Materialien und Beleuchtung"] --> Flatten["Aktuell: Instanzen zu<br/>Weltgeometrie zusammenführen"]
-    Flatten --> CudaBuffers["CUDA Vertex-, Index-,<br/>Normalen- und Materialbuffer"]
-    CudaBuffers --> GAS["OptiX Triangle GAS"]
+    Scene["Gemeinsame Szene, Kamera,<br/>Materialien und Beleuchtung"] --> CudaBuffers["Einmalige objektlokale CUDA-Buffer<br/>Vertex, Index, Normal, Tangente, UV"]
+    CudaBuffers --> GAS["Wiederverwendbares Triangle-GAS<br/>pro Mesh"]
+    GAS --> IAS["IAS mit Szeneninstanzen,<br/>Transformationen und Material-IDs"]
 
     Shader["Slang → PTX<br/>Raygen, Miss, Closest Hit"] --> Pipeline["OptiX-Pipeline und SBT"]
     Pipeline --> Launch["optixLaunch"]
-    GAS --> Launch
+    IAS --> Launch
     Params["Kleine Launch-Parameter<br/>Kamera, Samples, Bounces, Licht"] --> Launch
 
-    Launch --> Integrator["Progressiver GGX-Pathtracer<br/>direktes Licht, Sekundärpfade,<br/>Russian Roulette"]
+    Launch --> Integrator["Progressiver PBR-Pathtracer<br/>VNDF, NEE/MIS, Mesh-Lichter,<br/>SSS, Medien, Russian Roulette"]
     Integrator --> Accum["CUDA float4<br/>Akkumulationsbuffer"]
     Accum --> Tone["CUDA/OptiX Tone Mapping<br/>gepacktes RGBA8"]
     Tone --> External["Vulkan-kompatibler<br/>External-Memory-Buffer"]
@@ -91,7 +97,9 @@ Wichtige Eigenschaften:
 - SBT-Header werden beim Pipelineaufbau gepackt; pro Frame werden nur kleine Launch-Parameter aktualisiert.
 - Der OptiX-Renderpfad verwendet keinen Denoiser.
 - Die Ausgabe wird ohne synchrone Device-to-Host-Kopie oder CPU-Tone-Mapping direkt an Vulkan übergeben.
-- Separate OptiX-GAS plus IAS-Instanzen sind als nächster Geometrieausbau vorgesehen.
+- HDR wird über eine zweistufige Luminanz-/Sinus-CDF importance-gesampelt; BSDF-, Environment- und emissive Dreieckslichter werden mit MIS kombiniert.
+- Materialfaktoren aktualisieren nur einen GPU-Eintrag und setzen die Akkumulation zurück; Emissionsänderungen aktualisieren zusätzlich die Lichtverteilung.
+- CUDA-Events messen den Launch asynchron, ohne den Renderpfad per `cuCtxSynchronize()` pro Frame zu blockieren.
 
 ## Backend-Wechsel
 

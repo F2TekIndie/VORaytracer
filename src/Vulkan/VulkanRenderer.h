@@ -27,6 +27,7 @@ public:
     bool initialize(GLFWwindow* window) override;
     void shutdown() override;
     void setScene(const Scene* scene) override;
+    bool updateMaterial(std::uint32_t materialIndex) override;
     void resize(std::uint32_t width, std::uint32_t height) override;
     void resetAccumulation() override;
     bool render(const Camera& camera, const RenderSettings& settings) override;
@@ -47,6 +48,7 @@ public:
 private:
     static constexpr std::uint32_t kFramesInFlight = 2;
     static constexpr std::uint32_t kMeshletsPerTaskGroup = 32;
+    static constexpr std::uint32_t kMaxMaterialTextures = 1024;
 
     struct FrameResources
     {
@@ -69,6 +71,14 @@ private:
         GpuBuffer* destination{};
         const void* data{};
         VkDeviceSize size{};
+        VkDeviceSize destinationOffset{};
+    };
+
+    struct GpuTexture
+    {
+        VkImage image{VK_NULL_HANDLE};
+        VkDeviceMemory memory{VK_NULL_HANDLE};
+        VkImageView view{VK_NULL_HANDLE};
     };
 
     struct UploadedGeometry
@@ -128,7 +138,9 @@ private:
     void destroySwapchain();
     void destroyMeshPipeline();
     void destroySceneResources();
+    void destroyTextureResources();
     bool uploadSceneResources();
+    bool uploadTextureResources();
     bool buildAccelerationStructures();
     void destroyAccelerationStructures();
     GpuBuffer createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
@@ -168,6 +180,9 @@ private:
     bool depthImageInitialized_{};
 
     VkCommandPool commandPool_{VK_NULL_HANDLE};
+    VkQueryPool timestampQueryPool_{VK_NULL_HANDLE};
+    float timestampPeriodNanoseconds_{1.0f};
+    std::array<bool, kFramesInFlight> timestampQueryWritten_{};
     std::array<FrameResources, kFramesInFlight> frames_{};
     std::uint32_t frameSlot_{};
 
@@ -188,6 +203,8 @@ private:
     GpuBuffer sceneInstanceBuffer_{};
     GpuBuffer environmentBuffer_{};
     GpuBuffer materialBuffer_{};
+    std::vector<GpuTexture> materialTextures_;
+    VkSampler materialTextureSampler_{VK_NULL_HANDLE};
     GpuBuffer tlasStorage_{};
     GpuBuffer accelerationInstanceBuffer_{};
     std::vector<BlasResource> blases_;

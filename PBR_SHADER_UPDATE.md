@@ -1,8 +1,44 @@
 # PBR-Shader-Updateplan
 
-Stand: 12. August 2026
+Stand: 13. August 2026 – vollständig umgesetzt und verifiziert
 
 Dieses Dokument hält den vollständigen Ausbauplan für das gemeinsame PBR-Material- und BSDF-System von Vulkan und NVIDIA OptiX fest. Es ist als Arbeitsgrundlage für eine spätere, zusammenhängende Implementierung gedacht. Die bestehenden Renderpfade sind in [RENDERPFADE.md](RENDERPFADE.md) beschrieben.
+
+## Umsetzungsstand
+
+- [x] M1: Gemeinsames Fundament – abgeschlossen und am 13. August 2026 in Debug und Release, mit CPU-/Asset-Tests sowie Vulkan-/OptiX-GPU-Smoke-Tests verifiziert.
+- [x] M2: Vollständige Basistexturen – CPU-Dekodierung für externe/eingebettete Assimp-Texturen, farbraumkorrekte Mips, Deduplizierung, Vulkan-bindless-Images und CUDA-Texture-Objects; am 13. August 2026 in Debug/Release und auf beiden GPUs-Pfaden verifiziert.
+- [x] M3: BSDF-API und OptiX-Lichtsampling – gemeinsame Evaluate/Sample/PDF-API, GGX-VNDF, Directional-/HDR-NEE, zweistufige HDR-Importance-CDFs und Power-Heuristic-MIS; am 13. August 2026 in Debug/Release und mit 4K-HDR-GPU-Test verifiziert.
+- [x] M4: Clearcoat – Layer-Evaluation, Loben-Sampling/PDF, Basisenergieabschwächung sowie Factor-/Roughness-/Normal-Texturen; am 13. August 2026 in beiden Backends verifiziert.
+- [x] M5: Transmission und Glas – exaktes Fresnel, raue Mikrofacetten-BTDF, Snellius/TIR, OptiX-IOR-/Absorptionsstack und begrenzte Vulkan-Eintritt-/Austritt-Ray-Query; am 13. August 2026 in beiden Backends verifiziert.
+- [x] M6: Anisotropie – Tangentenhändigkeit einschließlich gespiegelter Instanzen, anisotropes GGX, Rotation, Textur und anisotropes VNDF; am 13. August 2026 in beiden Backends verifiziert.
+- [x] M7: Sheen und Cloth – Charlie-NDF, Evaluation/Sampling/PDF, Texturen und Energiekompensation; am 13. August 2026 in beiden Backends verifiziert.
+- [x] M8: Emissive Mesh-Lichter – einmalig aufgebaute Welt-Dreieckslichtliste, leistungsgewichtete CDF, Flächensampling, Solid-Angle-PDF, Shadow Rays und MIS-Mischung mit Environment/BSDF; am 13. August 2026 verifiziert.
+- [x] M9: Subsurface Scattering – Vulkan-Thickness-/Diffusionsapproximation und begrenzter OptiX-Random-Walk mit internem Transport; am 13. August 2026 in beiden Backends per GPU-Smoke-Test verifiziert.
+- [x] M10: Volumen – homogener Medium-Stack mit Absorption, Streuung, freier Weglänge und Henyey-Greenstein-Phase in OptiX sowie dokumentierte Vulkan-Fog-Approximation; am 13. August 2026 in beiden Backends per GPU-Smoke-Test verifiziert.
+- [x] M11: Qualität und Performance – vollständige Materialkugel-Vergleichsszene, Materialeditor mit 224-Byte-Teilupdates, 19 gemeinsame Diagnoseansichten, White-Furnace-/NaN-/Phase-Tests, Vulkan-/CUDA-GPU-Zeitmessung, Speicher-/Descriptorstatistiken, OptiX-GAS/IAS-Instanzierung und aktualisierte UI-/Renderpfaddokumentation; am 13. August 2026 vollständig verifiziert.
+
+## Abschlussverifikation
+
+Der Plan wurde am 13. August 2026 vollständig und in Meilensteinreihenfolge umgesetzt. Der gemeinsame binär getestete `GpuMaterial` umfasst alle geplanten Faktoren, Flags und stabilen Textur-IDs. Vulkan und OptiX importieren dieselben `SurfaceData` und verwenden die modularen Slang-Funktionen für BSDF-Auswertung; OptiX verwendet zusätzlich deren Sampling und PDFs.
+
+Die finale Verifikationsmatrix:
+
+| Prüfung | Ergebnis |
+|---|---|
+| Visual Studio x64 Debug | erfolgreich |
+| Visual Studio x64 Release | erfolgreich |
+| CPU-/Asset-/Layouttests Debug und Release | erfolgreich, einschließlich 1.269.612-Dreiecke-FBX |
+| Fresnel, TIR, Beer-Lambert und HG-Normalisierung | erfolgreich |
+| numerische GGX-White-Furnace- und NaN/Inf-Sweeps | erfolgreich |
+| Vulkan-PBR-Vergleichsszene | Exitcode 0, keine Validation-/Device-Fehler |
+| OptiX-PBR-Vergleichsszene | Exitcode 0, keine CUDA-/OptiX-Fehler |
+| 4096×2048-HDR in Vulkan und OptiX | Exitcode 0, keine systematischen Material-/Roughnessfehler |
+| Vulkan-Post-Denoiser über HALF4-Interop | Exitcode 0, keine CPU-Bildkopie |
+| visuelle Referenzprüfung | vollständige Materialkugeln in beiden Backends; Vulkan ohne Ein-Sample-Speckle oder Meshlet-Silhouettenlöcher |
+| GPU-Profiling und Speicher | asynchrone Vulkan-Timestamps/CUDA-Events sowie residente Byte-/Descriptorstatistiken im UI |
+
+Erwartete Compilerhinweise bleiben `E41012` für die automatisch ergänzten SPIR-V-Capabilities und `E38040` für die absichtlich uniformen Slang-Raygen-Parameter. Beide sind keine Laufzeit- oder Validierungsfehler.
 
 ## 1. Ziel
 

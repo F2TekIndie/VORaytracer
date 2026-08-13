@@ -78,11 +78,78 @@ Vec3 transformNormal(const Mat4& transform, Vec3 normal)
                       (c20 * normal.x + c21 * normal.y + c22 * normal.z) / determinant});
 }
 
+Mat4 normalTransformMatrix(const Mat4& transform)
+{
+    const float a00 = transform.m[0], a01 = transform.m[4], a02 = transform.m[8];
+    const float a10 = transform.m[1], a11 = transform.m[5], a12 = transform.m[9];
+    const float a20 = transform.m[2], a21 = transform.m[6], a22 = transform.m[10];
+    const float c00 = a11 * a22 - a12 * a21;
+    const float c01 = a12 * a20 - a10 * a22;
+    const float c02 = a10 * a21 - a11 * a20;
+    const float c10 = a02 * a21 - a01 * a22;
+    const float c11 = a00 * a22 - a02 * a20;
+    const float c12 = a01 * a20 - a00 * a21;
+    const float c20 = a01 * a12 - a02 * a11;
+    const float c21 = a02 * a10 - a00 * a12;
+    const float c22 = a00 * a11 - a01 * a10;
+    const float determinant = a00 * c00 + a01 * c01 + a02 * c02;
+    if (std::abs(determinant) < 1.0e-8f)
+        return Mat4::identity();
+    const float inverseDeterminant = 1.0f / determinant;
+    Mat4 result = Mat4::identity();
+    result.m[0] = c00 * inverseDeterminant;
+    result.m[4] = c01 * inverseDeterminant;
+    result.m[8] = c02 * inverseDeterminant;
+    result.m[1] = c10 * inverseDeterminant;
+    result.m[5] = c11 * inverseDeterminant;
+    result.m[9] = c12 * inverseDeterminant;
+    result.m[2] = c20 * inverseDeterminant;
+    result.m[6] = c21 * inverseDeterminant;
+    result.m[10] = c22 * inverseDeterminant;
+    return result;
+}
+
+Vec3 transformDirection(const Mat4& transform, Vec3 direction)
+{
+    return normalize({transform.m[0] * direction.x + transform.m[4] * direction.y + transform.m[8] * direction.z,
+                      transform.m[1] * direction.x + transform.m[5] * direction.y + transform.m[9] * direction.z,
+                      transform.m[2] * direction.x + transform.m[6] * direction.y + transform.m[10] * direction.z});
+}
+
+float transformHandedness(const Mat4& transform)
+{
+    const float determinant = transform.m[0] * (transform.m[5] * transform.m[10] - transform.m[9] * transform.m[6]) -
+                              transform.m[4] * (transform.m[1] * transform.m[10] - transform.m[9] * transform.m[2]) +
+                              transform.m[8] * (transform.m[1] * transform.m[6] - transform.m[5] * transform.m[2]);
+    return determinant < 0.0f ? -1.0f : 1.0f;
+}
+
 struct SlangStructuredBuffer
 {
     CUdeviceptr data;
     std::size_t count;
 };
+
+struct alignas(16) GpuEmissiveTriangle
+{
+    Vec4 position0;
+    Vec4 position1;
+    Vec4 position2;
+    Vec4 emissionAndArea;
+    Vec4 cdfAndPower;
+};
+static_assert(sizeof(GpuEmissiveTriangle) == 80);
+
+struct alignas(16) GpuOptixInstance
+{
+    Mat4 transform;
+    Mat4 normalTransform;
+    std::uint32_t geometry[4];
+    std::uint32_t materialIndex;
+    float handedness;
+    std::uint32_t padding[2];
+};
+static_assert(sizeof(GpuOptixInstance) == 160);
 
 struct LaunchParameters
 {
@@ -92,10 +159,16 @@ struct LaunchParameters
     SlangStructuredBuffer normalGuide;
     SlangStructuredBuffer displayOutput;
     SlangStructuredBuffer normals;
+    SlangStructuredBuffer tangents;
+    SlangStructuredBuffer uvs;
     SlangStructuredBuffer indices;
-    SlangStructuredBuffer triangleMaterialIndices;
+    SlangStructuredBuffer instances;
     SlangStructuredBuffer materials;
+    SlangStructuredBuffer emissiveTriangles;
     SlangStructuredBuffer environmentPixels;
+    SlangStructuredBuffer environmentConditionalCdf;
+    SlangStructuredBuffer environmentMarginalCdf;
+    CUdeviceptr materialTextureTable;
     OptixTraversableHandle scene;
     std::uint32_t width;
     std::uint32_t height;
@@ -109,7 +182,8 @@ struct LaunchParameters
     float exposure;
     std::uint32_t writeDisplay;
     std::uint32_t materialOverrideId;
-    std::uint32_t padding[2];
+    std::uint32_t debugView;
+    std::uint32_t padding;
     std::uint32_t indirectLighting;
     std::uint32_t globalLightMode;
     std::uint32_t environmentWidth;
@@ -118,6 +192,9 @@ struct LaunchParameters
     float environmentRotation;
     std::uint32_t environmentVisible;
     std::uint32_t environmentMipCount;
+    float environmentImportanceTotal;
+    float emissiveLightPower;
+    std::uint32_t importancePadding[2];
     Vec4 cameraPositionAndFov;
     Vec4 cameraTargetAndAspect;
     Vec4 cameraUp;
@@ -140,8 +217,8 @@ struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) EmptyRecord
     std::array<char, OPTIX_SBT_RECORD_HEADER_SIZE> header{};
 };
 
-static_assert(sizeof(LaunchParameters) == 400);
-static_assert(sizeof(RaygenRecord) == 432);
+static_assert(sizeof(LaunchParameters) % alignof(CUdeviceptr) == 0);
+static_assert(sizeof(RaygenRecord) % OPTIX_SBT_RECORD_ALIGNMENT == 0);
 static_assert(sizeof(EmptyRecord) == OPTIX_SBT_RECORD_HEADER_SIZE);
 } // namespace
 
@@ -163,6 +240,8 @@ bool OptixRenderer::initialize(GLFWwindow* window)
         checkCuda(cuCtxCreate(&cudaContext_, nullptr, 0, cudaDevice_), "cuCtxCreate");
         checkCuda(cuStreamCreate(&cudaStream_, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
         checkCuda(cuEventCreate(&launchParameterCopyComplete_, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        checkCuda(cuEventCreate(&launchTimingStart_, CU_EVENT_DEFAULT), "cuEventCreate(launch timing start)");
+        checkCuda(cuEventCreate(&launchTimingEnd_, CU_EVENT_DEFAULT), "cuEventCreate(launch timing end)");
         checkCuda(cuMemHostAlloc(&launchParametersHost_, sizeof(LaunchParameters), CU_MEMHOSTALLOC_PORTABLE),
                   "cuMemHostAlloc(launch parameters)");
         checkOptix(optixInit(), "optixInit");
@@ -222,6 +301,13 @@ void OptixRenderer::shutdown()
     if (launchParameterCopyComplete_)
         cuEventDestroy(launchParameterCopyComplete_);
     launchParameterCopyComplete_ = nullptr;
+    if (launchTimingStart_)
+        cuEventDestroy(launchTimingStart_);
+    if (launchTimingEnd_)
+        cuEventDestroy(launchTimingEnd_);
+    launchTimingStart_ = nullptr;
+    launchTimingEnd_ = nullptr;
+    launchTimingPending_ = false;
     if (cudaStream_)
         cuStreamDestroy(cudaStream_);
     cudaStream_ = nullptr;
@@ -238,6 +324,29 @@ void OptixRenderer::setScene(const Scene* scene)
     if (available_ && !buildSceneAcceleration())
         log(LogLevel::Error, "OptiX scene acceleration build failed: " + unavailableReason_);
     resetAccumulation();
+}
+
+bool OptixRenderer::updateMaterial(std::uint32_t materialIndex)
+{
+    if (!available_ || !scene_ || !materialBuffer_ || scene_->materials.size() != materialCount_ ||
+        materialIndex >= scene_->materials.size())
+        return false;
+    try
+    {
+        checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent(material update)");
+        const GpuMaterial material = scene_->materials[materialIndex].toGpu();
+        checkCuda(cuMemcpyHtoDAsync(materialBuffer_ + materialIndex * sizeof(GpuMaterial), &material,
+                                    sizeof(GpuMaterial), cudaStream_),
+                  "cuMemcpyHtoDAsync(OptiX materials)");
+        checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(material update)");
+        resetAccumulation();
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        return false;
+    }
 }
 
 void OptixRenderer::resize(std::uint32_t width, std::uint32_t height)
@@ -335,6 +444,15 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
         if (!updateShaderBindingTable(camera, settings))
             return false;
+        if (launchTimingPending_ && cuEventQuery(launchTimingEnd_) == CUDA_SUCCESS)
+        {
+            float elapsedMilliseconds = 0.0f;
+            checkCuda(cuEventElapsedTime(&elapsedMilliseconds, launchTimingStart_, launchTimingEnd_),
+                      "cuEventElapsedTime(OptiX launch)");
+            stats_.gpuMilliseconds = elapsedMilliseconds;
+            launchTimingPending_ = false;
+        }
+        const bool recordLaunchTiming = !launchTimingPending_;
         OptixShaderBindingTable shaderBindingTable{};
         shaderBindingTable.raygenRecord = raygenRecord_;
         shaderBindingTable.missRecordBase = missRecord_;
@@ -349,10 +467,17 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
             checkCuda(cuWaitExternalSemaphoresAsync(&vulkanCompleteSemaphore_, &waitParams, 1, cudaStream_),
                       "cuWaitExternalSemaphoresAsync(Vulkan complete)");
         }
+        if (recordLaunchTiming)
+            checkCuda(cuEventRecord(launchTimingStart_, cudaStream_), "cuEventRecord(OptiX launch start)");
         checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &shaderBindingTable, width_, height_, 1), "optixLaunch");
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
         checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
                   "cuSignalExternalSemaphoresAsync(CUDA ready)");
+        if (recordLaunchTiming)
+        {
+            checkCuda(cuEventRecord(launchTimingEnd_, cudaStream_), "cuEventRecord(OptiX launch end)");
+            launchTimingPending_ = true;
+        }
         firstInteropLaunch_ = false;
         ++stats_.frameIndex;
         stats_.accumulatedSamples += settings.samplesPerFrame;
@@ -588,6 +713,101 @@ void OptixRenderer::destroyOutputBuffers()
     outputBuffer_ = 0;
 }
 
+bool OptixRenderer::uploadTextureResources()
+{
+    TextureReference fallback{};
+    fallback.width = 1;
+    fallback.height = 1;
+    fallback.mipCount = 1;
+    fallback.mipOffsets = {0};
+    fallback.rgba8Pixels = {255, 255, 255, 255};
+    std::vector<const TextureReference*> sources;
+    if (scene_ && !scene_->textures.empty())
+    {
+        if (scene_->textures.size() > 1024)
+            throw std::runtime_error("Scene exceeds the OptiX material texture limit");
+        sources.reserve(scene_->textures.size());
+        for (const TextureReference& texture : scene_->textures)
+            sources.push_back(texture.valid() ? &texture : &fallback);
+    }
+    else
+        sources.push_back(&fallback);
+
+    textureArrays_.reserve(sources.size());
+    textureObjects_.reserve(sources.size());
+    for (const TextureReference* sourcePointer : sources)
+    {
+        const TextureReference& source = *sourcePointer;
+        CUDA_ARRAY3D_DESCRIPTOR arrayDescription{};
+        arrayDescription.Width = source.width;
+        arrayDescription.Height = source.height;
+        arrayDescription.Depth = 0;
+        arrayDescription.Format = CU_AD_FORMAT_UNSIGNED_INT8;
+        arrayDescription.NumChannels = 4;
+        CUmipmappedArray mipmappedArray{};
+        checkCuda(cuMipmappedArrayCreate(&mipmappedArray, &arrayDescription, source.mipCount),
+                  "cuMipmappedArrayCreate(material texture)");
+        textureArrays_.push_back(mipmappedArray);
+        std::uint32_t width = source.width;
+        std::uint32_t height = source.height;
+        for (std::uint32_t mip = 0; mip < source.mipCount; ++mip)
+        {
+            CUarray level{};
+            checkCuda(cuMipmappedArrayGetLevel(&level, mipmappedArray, mip),
+                      "cuMipmappedArrayGetLevel(material texture)");
+            CUDA_MEMCPY2D copy{};
+            copy.srcMemoryType = CU_MEMORYTYPE_HOST;
+            copy.srcHost = source.rgba8Pixels.data() + source.mipOffsets[mip];
+            copy.srcPitch = static_cast<std::size_t>(width) * 4;
+            copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+            copy.dstArray = level;
+            copy.WidthInBytes = static_cast<std::size_t>(width) * 4;
+            copy.Height = height;
+            checkCuda(cuMemcpy2D(&copy), "cuMemcpy2D(material texture)");
+            width = std::max(width / 2, 1u);
+            height = std::max(height / 2, 1u);
+        }
+
+        CUDA_RESOURCE_DESC resource{};
+        resource.resType = CU_RESOURCE_TYPE_MIPMAPPED_ARRAY;
+        resource.res.mipmap.hMipmappedArray = mipmappedArray;
+        CUDA_TEXTURE_DESC textureDescription{};
+        textureDescription.addressMode[0] = CU_TR_ADDRESS_MODE_WRAP;
+        textureDescription.addressMode[1] = CU_TR_ADDRESS_MODE_WRAP;
+        textureDescription.addressMode[2] = CU_TR_ADDRESS_MODE_WRAP;
+        textureDescription.filterMode = CU_TR_FILTER_MODE_LINEAR;
+        textureDescription.mipmapFilterMode = CU_TR_FILTER_MODE_LINEAR;
+        textureDescription.flags = CU_TRSF_NORMALIZED_COORDINATES | (source.srgb ? CU_TRSF_SRGB : 0u);
+        textureDescription.maxMipmapLevelClamp = static_cast<float>(source.mipCount - 1);
+        CUtexObject textureObject{};
+        checkCuda(cuTexObjectCreate(&textureObject, &resource, &textureDescription, nullptr),
+                  "cuTexObjectCreate(material texture)");
+        textureObjects_.push_back(textureObject);
+    }
+    constexpr std::size_t textureTableEntries = 1024;
+    std::vector<CUtexObject> textureTable(textureTableEntries + 1, 0);
+    std::copy(textureObjects_.begin(), textureObjects_.end(), textureTable.begin());
+    checkCuda(cuMemAlloc(&textureTableBuffer_, textureTable.size() * sizeof(CUtexObject)),
+              "cuMemAlloc(material texture table)");
+    checkCuda(cuMemcpyHtoD(textureTableBuffer_, textureTable.data(),
+                           textureTable.size() * sizeof(CUtexObject)),
+              "cuMemcpyHtoD(material texture table)");
+    return true;
+}
+
+void OptixRenderer::destroyTextureResources()
+{
+    if (textureTableBuffer_)
+        cuMemFree(textureTableBuffer_);
+    textureTableBuffer_ = 0;
+    for (CUtexObject texture : textureObjects_)
+        cuTexObjectDestroy(texture);
+    textureObjects_.clear();
+    for (CUmipmappedArray array : textureArrays_)
+        cuMipmappedArrayDestroy(array);
+    textureArrays_.clear();
+}
+
 bool OptixRenderer::buildSceneAcceleration()
 {
     try
@@ -599,122 +819,319 @@ bool OptixRenderer::buildSceneAcceleration()
 
         std::vector<Vec3> positions;
         std::vector<Vec3> normals;
+        std::vector<Vec4> tangents;
+        std::vector<Vec2> uvs;
         std::vector<std::uint32_t> indices;
-        std::vector<std::uint32_t> triangleMaterialIndices;
-        const auto appendInstance = [&](const Mesh& mesh, const Mat4& transform) {
+        struct MeshGeometry
+        {
+            std::uint32_t vertexOffset{};
+            std::uint32_t vertexCount{};
+            std::uint32_t triangleOffset{};
+            std::uint32_t triangleCount{};
+            std::uint32_t materialIndex{};
+            bool valid{};
+        };
+        std::vector<MeshGeometry> meshGeometries(scene_->meshes.size());
+        for (std::uint32_t meshIndex = 0; meshIndex < scene_->meshes.size(); ++meshIndex)
+        {
+            const Mesh& mesh = scene_->meshes[meshIndex];
             if (mesh.vertices.empty() || mesh.lods.empty() || mesh.lods.front().indices.empty())
-                return;
-            const std::uint32_t vertexBase = static_cast<std::uint32_t>(positions.size());
+                continue;
+            MeshGeometry& geometry = meshGeometries[meshIndex];
+            geometry.vertexOffset = static_cast<std::uint32_t>(positions.size());
+            geometry.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
+            geometry.triangleOffset = static_cast<std::uint32_t>(indices.size() / 3);
+            geometry.triangleCount = static_cast<std::uint32_t>(mesh.lods.front().indices.size() / 3);
+            geometry.materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
+            geometry.valid = true;
             for (const Vertex& vertex : mesh.vertices)
             {
-                const Vec3& p = vertex.position;
-                positions.push_back({transform.m[0] * p.x + transform.m[4] * p.y + transform.m[8] * p.z + transform.m[12],
-                                     transform.m[1] * p.x + transform.m[5] * p.y + transform.m[9] * p.z + transform.m[13],
-                                     transform.m[2] * p.x + transform.m[6] * p.y + transform.m[10] * p.z + transform.m[14]});
-                normals.push_back(transformNormal(transform, vertex.normal));
+                positions.push_back(vertex.position);
+                normals.push_back(vertex.normal);
+                tangents.push_back(vertex.tangent);
+                uvs.push_back(vertex.uv);
             }
             for (std::uint32_t index : mesh.lods.front().indices)
-                indices.push_back(vertexBase + index);
-            const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
-            triangleMaterialIndices.insert(triangleMaterialIndices.end(), mesh.lods.front().indices.size() / 3,
-                                           materialIndex);
+                indices.push_back(index);
+        }
+
+        std::vector<GpuOptixInstance> gpuInstances;
+        std::vector<std::uint32_t> instanceMeshIndices;
+        const auto appendInstance = [&](std::uint32_t meshIndex, const Mat4& transform) {
+            if (meshIndex >= meshGeometries.size() || !meshGeometries[meshIndex].valid)
+                return;
+            const MeshGeometry& geometry = meshGeometries[meshIndex];
+            gpuInstances.push_back({transform, normalTransformMatrix(transform),
+                                    {geometry.vertexOffset, geometry.triangleOffset, geometry.triangleCount, 0u},
+                                    geometry.materialIndex, transformHandedness(transform), {}});
+            instanceMeshIndices.push_back(meshIndex);
         };
         if (!scene_->instances.empty())
         {
             for (const Instance& instance : scene_->instances)
-            {
-                if (instance.meshIndex < scene_->meshes.size())
-                    appendInstance(scene_->meshes[instance.meshIndex], instance.transform);
-            }
+                appendInstance(instance.meshIndex, instance.transform);
         }
         else
         {
             const Mat4 identity = Mat4::identity();
-            for (const Mesh& mesh : scene_->meshes)
-                appendInstance(mesh, identity);
+            for (std::uint32_t meshIndex = 0; meshIndex < scene_->meshes.size(); ++meshIndex)
+                appendInstance(meshIndex, identity);
         }
-        if (positions.empty() || indices.size() < 3)
+        if (positions.empty() || indices.size() < 3 || gpuInstances.empty())
             throw std::runtime_error("Scene contains no indexed triangles for OptiX");
 
         const std::size_t vertexBytes = positions.size() * sizeof(Vec3);
         const std::size_t normalBytes = normals.size() * sizeof(Vec3);
+        const std::size_t tangentBytes = tangents.size() * sizeof(Vec4);
+        const std::size_t uvBytes = uvs.size() * sizeof(Vec2);
         const std::size_t indexBytes = indices.size() * sizeof(std::uint32_t);
-        const std::size_t triangleMaterialBytes = triangleMaterialIndices.size() * sizeof(std::uint32_t);
-        struct alignas(16) GpuMaterial
-        {
-            Vec4 baseColorAndMetallic;
-            Vec4 emissiveAndRoughness;
-        };
+        const std::size_t instanceBytes = gpuInstances.size() * sizeof(GpuOptixInstance);
         std::vector<GpuMaterial> materials;
         materials.reserve(std::max<std::size_t>(scene_->materials.size(), 1));
         if (scene_->materials.empty())
-            materials.push_back({{1.0f, 1.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f}});
+            materials.push_back(Material{}.toGpu());
         else
         {
             for (const Material& material : scene_->materials)
             {
-                materials.push_back({{material.baseColor.x, material.baseColor.y, material.baseColor.z, material.metallic},
-                                     {material.emissive.x, material.emissive.y, material.emissive.z, material.roughness}});
+                materials.push_back(material.toGpu());
             }
         }
         const std::size_t materialBytes = materials.size() * sizeof(GpuMaterial);
+        std::vector<GpuEmissiveTriangle> emissiveTriangles;
+        float emissiveTotalPower = 0.0f;
+        for (std::size_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
+        {
+            const GpuOptixInstance& instance = gpuInstances[instanceIndex];
+            const std::uint32_t materialIndex = instance.materialIndex;
+            if (materialIndex >= scene_->materials.size())
+                continue;
+            const Material& material = scene_->materials[materialIndex];
+            const float luminance = material.emissive.x * 0.2126f + material.emissive.y * 0.7152f +
+                                    material.emissive.z * 0.0722f;
+            if (luminance <= 1.0e-6f)
+                continue;
+            const auto worldPoint = [&](Vec3 point) {
+                return Vec3{instance.transform.m[0] * point.x + instance.transform.m[4] * point.y +
+                                instance.transform.m[8] * point.z + instance.transform.m[12],
+                            instance.transform.m[1] * point.x + instance.transform.m[5] * point.y +
+                                instance.transform.m[9] * point.z + instance.transform.m[13],
+                            instance.transform.m[2] * point.x + instance.transform.m[6] * point.y +
+                                instance.transform.m[10] * point.z + instance.transform.m[14]};
+            };
+            for (std::uint32_t triangleIndex = 0; triangleIndex < instance.geometry[2]; ++triangleIndex)
+            {
+                const std::uint32_t triangleBase = (instance.geometry[1] + triangleIndex) * 3;
+                const Vec3 position0 = worldPoint(positions[instance.geometry[0] + indices[triangleBase + 0]]);
+                const Vec3 position1 = worldPoint(positions[instance.geometry[0] + indices[triangleBase + 1]]);
+                const Vec3 position2 = worldPoint(positions[instance.geometry[0] + indices[triangleBase + 2]]);
+                const float area = 0.5f * length(cross(position1 - position0, position2 - position0));
+                const float power = luminance * area;
+                if (power <= 1.0e-10f)
+                    continue;
+                const float previousPower = emissiveTotalPower;
+                emissiveTotalPower += power;
+                emissiveTriangles.push_back({{position0.x, position0.y, position0.z, 1.0f},
+                                             {position1.x, position1.y, position1.z, 1.0f},
+                                             {position2.x, position2.y, position2.z, 1.0f},
+                                             {material.emissive.x, material.emissive.y, material.emissive.z, area},
+                                             {previousPower, emissiveTotalPower, power, 0.0f}});
+            }
+        }
+        if (emissiveTriangles.empty())
+            emissiveTriangles.push_back({});
+        else
+        {
+            for (GpuEmissiveTriangle& triangle : emissiveTriangles)
+            {
+                triangle.cdfAndPower.x /= emissiveTotalPower;
+                triangle.cdfAndPower.y /= emissiveTotalPower;
+            }
+        }
+        const std::size_t emissiveTriangleBytes = emissiveTriangles.size() * sizeof(GpuEmissiveTriangle);
         const Vec4 fallbackEnvironment{0.0f, 0.0f, 0.0f, 1.0f};
         const Vec4* environmentData = scene_->environment.hasHdr() ? scene_->environment.hdrPixels.data()
                                                                    : &fallbackEnvironment;
         environmentPixelCount_ = scene_->environment.hasHdr() ? scene_->environment.hdrPixels.size() : 1;
         const std::size_t environmentBytes = environmentPixelCount_ * sizeof(Vec4);
+        constexpr std::array<float, 2> fallbackCdf{0.0f, 1.0f};
+        const bool validImportance = scene_->environment.hasHdr() &&
+                                     scene_->environment.hdrConditionalCdf.size() ==
+                                         static_cast<std::size_t>(scene_->environment.hdrHeight) *
+                                             (scene_->environment.hdrWidth + 1u) &&
+                                     scene_->environment.hdrMarginalCdf.size() == scene_->environment.hdrHeight + 1u;
+        const float* conditionalCdfData = validImportance ? scene_->environment.hdrConditionalCdf.data()
+                                                          : fallbackCdf.data();
+        const float* marginalCdfData = validImportance ? scene_->environment.hdrMarginalCdf.data()
+                                                       : fallbackCdf.data();
+        environmentConditionalCdfCount_ = validImportance ? scene_->environment.hdrConditionalCdf.size() : 2;
+        environmentMarginalCdfCount_ = validImportance ? scene_->environment.hdrMarginalCdf.size() : 2;
+        uploadTextureResources();
         checkCuda(cuMemAlloc(&vertexBuffer_, vertexBytes), "cuMemAlloc(OptiX vertices)");
         checkCuda(cuMemAlloc(&normalBuffer_, normalBytes), "cuMemAlloc(OptiX normals)");
+        checkCuda(cuMemAlloc(&tangentBuffer_, tangentBytes), "cuMemAlloc(OptiX tangents)");
+        checkCuda(cuMemAlloc(&uvBuffer_, uvBytes), "cuMemAlloc(OptiX UVs)");
         checkCuda(cuMemAlloc(&indexBuffer_, indexBytes), "cuMemAlloc(OptiX indices)");
-        checkCuda(cuMemAlloc(&triangleMaterialIndexBuffer_, triangleMaterialBytes),
-                  "cuMemAlloc(OptiX triangle materials)");
+        checkCuda(cuMemAlloc(&instanceBuffer_, instanceBytes), "cuMemAlloc(OptiX instances)");
         checkCuda(cuMemAlloc(&materialBuffer_, materialBytes), "cuMemAlloc(OptiX materials)");
+        checkCuda(cuMemAlloc(&emissiveTriangleBuffer_, emissiveTriangleBytes),
+                  "cuMemAlloc(OptiX emissive triangles)");
         checkCuda(cuMemAlloc(&environmentBuffer_, environmentBytes), "cuMemAlloc(OptiX HDR environment)");
+        checkCuda(cuMemAlloc(&environmentConditionalCdfBuffer_, environmentConditionalCdfCount_ * sizeof(float)),
+                  "cuMemAlloc(OptiX HDR conditional CDF)");
+        checkCuda(cuMemAlloc(&environmentMarginalCdfBuffer_, environmentMarginalCdfCount_ * sizeof(float)),
+                  "cuMemAlloc(OptiX HDR marginal CDF)");
         checkCuda(cuMemcpyHtoD(vertexBuffer_, positions.data(), vertexBytes), "cuMemcpyHtoD(OptiX vertices)");
         checkCuda(cuMemcpyHtoD(normalBuffer_, normals.data(), normalBytes), "cuMemcpyHtoD(OptiX normals)");
+        checkCuda(cuMemcpyHtoD(tangentBuffer_, tangents.data(), tangentBytes), "cuMemcpyHtoD(OptiX tangents)");
+        checkCuda(cuMemcpyHtoD(uvBuffer_, uvs.data(), uvBytes), "cuMemcpyHtoD(OptiX UVs)");
         checkCuda(cuMemcpyHtoD(indexBuffer_, indices.data(), indexBytes), "cuMemcpyHtoD(OptiX indices)");
-        checkCuda(cuMemcpyHtoD(triangleMaterialIndexBuffer_, triangleMaterialIndices.data(), triangleMaterialBytes),
-                  "cuMemcpyHtoD(OptiX triangle materials)");
+        checkCuda(cuMemcpyHtoD(instanceBuffer_, gpuInstances.data(), instanceBytes),
+                  "cuMemcpyHtoD(OptiX instances)");
         checkCuda(cuMemcpyHtoD(materialBuffer_, materials.data(), materialBytes), "cuMemcpyHtoD(OptiX materials)");
+        checkCuda(cuMemcpyHtoD(emissiveTriangleBuffer_, emissiveTriangles.data(), emissiveTriangleBytes),
+                  "cuMemcpyHtoD(OptiX emissive triangles)");
         checkCuda(cuMemcpyHtoD(environmentBuffer_, environmentData, environmentBytes),
                   "cuMemcpyHtoD(OptiX HDR environment)");
+        checkCuda(cuMemcpyHtoD(environmentConditionalCdfBuffer_, conditionalCdfData,
+                               environmentConditionalCdfCount_ * sizeof(float)),
+                  "cuMemcpyHtoD(OptiX HDR conditional CDF)");
+        checkCuda(cuMemcpyHtoD(environmentMarginalCdfBuffer_, marginalCdfData,
+                               environmentMarginalCdfCount_ * sizeof(float)),
+                  "cuMemcpyHtoD(OptiX HDR marginal CDF)");
         vertexCount_ = positions.size();
         triangleCount_ = indices.size() / 3;
         materialCount_ = materials.size();
+        instanceCount_ = gpuInstances.size();
+        emissiveTriangleCount_ = emissiveTotalPower > 0.0f ? emissiveTriangles.size() : 0;
+        emissiveLightPower_ = emissiveTotalPower;
 
         const std::uint32_t geometryFlags = OPTIX_GEOMETRY_FLAG_NONE;
-        CUdeviceptr vertexBuffers[] = {vertexBuffer_};
-        OptixBuildInput buildInput{};
-        buildInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-        buildInput.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-        buildInput.triangleArray.vertexStrideInBytes = sizeof(Vec3);
-        buildInput.triangleArray.numVertices = static_cast<std::uint32_t>(positions.size());
-        buildInput.triangleArray.vertexBuffers = vertexBuffers;
-        buildInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-        buildInput.triangleArray.indexStrideInBytes = 3 * sizeof(std::uint32_t);
-        buildInput.triangleArray.numIndexTriplets = static_cast<std::uint32_t>(indices.size() / 3);
-        buildInput.triangleArray.indexBuffer = indexBuffer_;
-        buildInput.triangleArray.flags = &geometryFlags;
-        buildInput.triangleArray.numSbtRecords = 1;
-
         OptixAccelBuildOptions buildOptions{};
         buildOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
         buildOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
-        OptixAccelBufferSizes sizes{};
-        checkOptix(optixAccelComputeMemoryUsage(optixContext_, &buildOptions, &buildInput, 1, &sizes),
-                   "optixAccelComputeMemoryUsage");
+        struct GasBuildRecord
+        {
+            std::uint32_t meshIndex{};
+            CUdeviceptr vertexData{};
+            OptixBuildInput input{};
+            OptixAccelBufferSizes sizes{};
+        };
+        std::vector<GasBuildRecord> gasBuilds;
+        gasBuilds.reserve(scene_->meshes.size());
+        std::size_t maximumGasTemporarySize = 0;
+        for (std::uint32_t meshIndex = 0; meshIndex < meshGeometries.size(); ++meshIndex)
+        {
+            const MeshGeometry& geometry = meshGeometries[meshIndex];
+            if (!geometry.valid)
+                continue;
+            gasBuilds.push_back({});
+            GasBuildRecord& record = gasBuilds.back();
+            record.meshIndex = meshIndex;
+            record.vertexData = vertexBuffer_ + static_cast<CUdeviceptr>(geometry.vertexOffset) * sizeof(Vec3);
+            record.input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+            record.input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            record.input.triangleArray.vertexStrideInBytes = sizeof(Vec3);
+            record.input.triangleArray.numVertices = geometry.vertexCount;
+            record.input.triangleArray.vertexBuffers = &record.vertexData;
+            record.input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            record.input.triangleArray.indexStrideInBytes = 3 * sizeof(std::uint32_t);
+            record.input.triangleArray.numIndexTriplets = geometry.triangleCount;
+            record.input.triangleArray.indexBuffer = indexBuffer_ +
+                static_cast<CUdeviceptr>(geometry.triangleOffset) * 3 * sizeof(std::uint32_t);
+            record.input.triangleArray.flags = &geometryFlags;
+            record.input.triangleArray.numSbtRecords = 1;
+            checkOptix(optixAccelComputeMemoryUsage(optixContext_, &buildOptions, &record.input, 1,
+                                                    &record.sizes),
+                       "optixAccelComputeMemoryUsage(GAS)");
+            maximumGasTemporarySize = std::max(maximumGasTemporarySize, record.sizes.tempSizeInBytes);
+        }
 
         CUdeviceptr temporaryBuffer = 0;
-        checkCuda(cuMemAlloc(&temporaryBuffer, sizes.tempSizeInBytes), "cuMemAlloc(OptiX GAS temporary)");
-        checkCuda(cuMemAlloc(&gasBuffer_, sizes.outputSizeInBytes), "cuMemAlloc(OptiX GAS)");
-        const OptixResult buildResult = optixAccelBuild(optixContext_, nullptr, &buildOptions, &buildInput, 1,
-                                                        temporaryBuffer, sizes.tempSizeInBytes, gasBuffer_,
-                                                        sizes.outputSizeInBytes, &gasHandle_, nullptr, 0);
+        checkCuda(cuMemAlloc(&temporaryBuffer, maximumGasTemporarySize), "cuMemAlloc(OptiX GAS temporary)");
+        std::vector<OptixTraversableHandle> meshHandles(scene_->meshes.size(), 0);
+        std::size_t accelerationBytes = 0;
+        for (GasBuildRecord& record : gasBuilds)
+        {
+            CUdeviceptr output = 0;
+            checkCuda(cuMemAlloc(&output, record.sizes.outputSizeInBytes), "cuMemAlloc(OptiX mesh GAS)");
+            meshGasBuffers_.push_back(output);
+            OptixTraversableHandle handle = 0;
+            checkOptix(optixAccelBuild(optixContext_, cudaStream_, &buildOptions, &record.input, 1,
+                                       temporaryBuffer, record.sizes.tempSizeInBytes, output,
+                                       record.sizes.outputSizeInBytes, &handle, nullptr, 0),
+                       "optixAccelBuild(mesh GAS)");
+            meshHandles[record.meshIndex] = handle;
+            accelerationBytes += record.sizes.outputSizeInBytes;
+        }
         cuMemFree(temporaryBuffer);
-        checkOptix(buildResult, "optixAccelBuild");
-        checkCuda(cuCtxSynchronize(), "cuCtxSynchronize(OptiX GAS)");
-        log(LogLevel::Info, "OptiX scene GAS: " + std::to_string(positions.size()) + " vertices, " +
-                                std::to_string(indices.size() / 3) + " triangles");
+        temporaryBuffer = 0;
+
+        std::vector<OptixInstance> optixInstances(gpuInstances.size());
+        for (std::uint32_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
+        {
+            const Mat4& transform = gpuInstances[instanceIndex].transform;
+            OptixInstance& instance = optixInstances[instanceIndex];
+            instance.transform[0] = transform.m[0];
+            instance.transform[1] = transform.m[4];
+            instance.transform[2] = transform.m[8];
+            instance.transform[3] = transform.m[12];
+            instance.transform[4] = transform.m[1];
+            instance.transform[5] = transform.m[5];
+            instance.transform[6] = transform.m[9];
+            instance.transform[7] = transform.m[13];
+            instance.transform[8] = transform.m[2];
+            instance.transform[9] = transform.m[6];
+            instance.transform[10] = transform.m[10];
+            instance.transform[11] = transform.m[14];
+            instance.instanceId = instanceIndex;
+            instance.sbtOffset = 0;
+            instance.visibilityMask = 0xff;
+            instance.flags = OPTIX_INSTANCE_FLAG_NONE;
+            instance.traversableHandle = meshHandles[instanceMeshIndices[instanceIndex]];
+        }
+        const std::size_t iasInstanceBytes = optixInstances.size() * sizeof(OptixInstance);
+        checkCuda(cuMemAlloc(&iasInstanceBuffer_, iasInstanceBytes), "cuMemAlloc(OptiX IAS instances)");
+        checkCuda(cuMemcpyHtoDAsync(iasInstanceBuffer_, optixInstances.data(), iasInstanceBytes, cudaStream_),
+                  "cuMemcpyHtoDAsync(OptiX IAS instances)");
+        OptixBuildInput iasInput{};
+        iasInput.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+        iasInput.instanceArray.instances = iasInstanceBuffer_;
+        iasInput.instanceArray.numInstances = static_cast<std::uint32_t>(optixInstances.size());
+        OptixAccelBufferSizes iasSizes{};
+        checkOptix(optixAccelComputeMemoryUsage(optixContext_, &buildOptions, &iasInput, 1, &iasSizes),
+                   "optixAccelComputeMemoryUsage(IAS)");
+        checkCuda(cuMemAlloc(&temporaryBuffer, iasSizes.tempSizeInBytes), "cuMemAlloc(OptiX IAS temporary)");
+        checkCuda(cuMemAlloc(&gasBuffer_, iasSizes.outputSizeInBytes), "cuMemAlloc(OptiX IAS)");
+        checkOptix(optixAccelBuild(optixContext_, cudaStream_, &buildOptions, &iasInput, 1,
+                                   temporaryBuffer, iasSizes.tempSizeInBytes, gasBuffer_,
+                                   iasSizes.outputSizeInBytes, &gasHandle_, nullptr, 0),
+                   "optixAccelBuild(IAS)");
+        checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(OptiX GAS/IAS)");
+        cuMemFree(temporaryBuffer);
+        accelerationBytes += iasSizes.outputSizeInBytes + iasInstanceBytes;
+        stats_.materialBytes = materialBytes;
+        stats_.residentMaterials = static_cast<std::uint32_t>(materials.size());
+        stats_.residentTextures = static_cast<std::uint32_t>(textureObjects_.size());
+        stats_.descriptorCapacity = 1024;
+        stats_.textureBytes = 0;
+        if (scene_ && !scene_->textures.empty())
+        {
+            for (const TextureReference& texture : scene_->textures)
+                stats_.textureBytes += texture.rgba8Pixels.size();
+        }
+        else
+            stats_.textureBytes = 4;
+        stats_.gpuSceneBytes = vertexBytes + normalBytes + tangentBytes + uvBytes + indexBytes +
+                               materialBytes + emissiveTriangleBytes + environmentBytes +
+                               environmentConditionalCdfCount_ * sizeof(float) +
+                               environmentMarginalCdfCount_ * sizeof(float) + instanceBytes + accelerationBytes +
+                               stats_.textureBytes;
+        log(LogLevel::Info, "OptiX scene GAS/IAS: " + std::to_string(positions.size()) + " unique vertices, " +
+                                std::to_string(indices.size() / 3) + " unique triangles, " +
+                                std::to_string(gasBuilds.size()) + " GAS, " +
+                                std::to_string(gpuInstances.size()) + " IAS instances, " +
+                                std::to_string(emissiveTriangleCount_) + " emissive lights");
         return true;
     }
     catch (const std::exception& error)
@@ -727,32 +1144,64 @@ bool OptixRenderer::buildSceneAcceleration()
 
 void OptixRenderer::destroySceneAcceleration()
 {
+    destroyTextureResources();
     if (gasBuffer_)
         cuMemFree(gasBuffer_);
+    for (CUdeviceptr meshGas : meshGasBuffers_)
+        cuMemFree(meshGas);
+    meshGasBuffers_.clear();
+    if (iasInstanceBuffer_)
+        cuMemFree(iasInstanceBuffer_);
     if (indexBuffer_)
         cuMemFree(indexBuffer_);
     if (materialBuffer_)
         cuMemFree(materialBuffer_);
+    if (emissiveTriangleBuffer_)
+        cuMemFree(emissiveTriangleBuffer_);
     if (environmentBuffer_)
         cuMemFree(environmentBuffer_);
-    if (triangleMaterialIndexBuffer_)
-        cuMemFree(triangleMaterialIndexBuffer_);
+    if (environmentConditionalCdfBuffer_)
+        cuMemFree(environmentConditionalCdfBuffer_);
+    if (environmentMarginalCdfBuffer_)
+        cuMemFree(environmentMarginalCdfBuffer_);
+    if (instanceBuffer_)
+        cuMemFree(instanceBuffer_);
     if (normalBuffer_)
         cuMemFree(normalBuffer_);
+    if (tangentBuffer_)
+        cuMemFree(tangentBuffer_);
+    if (uvBuffer_)
+        cuMemFree(uvBuffer_);
     if (vertexBuffer_)
         cuMemFree(vertexBuffer_);
     gasBuffer_ = 0;
+    iasInstanceBuffer_ = 0;
     indexBuffer_ = 0;
     materialBuffer_ = 0;
+    emissiveTriangleBuffer_ = 0;
     environmentBuffer_ = 0;
-    triangleMaterialIndexBuffer_ = 0;
+    environmentConditionalCdfBuffer_ = 0;
+    environmentMarginalCdfBuffer_ = 0;
+    instanceBuffer_ = 0;
     normalBuffer_ = 0;
+    tangentBuffer_ = 0;
+    uvBuffer_ = 0;
     vertexBuffer_ = 0;
     vertexCount_ = 0;
     triangleCount_ = 0;
     materialCount_ = 0;
+    instanceCount_ = 0;
+    emissiveTriangleCount_ = 0;
+    emissiveLightPower_ = 0.0f;
     environmentPixelCount_ = 0;
+    environmentConditionalCdfCount_ = 0;
+    environmentMarginalCdfCount_ = 0;
     gasHandle_ = 0;
+    stats_.gpuSceneBytes = 0;
+    stats_.textureBytes = 0;
+    stats_.materialBytes = 0;
+    stats_.residentTextures = 0;
+    stats_.residentMaterials = 0;
 }
 
 bool OptixRenderer::createPipeline()
@@ -770,9 +1219,9 @@ bool OptixRenderer::createPipeline()
 #endif
         OptixPipelineCompileOptions pipelineOptions{};
         pipelineOptions.usesMotionBlur = false;
-        pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-        // Slang lowers the payload struct to six OptiX registers because float2 keeps its CUDA alignment.
-        pipelineOptions.numPayloadValues = 6;
+        pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
+        // Primitive, instance, barycentrics, distance and hit state lower to seven payload registers.
+        pipelineOptions.numPayloadValues = 7;
         pipelineOptions.numAttributeValues = 2;
         pipelineOptions.exceptionFlags = VOR_DEBUG ? OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW : OPTIX_EXCEPTION_FLAG_NONE;
         pipelineOptions.pipelineLaunchParamsVariableName = nullptr;
@@ -837,7 +1286,7 @@ bool OptixRenderer::createPipeline()
         checkOptix(optixUtilComputeStackSizes(&stackSizes, 1, 0, 0, &directFromTraversal, &directFromState,
                                               &continuation),
                    "optixUtilComputeStackSizes");
-        checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 1),
+        checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 2),
                    "optixPipelineSetStackSize");
 
         checkCuda(cuMemAlloc(&raygenRecord_, sizeof(RaygenRecord)), "cuMemAlloc(raygen SBT)");
@@ -916,10 +1365,16 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.normalGuide = {};
         parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.normals = {normalBuffer_, vertexCount_};
+        parameters.tangents = {tangentBuffer_, vertexCount_};
+        parameters.uvs = {uvBuffer_, vertexCount_};
         parameters.indices = {indexBuffer_, triangleCount_};
-        parameters.triangleMaterialIndices = {triangleMaterialIndexBuffer_, triangleCount_};
+        parameters.instances = {instanceBuffer_, instanceCount_};
         parameters.materials = {materialBuffer_, materialCount_};
+        parameters.emissiveTriangles = {emissiveTriangleBuffer_, emissiveTriangleCount_};
         parameters.environmentPixels = {environmentBuffer_, environmentPixelCount_};
+        parameters.environmentConditionalCdf = {environmentConditionalCdfBuffer_, environmentConditionalCdfCount_};
+        parameters.environmentMarginalCdf = {environmentMarginalCdfBuffer_, environmentMarginalCdfCount_};
+        parameters.materialTextureTable = textureTableBuffer_;
         parameters.scene = gasHandle_;
         parameters.width = width_;
         parameters.height = height_;
@@ -935,6 +1390,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.materialOverrideId = scene_ && scene_->materialOverrideId < scene_->materials.size()
                                             ? scene_->materialOverrideId
                                             : kInvalidMaterialId;
+        parameters.debugView = static_cast<std::uint32_t>(settings.debugView);
         const Environment fallbackEnvironment{};
         const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
         parameters.indirectLighting = settings.indirectLighting ? 1u : 0u;
@@ -945,6 +1401,8 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.environmentRotation = environment.rotationRadians;
         parameters.environmentVisible = environment.visibleBackground ? 1u : 0u;
         parameters.environmentMipCount = environment.hasHdr() ? environment.hdrMipCount : 0u;
+        parameters.environmentImportanceTotal = environment.hdrImportanceTotal;
+        parameters.emissiveLightPower = emissiveLightPower_;
         parameters.cameraPositionAndFov = {camera.position.x, camera.position.y, camera.position.z,
                                            camera.verticalFovDegrees * kPi / 180.0f};
         parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
