@@ -1,3 +1,8 @@
+# Testing ChatGPT Codex 5.6 Sol for generating a hybrid rasterizer/raytracer
+
+All coding is done by Codex.
+Project is setup for Windows and NVIDIA RTX graphic cards.
+ 
 # VORaytracer
 
 VORaytracer ist ein nativer C++20-PBR-Renderer für Windows mit zwei umschaltbaren Renderpfaden:
@@ -7,9 +12,11 @@ VORaytracer ist ein nativer C++20-PBR-Renderer für Windows mit zwei umschaltbar
 
 Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation beider Backends bereit. Modelle werden mit Assimp geladen, mit meshoptimizer aufbereitet und von Slang-Shadern verarbeitet.
 
-- [Technischer Umsetzungsstand und weitere Planung](IMPLEMENTIERUNGSPLAN.md)
+## Lizenz
+
+VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](LICENSE) (`LGPL-3.0-or-later`) veröffentlicht. Copyright © 2026 VORaytracer contributors. Eingebundene Bibliotheken und SDKs unterliegen ihren jeweiligen eigenen Lizenzen.
+
 - [Grafische Darstellung der Renderpfade](RENDERPFADE.md)
-- [Geplanter Ausbau des PBR-Material- und BSDF-Systems](PBR_SHADER_UPDATE.md)
 
 ## Funktionsumfang
 
@@ -53,7 +60,7 @@ Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation 
 | CUDA | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` |
 | OptiX | `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0` |
 
-Zusätzlich erforderlich sind Visual Studio mit C++-Toolset `v145`, ein kompatibles Windows SDK und eine NVIDIA-GPU mit den verwendeten Vulkan-Mesh-Shader-, Acceleration-Structure- und Ray-Query-Funktionen. Assimp wird global aus `G:\CodingLibraries` verwendet; im Projekt liegt kein eigener Assimp-Quellcode mehr.
+Zusätzlich erforderlich sind Visual Studio mit C++-Toolset `v145`, ein kompatibles Windows SDK und eine NVIDIA-GPU mit den verwendeten Vulkan-Mesh-Shader-, Acceleration-Structure- und Ray-Query-Funktionen.
 
 ## Bauen und starten
 
