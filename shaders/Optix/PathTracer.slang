@@ -293,12 +293,11 @@ float3 traceVisibility(LaunchParameters parameters, RayDesc sourceRay)
         float shadowTextureLod = log2(max(shadowPayload.hitDistance * 0.05, 1.0));
         ResolvedHit hit = resolveHit(parameters, shadowPayload, shadowRay, shadowTextureLod);
         uint alphaMode = hit.material.materialFlags.y;
-        bool frontFacing = dot(hit.geometricNormal, -shadowRay.Direction) > 0.0;
-        bool needsBackFaceForTransport = hit.surface.transmission > 0.0 || hit.surface.volumeDensity > 0.0;
-        bool passThrough = !frontFacing && (hit.surface.flags & MATERIAL_FLAG_DOUBLE_SIDED) == 0u &&
-                           !needsBackFaceForTransport;
-        passThrough = passThrough || (alphaMode == ALPHA_MODE_MASK &&
-                                      hit.surface.alpha < hit.material.surfaceParameters.w);
+        // Sidedness controls surface shading, not whether an opaque triangle casts a shadow.
+        // Treating single-sided back faces as transparent creates triangle-shaped light leaks on
+        // open FBX meshes such as cloth, hoods and layered character parts.
+        bool passThrough = alphaMode == ALPHA_MODE_MASK &&
+                           hit.surface.alpha < hit.material.surfaceParameters.w;
         if (alphaMode == ALPHA_MODE_BLEND)
         {
             visibility *= 1.0 - hit.surface.alpha;
