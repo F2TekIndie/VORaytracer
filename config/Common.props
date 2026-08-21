@@ -1,5 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildThisFileDirectory)Local.props" Condition="Exists('$(MSBuildThisFileDirectory)Local.props')" />
+  <PropertyGroup>
+    <CodingLibrariesRoot Condition="'$(CodingLibrariesRoot)'==''">G:\CodingLibraries</CodingLibrariesRoot>
+    <VulkanSdkRoot Condition="'$(VulkanSdkRoot)'==''">$(CodingLibrariesRoot)\VulkanSDK</VulkanSdkRoot>
+    <SlangRoot Condition="'$(SlangRoot)'==''">$(CodingLibrariesRoot)\slang-14.1</SlangRoot>
+    <AssimpRoot Condition="'$(AssimpRoot)'==''">$(CodingLibrariesRoot)\assimp</AssimpRoot>
+    <AssimpBuildRoot Condition="'$(AssimpBuildRoot)'==''">$(AssimpRoot)\out-v145</AssimpBuildRoot>
+    <GlfwRoot Condition="'$(GlfwRoot)'==''">$(CodingLibrariesRoot)\glfw-3.5.1</GlfwRoot>
+    <ImGuiRoot Condition="'$(ImGuiRoot)'==''">$(CodingLibrariesRoot)\imgui</ImGuiRoot>
+    <MeshoptimizerRoot Condition="'$(MeshoptimizerRoot)'==''">$(CodingLibrariesRoot)\meshoptimizer</MeshoptimizerRoot>
+    <StbRoot Condition="'$(StbRoot)'==''">$(CodingLibrariesRoot)\stb</StbRoot>
+    <CudaRoot Condition="'$(CudaRoot)'=='' and '$(CUDA_PATH)'!=''">$(CUDA_PATH)</CudaRoot>
+    <CudaRoot Condition="'$(CudaRoot)'==''">C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3</CudaRoot>
+    <OptixRoot Condition="'$(OptixRoot)'=='' and '$(OPTIX_ROOT)'!=''">$(OPTIX_ROOT)</OptixRoot>
+    <OptixRoot Condition="'$(OptixRoot)'==''">C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0</OptixRoot>
+  </PropertyGroup>
   <PropertyGroup>
     <CharacterSet>Unicode</CharacterSet>
     <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
@@ -15,11 +31,11 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;VK_USE_PLATFORM_WIN32_KHR;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(SolutionDir)src;G:\CodingLibraries\VulkanSDK\Include;G:\CodingLibraries\slang-14.1\include;G:\CodingLibraries\assimp\out-v145\include;G:\CodingLibraries\assimp\include;G:\CodingLibraries\glfw-3.5.1\include;G:\CodingLibraries\imgui;G:\CodingLibraries\imgui\backends;G:\CodingLibraries\meshoptimizer\src;G:\CodingLibraries\stb;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\include;C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)src;$(VulkanSdkRoot)\Include;$(SlangRoot)\include;$(AssimpBuildRoot)\include;$(AssimpRoot)\include;$(GlfwRoot)\include;$(ImGuiRoot);$(ImGuiRoot)\backends;$(MeshoptimizerRoot)\src;$(StbRoot);$(CudaRoot)\include;$(OptixRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>G:\CodingLibraries\VulkanSDK\Lib;G:\CodingLibraries\slang-14.1\lib;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\lib\x64;G:\CodingLibraries\assimp\out-v145\lib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(VulkanSdkRoot)\Lib;$(SlangRoot)\lib;$(CudaRoot)\lib\x64;$(AssimpBuildRoot)\lib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">

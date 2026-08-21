@@ -9,7 +9,7 @@
   <PropertyGroup Label="Configuration"><ConfigurationType>Utility</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="$(SolutionDir)config\Common.props" />
-  <PropertyGroup><ShaderOutputDir>$(OutDir)Shaders\</ShaderOutputDir><SlangCompiler>G:\CodingLibraries\slang-14.1\bin\slangc.exe</SlangCompiler><SlangCommon>-target spirv -profile spirv_1_6 -emit-spirv-directly -fvk-use-entrypoint-name</SlangCommon><SlangOptimization Condition="'$(Configuration)'=='Debug'">-O0</SlangOptimization><SlangOptimization Condition="'$(Configuration)'=='Release'">-O3</SlangOptimization></PropertyGroup>
+  <PropertyGroup><ShaderOutputDir>$(OutDir)Shaders\</ShaderOutputDir><SlangCompiler>$(SlangRoot)\bin\slangc.exe</SlangCompiler><SlangCommon>-target spirv -profile spirv_1_6 -emit-spirv-directly -fvk-use-entrypoint-name</SlangCommon><SlangOptimization Condition="'$(Configuration)'=='Debug'">-O0</SlangOptimization><SlangOptimization Condition="'$(Configuration)'=='Release'">-O3</SlangOptimization></PropertyGroup>
   <ItemGroup>
     <CustomBuild Include="$(SolutionDir)shaders\Vulkan\MeshPipeline.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
@@ -23,8 +23,8 @@
     </CustomBuild>
     <CustomBuild Include="$(SolutionDir)shaders\Optix\PathTracer.slang">
       <Command>if not exist "$(ShaderOutputDir)" mkdir "$(ShaderOutputDir)"
-set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64;%PATH%"
-"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -I "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0\include" -target ptx -entry RayGen -stage raygeneration -entry ToneMap -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
+set "PATH=$(CudaRoot)\bin\x64;%PATH%"
+"$(SlangCompiler)" "%(FullPath)" $(SlangOptimization) -I "$(SolutionDir)shaders\Shared" -I "$(OptixRoot)\include" -target ptx -entry RayGen -stage raygeneration -entry ToneMap -stage raygeneration -entry Miss -stage miss -entry ClosestHit -stage closesthit -o "$(ShaderOutputDir)PathTracer.ptx"</Command>
       <Outputs>$(ShaderOutputDir)PathTracer.ptx</Outputs>
       <AdditionalInputs>$(SolutionDir)shaders\Shared\Pbr.slang;$(SolutionDir)shaders\Shared\MaterialTypes.slang;$(SolutionDir)shaders\Shared\MaterialSampling.slang;$(SolutionDir)shaders\Shared\Fresnel.slang;$(SolutionDir)shaders\Shared\Microfacet.slang;$(SolutionDir)shaders\Shared\BsdfTypes.slang;$(SolutionDir)shaders\Shared\BsdfDiffuse.slang;$(SolutionDir)shaders\Shared\BsdfConductor.slang;$(SolutionDir)shaders\Shared\BsdfClearcoat.slang;$(SolutionDir)shaders\Shared\BsdfTransmission.slang;$(SolutionDir)shaders\Shared\BsdfAnisotropic.slang;$(SolutionDir)shaders\Shared\BsdfSheen.slang;$(SolutionDir)shaders\Shared\BsdfSubsurface.slang;$(SolutionDir)shaders\Shared\PhaseFunctions.slang</AdditionalInputs>
     </CustomBuild>

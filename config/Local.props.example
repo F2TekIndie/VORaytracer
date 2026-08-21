@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Copy this file to Local.props and adjust only the paths that differ. -->
+  <PropertyGroup>
+    <CodingLibrariesRoot>G:\CodingLibraries</CodingLibrariesRoot>
+    <VulkanSdkRoot>$(CodingLibrariesRoot)\VulkanSDK</VulkanSdkRoot>
+    <SlangRoot>$(CodingLibrariesRoot)\slang-14.1</SlangRoot>
+    <AssimpRoot>$(CodingLibrariesRoot)\assimp</AssimpRoot>
+    <AssimpBuildRoot>$(AssimpRoot)\out-v145</AssimpBuildRoot>
+    <GlfwRoot>$(CodingLibrariesRoot)\glfw-3.5.1</GlfwRoot>
+    <ImGuiRoot>$(CodingLibrariesRoot)\imgui</ImGuiRoot>
+    <MeshoptimizerRoot>$(CodingLibrariesRoot)\meshoptimizer</MeshoptimizerRoot>
+    <StbRoot>$(CodingLibrariesRoot)\stb</StbRoot>
+    <CudaRoot>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3</CudaRoot>
+    <OptixRoot>C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0</OptixRoot>
+  </PropertyGroup>
+</Project>

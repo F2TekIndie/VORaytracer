@@ -1,8 +1,3 @@
-# Testing ChatGPT Codex 5.6 Sol for generating a hybrid rasterizer/raytracer
-
-All coding is done by Codex.
-Project is setup for Windows and NVIDIA RTX graphic cards.
- 
 # VORaytracer
 
 VORaytracer ist ein nativer C++20-PBR-Renderer für Windows mit zwei umschaltbaren Renderpfaden:
@@ -12,11 +7,15 @@ VORaytracer ist ein nativer C++20-PBR-Renderer für Windows mit zwei umschaltbar
 
 Dear ImGui stellt die Bedienoberfläche und Vulkan die gemeinsame Präsentation beider Backends bereit. Modelle werden mit Assimp geladen, mit meshoptimizer aufbereitet und von Slang-Shadern verarbeitet.
 
+Das Projekt entstand als Experiment zur Entwicklung eines hybriden Rasterizer/Raytracers mit Codex. Es ist für Windows und NVIDIA-RTX-GPUs ausgelegt.
+
 ## Lizenz
 
 VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](LICENSE) (`LGPL-3.0-or-later`) veröffentlicht. Copyright © 2026 VORaytracer contributors. Eingebundene Bibliotheken und SDKs unterliegen ihren jeweiligen eigenen Lizenzen.
 
 - [Grafische Darstellung der Renderpfade](RENDERPFADE.md)
+- [Mitwirken](CONTRIBUTING.md)
+- [Drittanbieter-Komponenten](THIRD_PARTY_NOTICES.md)
 
 ## Funktionsumfang
 
@@ -48,21 +47,37 @@ VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](
 
 ## Voraussetzungen
 
-| Komponente | Erwarteter Pfad |
+Die Abhängigkeiten werden nicht mit dem Repository ausgeliefert. Standardmäßig erwartet das Projekt folgende MSBuild-Properties und Pfade:
+
+| Property | Standardwert |
 |---|---|
-| Vulkan SDK | `G:\CodingLibraries\VulkanSDK` |
-| Slang | `G:\CodingLibraries\slang-14.1` |
-| Assimp | `G:\CodingLibraries\assimp\out-v145` |
-| GLFW | `G:\CodingLibraries\glfw-3.5.1` |
-| Dear ImGui | `G:\CodingLibraries\imgui` |
-| meshoptimizer | `G:\CodingLibraries\meshoptimizer` |
-| stb_image | `G:\CodingLibraries\stb\stb_image.h` |
-| CUDA | `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` |
-| OptiX | `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0` |
+| `CodingLibrariesRoot` | `G:\CodingLibraries` |
+| `VulkanSdkRoot` | `$(CodingLibrariesRoot)\VulkanSDK` |
+| `SlangRoot` | `$(CodingLibrariesRoot)\slang-14.1` |
+| `AssimpRoot` | `$(CodingLibrariesRoot)\assimp` |
+| `AssimpBuildRoot` | `$(AssimpRoot)\out-v145` |
+| `GlfwRoot` | `$(CodingLibrariesRoot)\glfw-3.5.1` |
+| `ImGuiRoot` | `$(CodingLibrariesRoot)\imgui` |
+| `MeshoptimizerRoot` | `$(CodingLibrariesRoot)\meshoptimizer` |
+| `StbRoot` | `$(CodingLibrariesRoot)\stb` |
+| `CudaRoot` | `CUDA_PATH` oder `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` |
+| `OptixRoot` | `OPTIX_ROOT` oder `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0` |
 
 Zusätzlich erforderlich sind Visual Studio mit C++-Toolset `v145`, ein kompatibles Windows SDK und eine NVIDIA-GPU mit den verwendeten Vulkan-Mesh-Shader-, Acceleration-Structure- und Ray-Query-Funktionen.
 
+Bei abweichenden Installationspfaden `config\Local.props.example` nach `config\Local.props` kopieren und dort nur die betroffenen Properties ändern. `Local.props` ist absichtlich von Git ausgeschlossen. Alternativ können die Properties auf der MSBuild-Kommandozeile gesetzt werden; CUDA und OptiX berücksichtigen außerdem `CUDA_PATH` beziehungsweise `OPTIX_ROOT`.
+
 ## Bauen und starten
+
+Repository klonen und bei Bedarf die lokalen Abhängigkeitspfade konfigurieren:
+
+```powershell
+git clone <repository-url>
+Set-Location VORaytracer
+Copy-Item .\config\Local.props.example .\config\Local.props
+```
+
+Der Build-Wrapper findet MSBuild über Visual Studio Installer und akzeptiert bei Bedarf einen expliziten Pfad über `-MSBuildPath`:
 
 ```powershell
 .\scripts\Build.ps1 -Configuration Debug
@@ -77,6 +92,7 @@ Anschließend beispielsweise:
 ```
 
 Ohne explizit geladene Datei startet die Anwendung mit einer prozeduralen Testszenengeometrie.
+Die kleinen Szenen `SampleTriangle` und `TexturedTriangle` samt Testtextur sind als redistributable Test-Fixtures in `assets` enthalten; weitere lokale Modelle und HDRs in diesem Verzeichnis werden nicht versioniert.
 
 ## Bedienung
 

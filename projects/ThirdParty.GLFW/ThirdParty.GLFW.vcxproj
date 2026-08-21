@@ -9,29 +9,29 @@
   <PropertyGroup Label="Configuration"><ConfigurationType>StaticLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="$(SolutionDir)config\Common.props" />
-  <ItemDefinitionGroup><ClCompile><CompileAs>CompileAsC</CompileAs><DisableSpecificWarnings>4100;4244;%(DisableSpecificWarnings)</DisableSpecificWarnings><PreprocessorDefinitions>_GLFW_WIN32;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>G:\CodingLibraries\glfw-3.5.1\src;G:\CodingLibraries\glfw-3.5.1\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile></ItemDefinitionGroup>
+  <ItemDefinitionGroup><ClCompile><CompileAs>CompileAsC</CompileAs><DisableSpecificWarnings>4100;4244;%(DisableSpecificWarnings)</DisableSpecificWarnings><PreprocessorDefinitions>_GLFW_WIN32;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(GlfwRoot)\src;$(GlfwRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile></ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\context.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\init.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\input.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\monitor.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\platform.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\vulkan.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\window.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\egl_context.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\osmesa_context.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_init.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_monitor.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_window.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\null_joystick.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_time.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_thread.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_module.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_init.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_joystick.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_monitor.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\win32_window.c" />
-    <ClCompile Include="G:\CodingLibraries\glfw-3.5.1\src\wgl_context.c" />
+    <ClCompile Include="$(GlfwRoot)\src\context.c" />
+    <ClCompile Include="$(GlfwRoot)\src\init.c" />
+    <ClCompile Include="$(GlfwRoot)\src\input.c" />
+    <ClCompile Include="$(GlfwRoot)\src\monitor.c" />
+    <ClCompile Include="$(GlfwRoot)\src\platform.c" />
+    <ClCompile Include="$(GlfwRoot)\src\vulkan.c" />
+    <ClCompile Include="$(GlfwRoot)\src\window.c" />
+    <ClCompile Include="$(GlfwRoot)\src\egl_context.c" />
+    <ClCompile Include="$(GlfwRoot)\src\osmesa_context.c" />
+    <ClCompile Include="$(GlfwRoot)\src\null_init.c" />
+    <ClCompile Include="$(GlfwRoot)\src\null_monitor.c" />
+    <ClCompile Include="$(GlfwRoot)\src\null_window.c" />
+    <ClCompile Include="$(GlfwRoot)\src\null_joystick.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_time.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_thread.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_module.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_init.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_joystick.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_monitor.c" />
+    <ClCompile Include="$(GlfwRoot)\src\win32_window.c" />
+    <ClCompile Include="$(GlfwRoot)\src\wgl_context.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

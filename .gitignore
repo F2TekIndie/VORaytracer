@@ -1,11 +1,26 @@
+# Build output and IDE caches
 /bin/
 /obj/
 /build/
-/assets/
 /artifacts/
 /.vs/
+
+# Per-user configuration and UI state
+/config/Local.props
+/imgui.ini
 *.user
 *.suo
 *.VC.db
 *.opendb
 
+# Local model/HDR test data; keep the tiny redistributable sample scene
+/assets/*
+!/assets/SampleTriangle.obj
+!/assets/SampleTriangle.mtl
+!/assets/TexturedTriangle.obj
+!/assets/TexturedTriangle.mtl
+!/assets/TestTexture.ppm
+
+# Logs and crash/debug output
+*.log
+*.dmp

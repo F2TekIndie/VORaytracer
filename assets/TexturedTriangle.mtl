@@ -1,0 +1,8 @@
+newmtl Textured
+Kd 1.0 1.0 1.0
+Ke 1.0 1.0 1.0
+map_Kd TestTexture.ppm
+map_Ke TestTexture.ppm
+map_Bump TestTexture.ppm
+map_Pm TestTexture.ppm
+map_Ka TestTexture.ppm

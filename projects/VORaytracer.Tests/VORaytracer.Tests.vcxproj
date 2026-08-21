@@ -9,7 +9,7 @@
   <PropertyGroup Label="Configuration"><ConfigurationType>Application</ConfigurationType><PlatformToolset>v145</PlatformToolset><UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries><UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <Import Project="$(SolutionDir)config\Common.props" />
-  <ItemDefinitionGroup><Link><SubSystem>Console</SubSystem></Link><PostBuildEvent><Command>if exist "G:\CodingLibraries\assimp\out-v145\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" copy /Y "G:\CodingLibraries\assimp\out-v145\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" "$(OutDir)"</Command></PostBuildEvent></ItemDefinitionGroup>
+  <ItemDefinitionGroup><Link><SubSystem>Console</SubSystem></Link><PostBuildEvent><Command>if exist "$(AssimpBuildRoot)\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" copy /Y "$(AssimpBuildRoot)\bin\$(Configuration)\assimp-vc145-mt$(AssimpDebugSuffix).dll" "$(OutDir)"</Command></PostBuildEvent></ItemDefinitionGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Debug'"><AssimpDebugSuffix>d</AssimpDebugSuffix></PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'"><AssimpDebugSuffix></AssimpDebugSuffix></PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'"><Link><AdditionalDependencies>assimp-vc145-mtd.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>

@@ -11,12 +11,12 @@
   <Import Project="$(SolutionDir)config\Common.props" />
   <ItemGroup>
     <ClCompile Include="$(SolutionDir)src\Vulkan\VulkanRenderer.cpp" />
-    <ClCompile Include="G:\CodingLibraries\imgui\imgui.cpp" />
-    <ClCompile Include="G:\CodingLibraries\imgui\imgui_draw.cpp" />
-    <ClCompile Include="G:\CodingLibraries\imgui\imgui_tables.cpp" />
-    <ClCompile Include="G:\CodingLibraries\imgui\imgui_widgets.cpp" />
-    <ClCompile Include="G:\CodingLibraries\imgui\backends\imgui_impl_glfw.cpp" />
-    <ClCompile Include="G:\CodingLibraries\imgui\backends\imgui_impl_vulkan.cpp" />
+    <ClCompile Include="$(ImGuiRoot)\imgui.cpp" />
+    <ClCompile Include="$(ImGuiRoot)\imgui_draw.cpp" />
+    <ClCompile Include="$(ImGuiRoot)\imgui_tables.cpp" />
+    <ClCompile Include="$(ImGuiRoot)\imgui_widgets.cpp" />
+    <ClCompile Include="$(ImGuiRoot)\backends\imgui_impl_glfw.cpp" />
+    <ClCompile Include="$(ImGuiRoot)\backends\imgui_impl_vulkan.cpp" />
   </ItemGroup>
   <ItemGroup><ClInclude Include="$(SolutionDir)src\Vulkan\VulkanRenderer.h" /></ItemGroup>
   <ItemGroup>
