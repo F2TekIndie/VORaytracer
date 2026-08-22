@@ -31,7 +31,8 @@ VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](
 - device-local Vulkan-Geometrie über Staging-Uploads
 - separate Vulkan-BLAS pro Geometrie und TLAS-Instanzen ohne getrennte `vkQueueWaitIdle()`-Stopps
 - gemeinsames modulares Slang-PBR-System für Metallic-Roughness, Clearcoat, Glas/Absorption, Anisotropie, Sheen, Emission, Subsurface und homogene Volumen
-- bindless Vulkan-Materialtexturen und CUDA-Mipmapped-Texture-Objects für Base Color, Metallic-Roughness, Normal, AO, Emissive und spezialisierte Loben
+- bindless Vulkan-Materialtexturen und CUDA-Mipmapped-Texture-Objects für Base Color, Opacity, Metallic-Roughness, Normal, skalare Height/Bump-Maps, AO, Emissive und spezialisierte Loben
+- Vulkan-Alpha-Mask und echte Alpha-Blend-Pässe mit Opacity-Faktor/-Textur, transparenten Ray-Query-Schatten und optionalem Denoiser
 - Vulkan-GGX-Auswertung mit Ray-Query-Schatten, Reflexionen sowie begrenzten Echtzeitapproximationen für Transmission, Subsurface und Volumen
 - Richtungslicht, prozeduraler Himmel oder HDR-Environment als globale Beleuchtung
 - roughnessabhängiges HDR-IBL mit Cosine-Irradiance- und GGX-Importance-Faltung im Vulkan-Shader
@@ -42,7 +43,7 @@ VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](
 - standardisiertes hellgraues Kunststoffmaterial als nichtdestruktive Laufzeitüberschreibung
 - ein- und ausblendbare Bodenebene mit Standardkunststoffmaterial
 - stabile, pseudozufällige Meshlet-Debugfarbe pro Meshlet
-- PBR-Materialvergleichsszene, Materialeditor mit gezielten 224-Byte-GPU-Updates und gemeinsame Material-Debugansichten
+- PBR-Materialvergleichsszene, Materialeditor mit gezielten 240-Byte-GPU-Updates und gemeinsame Material-Debugansichten
 - asynchrone Vulkan-Timestamps und CUDA-Events sowie GPU-Speicher-/Descriptorstatistiken im Performance-Fenster
 
 ## Voraussetzungen

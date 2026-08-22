@@ -72,9 +72,12 @@ struct FramePushConstants
     uint meshletCount;
     uint materialOverrideId;
     uint showMeshlets;
-    uint postProcessInput;
+    uint renderFlags;
     uint environmentMipCount;
 };
+
+static const uint RENDER_FLAG_POST_PROCESS_INPUT = 1u << 0;
+static const uint RENDER_FLAG_TRANSPARENT_PASS = 1u << 1;
 
 [[vk::binding(0, 0)]] StructuredBuffer<GpuVertex> sceneVertices;
 [[vk::binding(1, 0)]] StructuredBuffer<GpuMeshlet> sceneMeshlets;
@@ -164,9 +167,12 @@ float3 surfaceDebugColor(uint debugView, SurfaceData surface, GpuMaterial materi
     if (debugView == 16u) return materialDebugColor(materialId);
     if (debugView == 17u)
         return (material.textureIndices0.x == INVALID_TEXTURE_ID && material.textureIndices0.y == INVALID_TEXTURE_ID &&
-                material.textureIndices0.z == INVALID_TEXTURE_ID) ? float3(0.05) :
+                material.textureIndices0.z == INVALID_TEXTURE_ID && material.materialFlags.z == INVALID_TEXTURE_ID &&
+                material.textureIndices3.x == INVALID_TEXTURE_ID)
+                   ? float3(0.05) :
                materialDebugColor(material.textureIndices0.x ^ (material.textureIndices0.y * 31u) ^
-                                  (material.textureIndices0.z * 131u));
+                                  (material.textureIndices0.z * 131u) ^ (material.materialFlags.z * 521u) ^
+                                  (material.textureIndices3.x * 8191u));
     if (debugView == 18u)
         return saturate(surface.volumeAbsorption * surface.volumeDensity +
                         surface.volumeScattering * surface.volumeDensity + surface.subsurfaceColor * surface.subsurface);
@@ -191,14 +197,45 @@ float4 sampleMaterialTexture(uint textureId, float2 uv, float4 fallback)
                : materialTextures[NonUniformResourceIndex(textureId)].Sample(materialTextureSampler, uv);
 }
 
+float heightValue(float4 sampleValue)
+{
+    return dot(sampleValue.xyz, float3(0.2126, 0.7152, 0.0722));
+}
+
+float2 sampleHeightGradient(GpuMaterial material, float2 uv)
+{
+    uint textureId = material.materialFlags.z;
+    uint packedDimensions = material.materialFlags.w;
+    uint width = packedDimensions & 0xffffu;
+    uint height = packedDimensions >> 16u;
+    if (textureId == INVALID_TEXTURE_ID || width == 0u || height == 0u)
+        return float2(0.0);
+
+    float2 texelSize = 1.0 / float2(width, height);
+    float2 uvDx = ddx(uv);
+    float2 uvDy = ddy(uv);
+    uint resourceIndex = NonUniformResourceIndex(textureId);
+    float left = heightValue(materialTextures[resourceIndex].SampleGrad(
+        materialTextureSampler, uv - float2(texelSize.x, 0.0), uvDx, uvDy));
+    float right = heightValue(materialTextures[resourceIndex].SampleGrad(
+        materialTextureSampler, uv + float2(texelSize.x, 0.0), uvDx, uvDy));
+    float up = heightValue(materialTextures[resourceIndex].SampleGrad(
+        materialTextureSampler, uv - float2(0.0, texelSize.y), uvDx, uvDy));
+    float down = heightValue(materialTextures[resourceIndex].SampleGrad(
+        materialTextureSampler, uv + float2(0.0, texelSize.y), uvDx, uvDy));
+    return float2(left - right, up - down);
+}
+
 SurfaceData resolveMaterialSurface(GpuMaterial material, float3 position, float3 geometricNormal,
                                    float3 shadingNormal, float4 tangentAndSign, float2 uv)
 {
     SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign, uv);
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
     samples.baseColor = sampleMaterialTexture(material.textureIndices0.x, uv, samples.baseColor);
+    samples.opacity = sampleMaterialTexture(material.textureIndices3.x, uv, samples.opacity);
     samples.metallicRoughness = sampleMaterialTexture(material.textureIndices0.y, uv, samples.metallicRoughness);
     samples.normal = sampleMaterialTexture(material.textureIndices0.z, uv, samples.normal);
+    samples.heightGradient = sampleHeightGradient(material, uv);
     samples.emissive = sampleMaterialTexture(material.textureIndices0.w, uv, samples.emissive);
     samples.occlusion = sampleMaterialTexture(material.textureIndices1.x, uv, samples.occlusion);
     samples.transmission = sampleMaterialTexture(material.textureIndices1.y, uv, samples.transmission);
@@ -236,7 +273,11 @@ CandidateMaterial resolveCandidateMaterial(uint instanceIndex, uint primitiveInd
                              ? 1.0
                              : materialTextures[NonUniformResourceIndex(material.textureIndices0.x)].SampleLevel(
                                    materialTextureSampler, uv, 0.0).w;
-    result.opacity = saturate(material.baseColorFactor.w * textureAlpha);
+    float opacityTexture = material.textureIndices3.x == INVALID_TEXTURE_ID
+                               ? 1.0
+                               : materialTextures[NonUniformResourceIndex(material.textureIndices3.x)].SampleLevel(
+                                     materialTextureSampler, uv, 0.0).x;
+    result.opacity = saturate(material.baseColorFactor.w * textureAlpha * opacityTexture);
     result.alphaMode = material.materialFlags.y;
     result.accepted = result.alphaMode != ALPHA_MODE_MASK || result.opacity >= material.surfaceParameters.w;
     result.doubleSided = materialHasFlag(material, MATERIAL_FLAG_DOUBLE_SIDED);
@@ -468,7 +509,7 @@ FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
     FragmentOutput output;
     float3 color = frame.skyZenithAndVisibility.w != 0.0
                        ? sampleGlobalEnvironment(input.direction) : float3(0.0);
-    if (frame.postProcessInput == 0)
+    if ((frame.renderFlags & RENDER_FLAG_POST_PROCESS_INPUT) == 0u)
     {
         color = max(color * exp2(frame.exposure), 0.0);
         color = color / (1.0 + color);
@@ -493,6 +534,12 @@ void TaskMain(
     {
         GpuMeshlet meshlet = sceneMeshlets[meshletIndex];
         visible = meshlet.vertexCount <= 64 && meshlet.triangleCount <= 124;
+        if (visible)
+        {
+            bool transparentMaterial = loadMaterial(meshlet.materialIndex).materialFlags.y == ALPHA_MODE_BLEND;
+            bool transparentPass = (frame.renderFlags & RENDER_FLAG_TRANSPARENT_PASS) != 0u;
+            visible = transparentMaterial == transparentPass;
+        }
         if (visible)
         {
             GpuInstance instance = sceneInstances[meshlet.instanceIndex];
@@ -597,12 +644,6 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                                                  interpolatedNormal, input.worldTangent, input.uv);
     if (material.materialFlags.y == ALPHA_MODE_MASK && surface.alpha < material.surfaceParameters.w)
         discard;
-    if (material.materialFlags.y == ALPHA_MODE_BLEND)
-    {
-        float dither = frac(52.9829189 * frac(dot(input.position.xy, float2(0.06711056, 0.00583715))));
-        if (surface.alpha <= dither)
-            discard;
-    }
     float3 normal = surface.shadingNormal;
     float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
     if (dot(normal, viewDirection) < 0.0)
@@ -931,12 +972,12 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
         color = lerp(color, transmittedRadiance * transmittance * surface.baseColor,
                      surface.transmission * (1.0 - fresnel));
     }
-    if (frame.postProcessInput == 0)
+    if ((frame.renderFlags & RENDER_FLAG_POST_PROCESS_INPUT) == 0u)
     {
         color *= exp2(frame.exposure);
         color = max(color, 0.0);
         color = color / (1.0 + color);
     }
-    output.color = float4(color, 1.0);
+    output.color = float4(color, material.materialFlags.y == ALPHA_MODE_BLEND ? surface.alpha : 1.0);
     return output;
 }

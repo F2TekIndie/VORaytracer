@@ -24,10 +24,11 @@ struct GpuMaterial
     float4 subsurfaceColorRadius;
     float4 volumeAbsorptionDensity;
     float4 volumeScatteringAnisotropy;
-    uint4 materialFlags;
+    uint4 materialFlags; // flags, alpha mode, height texture, packed width | height << 16
     uint4 textureIndices0;
     uint4 textureIndices1;
     uint4 textureIndices2;
+    uint4 textureIndices3; // opacity, reserved, reserved, reserved
 };
 
 struct SurfaceData

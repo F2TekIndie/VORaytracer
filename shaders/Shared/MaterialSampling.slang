@@ -3,8 +3,10 @@ import MaterialTypes;
 struct MaterialTextureSamples
 {
     float4 baseColor;
+    float4 opacity;
     float4 metallicRoughness;
     float4 normal;
+    float2 heightGradient;
     float4 emissive;
     float4 occlusion;
     float4 transmission;
@@ -20,8 +22,10 @@ MaterialTextureSamples defaultMaterialTextureSamples()
 {
     MaterialTextureSamples samples;
     samples.baseColor = float4(1.0);
+    samples.opacity = float4(1.0);
     samples.metallicRoughness = float4(1.0);
     samples.normal = float4(0.5, 0.5, 1.0, 1.0);
+    samples.heightGradient = float2(0.0);
     samples.emissive = float4(1.0);
     samples.occlusion = float4(1.0);
     samples.transmission = float4(1.0);
@@ -45,6 +49,7 @@ SurfaceData applyBaseMaterialTextures(
     float tangentSign = dot(cross(originalNormal, originalTangent), originalBitangent) < 0.0 ? -1.0 : 1.0;
     surface.baseColor *= max(samples.baseColor.xyz, 0.0);
     surface.alpha *= saturate(samples.baseColor.w);
+    surface.alpha *= saturate(samples.opacity.x);
     surface.roughness = clamp(surface.roughness * saturate(samples.metallicRoughness.y), 0.02, 1.0);
     surface.metallic = saturate(surface.metallic * saturate(samples.metallicRoughness.z));
     surface.emissive *= max(samples.emissive.xyz, 0.0);
@@ -55,10 +60,13 @@ SurfaceData applyBaseMaterialTextures(
                                            saturate(samples.clearcoatRoughness.y),
                                        0.02, 1.0);
 
-    if (material.textureIndices0.z != INVALID_TEXTURE_ID)
+    if (material.textureIndices0.z != INVALID_TEXTURE_ID || material.materialFlags.z != INVALID_TEXTURE_ID)
     {
-        float3 tangentNormal = samples.normal.xyz * 2.0 - 1.0;
+        float3 tangentNormal = material.textureIndices0.z != INVALID_TEXTURE_ID
+                                   ? samples.normal.xyz * 2.0 - 1.0
+                                   : float3(0.0, 0.0, 1.0);
         tangentNormal.xy *= max(material.surfaceParameters.y, 0.0);
+        tangentNormal.xy += samples.heightGradient * max(material.anisotropySheen.w, 0.0);
         tangentNormal = normalize(tangentNormal);
         surface.shadingNormal = normalize(surface.tangent * tangentNormal.x +
                                           surface.bitangent * tangentNormal.y +

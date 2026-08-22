@@ -112,6 +112,34 @@ float4 sampleMaterialTexture(LaunchParameters parameters, uint textureId, float2
                      parameters.materialTextureTable.sampler, uv, max(textureLod, 0.0));
 }
 
+float heightValue(float4 sampleValue)
+{
+    return dot(sampleValue.xyz, float3(0.2126, 0.7152, 0.0722));
+}
+
+float2 sampleHeightGradient(LaunchParameters parameters, GpuMaterial material, float2 uv, float textureLod)
+{
+    uint textureId = material.materialFlags.z;
+    uint packedDimensions = material.materialFlags.w;
+    uint width = packedDimensions & 0xffffu;
+    uint height = packedDimensions >> 16u;
+    if (textureId == INVALID_TEXTURE_ID || width == 0u || height == 0u)
+        return float2(0.0);
+
+    float lod = max(textureLod, 0.0);
+    float mipScale = exp2(floor(lod));
+    float2 texelSize = min(mipScale / float2(width, height), float2(0.5));
+    float left = heightValue(sampleMaterialTexture(parameters, textureId,
+                                                    uv - float2(texelSize.x, 0.0), float4(0.0), lod));
+    float right = heightValue(sampleMaterialTexture(parameters, textureId,
+                                                     uv + float2(texelSize.x, 0.0), float4(0.0), lod));
+    float up = heightValue(sampleMaterialTexture(parameters, textureId,
+                                                  uv - float2(0.0, texelSize.y), float4(0.0), lod));
+    float down = heightValue(sampleMaterialTexture(parameters, textureId,
+                                                    uv + float2(0.0, texelSize.y), float4(0.0), lod));
+    return float2(left - right, up - down);
+}
+
 SurfaceData resolveMaterialSurface(LaunchParameters parameters, GpuMaterial material, float3 position,
                                    float3 geometricNormal, float3 shadingNormal,
                                    float4 tangentAndSign, float2 uv, float textureLod)
@@ -120,9 +148,12 @@ SurfaceData resolveMaterialSurface(LaunchParameters parameters, GpuMaterial mate
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
     samples.baseColor = sampleMaterialTexture(parameters, material.textureIndices0.x, uv, samples.baseColor,
                                                textureLod);
+    samples.opacity = sampleMaterialTexture(parameters, material.textureIndices3.x, uv, samples.opacity,
+                                             textureLod);
     samples.metallicRoughness = sampleMaterialTexture(parameters, material.textureIndices0.y, uv,
                                                       samples.metallicRoughness, textureLod);
     samples.normal = sampleMaterialTexture(parameters, material.textureIndices0.z, uv, samples.normal, textureLod);
+    samples.heightGradient = sampleHeightGradient(parameters, material, uv, textureLod);
     samples.emissive = sampleMaterialTexture(parameters, material.textureIndices0.w, uv, samples.emissive,
                                               textureLod);
     samples.occlusion = sampleMaterialTexture(parameters, material.textureIndices1.x, uv, samples.occlusion,
@@ -238,9 +269,12 @@ float3 surfaceDebugColor(uint debugView, SurfaceData surface, GpuMaterial materi
     if (debugView == 16u) return debugIdColor(materialId);
     if (debugView == 17u)
         return (material.textureIndices0.x == INVALID_TEXTURE_ID && material.textureIndices0.y == INVALID_TEXTURE_ID &&
-                material.textureIndices0.z == INVALID_TEXTURE_ID) ? float3(0.05) :
+                material.textureIndices0.z == INVALID_TEXTURE_ID && material.materialFlags.z == INVALID_TEXTURE_ID &&
+                material.textureIndices3.x == INVALID_TEXTURE_ID)
+                   ? float3(0.05) :
                debugIdColor(material.textureIndices0.x ^ (material.textureIndices0.y * 31u) ^
-                            (material.textureIndices0.z * 131u));
+                            (material.textureIndices0.z * 131u) ^ (material.materialFlags.z * 521u) ^
+                            (material.textureIndices3.x * 8191u));
     if (debugView == 18u)
         return mediumDepth > 1u ? float3(0.12, 0.52, 0.9) :
                saturate(surface.volumeAbsorption * surface.volumeDensity +

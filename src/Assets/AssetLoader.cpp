@@ -60,6 +60,7 @@ void normalizeMaterial(Material& material)
     material.metallic = std::clamp(finiteOr(material.metallic, 0.0f), 0.0f, 1.0f);
     material.roughness = std::clamp(finiteOr(material.roughness, 1.0f), 0.02f, 1.0f);
     material.normalScale = std::max(finiteOr(material.normalScale, 1.0f), 0.0f);
+    material.bumpScale = std::max(finiteOr(material.bumpScale, 1.0f), 0.0f);
     material.occlusionStrength = std::clamp(finiteOr(material.occlusionStrength, 1.0f), 0.0f, 1.0f);
     material.alphaCutoff = std::clamp(finiteOr(material.alphaCutoff, 0.5f), 0.0f, 1.0f);
     material.transmission = std::clamp(finiteOr(material.transmission, 0.0f), 0.0f, 1.0f);
@@ -254,7 +255,7 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
     Assimp::Importer importer;
     const unsigned flags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_ImproveCacheLocality |
                            aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace | aiProcess_ValidateDataStructure |
-                           aiProcess_SortByPType;
+                           aiProcess_SortByPType | aiProcess_FlipUVs;
     const aiScene* imported = importer.ReadFile(path.string(), flags);
     if (!imported || !imported->mRootNode)
         return {.error = importer.GetErrorString()};
@@ -283,6 +284,7 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
         material.emissive = {emissive.r, emissive.g, emissive.b};
         source->Get(AI_MATKEY_METALLIC_FACTOR, material.metallic);
         source->Get(AI_MATKEY_ROUGHNESS_FACTOR, material.roughness);
+        source->Get(AI_MATKEY_BUMPSCALING, material.bumpScale);
         source->Get(AI_MATKEY_GLTF_ALPHACUTOFF, material.alphaCutoff);
         source->Get(AI_MATKEY_REFRACTI, material.indexOfRefraction);
         source->Get(AI_MATKEY_TRANSMISSION_FACTOR, material.transmission);
@@ -303,11 +305,20 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
         material.emissive = material.emissive * std::max(emissiveIntensity, 0.0f);
 
         aiString alphaMode;
-        if (source->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode) == AI_SUCCESS)
+        const bool hasExplicitAlphaMode = source->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode) == AI_SUCCESS;
+        if (hasExplicitAlphaMode)
         {
             if (std::strcmp(alphaMode.C_Str(), "MASK") == 0)
                 material.alphaMode = AlphaMode::Mask;
             else if (std::strcmp(alphaMode.C_Str(), "BLEND") == 0)
+                material.alphaMode = AlphaMode::Blend;
+        }
+        else
+        {
+            float opacity = 1.0f;
+            if (source->Get(AI_MATKEY_OPACITY, opacity) == AI_SUCCESS)
+                material.baseColor.w *= std::clamp(opacity, 0.0f, 1.0f);
+            if (material.baseColor.w < 1.0f)
                 material.alphaMode = AlphaMode::Blend;
         }
 
@@ -317,9 +328,17 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
         material.baseColorTexture = addTexture(scene, imported, basePath, source, aiTextureType_BASE_COLOR, true);
         if (material.baseColorTexture < 0)
             material.baseColorTexture = addTexture(scene, imported, basePath, source, aiTextureType_DIFFUSE, true);
+        material.opacityTexture = addTexture(scene, imported, basePath, source, aiTextureType_OPACITY, false);
+        if (!hasExplicitAlphaMode && material.opacityTexture >= 0)
+            material.alphaMode = AlphaMode::Blend;
         material.normalTexture = addTexture(scene, imported, basePath, source, aiTextureType_NORMALS, false);
-        if (material.normalTexture < 0)
-            material.normalTexture = addTexture(scene, imported, basePath, source, aiTextureType_HEIGHT, false);
+        material.heightTexture = addTexture(scene, imported, basePath, source, aiTextureType_HEIGHT, false);
+        if (material.heightTexture >= 0)
+        {
+            const TextureReference& heightTexture = scene.textures[static_cast<std::size_t>(material.heightTexture)];
+            material.heightTextureWidth = heightTexture.width;
+            material.heightTextureHeight = heightTexture.height;
+        }
         material.metallicRoughnessTexture = addTexture(scene, imported, basePath, source, aiTextureType_METALNESS, false);
         if (material.metallicRoughnessTexture < 0)
             material.metallicRoughnessTexture = addTexture(scene, imported, basePath, source,

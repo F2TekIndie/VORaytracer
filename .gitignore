@@ -19,6 +19,8 @@
 !/assets/SampleTriangle.mtl
 !/assets/TexturedTriangle.obj
 !/assets/TexturedTriangle.mtl
+!/assets/TransparentTriangle.obj
+!/assets/TransparentTriangle.mtl
 !/assets/TestTexture.ppm
 
 # Logs and crash/debug output

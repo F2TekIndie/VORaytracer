@@ -127,6 +127,32 @@ Mat4 normalTransformMatrix(const Mat4& transform)
     result.m[10] = c22 * inverseDeterminant;
     return result;
 }
+
+struct RenderPassAvailability
+{
+    bool opaque{};
+    bool transparent{};
+};
+
+RenderPassAvailability renderPassAvailability(const Scene* scene, std::uint32_t materialOverrideId)
+{
+    RenderPassAvailability result{};
+    if (!scene)
+        return result;
+
+    const bool hasOverride = materialOverrideId < scene->materials.size();
+    for (const Mesh& mesh : scene->meshes)
+    {
+        if (mesh.vertices.empty() || mesh.lods.empty() || mesh.lods.front().meshlets.empty())
+            continue;
+        const std::uint32_t materialIndex = hasOverride ? materialOverrideId : mesh.materialIndex;
+        const bool transparent = materialIndex < scene->materials.size() &&
+                                 scene->materials[materialIndex].alphaMode == AlphaMode::Blend;
+        result.transparent |= transparent;
+        result.opaque |= !transparent;
+    }
+    return result;
+}
 } // namespace
 
 VulkanRenderer::~VulkanRenderer()
@@ -492,8 +518,8 @@ void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSett
                                            : settings.debugView == DebugView::Beauty
                                                  ? 0u
                                                  : static_cast<std::uint32_t>(settings.debugView) + 1u;
-    framePushConstants_.padding[0] = 0u;
-    framePushConstants_.padding[1] = environment.hasHdr() ? environment.hdrMipCount : 0u;
+    framePushConstants_.renderFlags = 0u;
+    framePushConstants_.environmentMipCount = environment.hasHdr() ? environment.hdrMipCount : 0u;
 }
 
 bool VulkanRenderer::renderDenoiserInput(const Camera& camera, const RenderSettings& settings)
@@ -508,7 +534,7 @@ bool VulkanRenderer::renderDenoiserInput(const Camera& camera, const RenderSetti
             gpuInteropSurfaceInfo_.height != swapchainExtent_.height)
             return false;
         updateFrameConstants(camera, settings);
-        framePushConstants_.padding[0] = 1u;
+        framePushConstants_.renderFlags |= kRenderFlagPostProcessInput;
         FrameResources& frame = frames_[frameSlot_];
         check(vkWaitForFences(device_, 1, &frame.postInFlight, VK_TRUE, UINT64_MAX),
               "vkWaitForFences(Vulkan denoiser input)");
@@ -621,19 +647,28 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     {
         constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
                                                VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        FramePushConstants drawConstants = framePushConstants_;
+        const RenderPassAvailability passes = renderPassAvailability(scene_, drawConstants.materialOverrideId);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, denoiserBackgroundPipeline_);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                                 &sceneDescriptorSet_, 0, nullptr);
         vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(FramePushConstants),
-                           &framePushConstants_);
+                           &drawConstants);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, denoiserMeshPipeline_);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
-                                &sceneDescriptorSet_, 0, nullptr);
-        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(FramePushConstants),
-                           &framePushConstants_);
-        cmdDrawMeshTasks_(commandBuffer,
-                          (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
+        const auto drawMeshPass = [&](VkPipeline pipeline, bool transparent) {
+            drawConstants.renderFlags = transparent
+                                            ? drawConstants.renderFlags | kRenderFlagTransparentPass
+                                            : drawConstants.renderFlags & ~kRenderFlagTransparentPass;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(FramePushConstants),
+                               &drawConstants);
+            cmdDrawMeshTasks_(commandBuffer,
+                              (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
+        };
+        if (passes.opaque)
+            drawMeshPass(denoiserMeshPipeline_, false);
+        if (passes.transparent)
+            drawMeshPass(denoiserTransparentMeshPipeline_, true);
     }
     vkCmdEndRendering(commandBuffer);
 
@@ -1212,7 +1247,8 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[8].binding = 8;
     bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[8].descriptorCount = 1;
-    bindings[8].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[8].stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
+                             VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings[9].binding = 9;
     bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[9].descriptorCount = kMaxMaterialTextures;
@@ -1324,6 +1360,19 @@ bool VulkanRenderer::createMeshPipeline()
         renderingInfo.pColorAttachmentFormats = &denoiserFormat;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &denoiserMeshPipeline_),
               "vkCreateGraphicsPipelines(Vulkan denoiser mesh input)");
+
+        attachment.blendEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_FALSE;
+        renderingInfo.pColorAttachmentFormats = &swapchainFormat_;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                        &transparentMeshPipeline_),
+              "vkCreateGraphicsPipelines(transparent mesh)");
+        renderingInfo.pColorAttachmentFormats = &denoiserFormat;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                        &denoiserTransparentMeshPipeline_),
+              "vkCreateGraphicsPipelines(Vulkan denoiser transparent mesh input)");
+        attachment.blendEnable = VK_FALSE;
+        depthStencil.depthWriteEnable = VK_TRUE;
 
         const std::array backgroundStages{
             VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
@@ -1462,17 +1511,23 @@ void VulkanRenderer::destroyMeshPipeline()
         return;
     if (meshPipeline_)
         vkDestroyPipeline(device_, meshPipeline_, nullptr);
+    if (transparentMeshPipeline_)
+        vkDestroyPipeline(device_, transparentMeshPipeline_, nullptr);
     if (backgroundPipeline_)
         vkDestroyPipeline(device_, backgroundPipeline_, nullptr);
     if (denoiserMeshPipeline_)
         vkDestroyPipeline(device_, denoiserMeshPipeline_, nullptr);
+    if (denoiserTransparentMeshPipeline_)
+        vkDestroyPipeline(device_, denoiserTransparentMeshPipeline_, nullptr);
     if (denoiserBackgroundPipeline_)
         vkDestroyPipeline(device_, denoiserBackgroundPipeline_, nullptr);
     if (meshPipelineLayout_)
         vkDestroyPipelineLayout(device_, meshPipelineLayout_, nullptr);
     meshPipeline_ = VK_NULL_HANDLE;
+    transparentMeshPipeline_ = VK_NULL_HANDLE;
     backgroundPipeline_ = VK_NULL_HANDLE;
     denoiserMeshPipeline_ = VK_NULL_HANDLE;
+    denoiserTransparentMeshPipeline_ = VK_NULL_HANDLE;
     denoiserBackgroundPipeline_ = VK_NULL_HANDLE;
     meshPipelineLayout_ = VK_NULL_HANDLE;
 }
@@ -1782,7 +1837,7 @@ bool VulkanRenderer::uploadSceneResources()
     };
     static_assert(sizeof(GpuMeshlet) == 64);
     static_assert(sizeof(GpuInstance) == 176);
-    static_assert(sizeof(GpuMaterial) == 224);
+    static_assert(sizeof(GpuMaterial) == 240);
     struct RasterMeshRange
     {
         std::uint32_t firstMeshlet{};
@@ -2659,21 +2714,30 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
     if (!externalBuffer && sceneDescriptorSet_ && uploadedMeshletCount_ > 0)
     {
+        FramePushConstants drawConstants = framePushConstants_;
+        const RenderPassAvailability passes = renderPassAvailability(scene_, drawConstants.materialOverrideId);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, backgroundPipeline_);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                                 &sceneDescriptorSet_, 0, nullptr);
         constexpr VkShaderStageFlags allPushConstantStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
                                                               VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
         vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages,
-                           0, sizeof(FramePushConstants), &framePushConstants_);
+                           0, sizeof(FramePushConstants), &drawConstants);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
-                                &sceneDescriptorSet_, 0, nullptr);
-        vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages, 0,
-                           sizeof(FramePushConstants), &framePushConstants_);
-        cmdDrawMeshTasks_(commandBuffer,
-                          (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
+        const auto drawMeshPass = [&](VkPipeline pipeline, bool transparent) {
+            drawConstants.renderFlags = transparent
+                                            ? drawConstants.renderFlags | kRenderFlagTransparentPass
+                                            : drawConstants.renderFlags & ~kRenderFlagTransparentPass;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages, 0,
+                               sizeof(FramePushConstants), &drawConstants);
+            cmdDrawMeshTasks_(commandBuffer,
+                              (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
+        };
+        if (passes.opaque)
+            drawMeshPass(meshPipeline_, false);
+        if (passes.transparent)
+            drawMeshPass(transparentMeshPipeline_, true);
     }
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
     vkCmdEndRendering(commandBuffer);

@@ -29,10 +29,11 @@ int main()
     const Mat4 product = identity * identity;
     require(product.m == identity.m, "identity matrix multiplication");
 
-    require(sizeof(GpuMaterial) == 224, "shared GPU material size");
+    require(sizeof(GpuMaterial) == 240, "shared GPU material size");
     require(alignof(GpuMaterial) == 16, "shared GPU material alignment");
     require(offsetof(GpuMaterial, materialFlags) == 160, "shared GPU material flag offset");
     require(offsetof(GpuMaterial, textureIndices0) == 176, "shared GPU material texture offset");
+    require(offsetof(GpuMaterial, textureIndices3) == 224, "shared GPU opacity texture offset");
     Material layoutMaterial{};
     layoutMaterial.baseColor = {0.2f, 0.3f, 0.4f, 0.8f};
     layoutMaterial.metallic = 0.6f;
@@ -48,6 +49,11 @@ int main()
     layoutMaterial.anisotropy = 0.7f;
     layoutMaterial.anisotropyRotation = 0.2f;
     layoutMaterial.anisotropyTexture = 7;
+    layoutMaterial.bumpScale = 2.0f;
+    layoutMaterial.heightTexture = 8;
+    layoutMaterial.heightTextureWidth = 1024;
+    layoutMaterial.heightTextureHeight = 512;
+    layoutMaterial.opacityTexture = 9;
     const GpuMaterial layoutGpu = layoutMaterial.toGpu();
     require(layoutGpu.baseColorFactor.x == 0.2f && layoutGpu.emissiveAndMetallic.w == 0.6f,
             "shared GPU material factors");
@@ -58,13 +64,17 @@ int main()
                 layoutGpu.sheenColorAbsorptionDistance.w == 2.5f,
             "transmission, IOR, and absorption GPU factors");
     require(layoutGpu.anisotropySheen.x == 0.7f && layoutGpu.anisotropySheen.y == 0.2f &&
+                layoutGpu.anisotropySheen.w == 2.0f &&
                 layoutGpu.textureIndices2[3] == 7u,
-            "anisotropy factors and GPU texture ID");
+            "anisotropy and bump factors plus GPU texture ID");
     require(layoutGpu.textureIndices0[0] == 3u && layoutGpu.textureIndices0[2] == kInvalidTextureId,
             "shared GPU material texture IDs");
     require(layoutGpu.textureIndices1[2] == 4u && layoutGpu.textureIndices1[3] == 5u &&
                 layoutGpu.textureIndices2[0] == 6u,
             "clearcoat GPU texture IDs");
+    require(layoutGpu.materialFlags[2] == 8u && layoutGpu.materialFlags[3] == (1024u | (512u << 16u)),
+            "height texture ID and packed dimensions");
+    require(layoutGpu.textureIndices3[0] == 9u, "opacity texture GPU ID");
     require(hasFlag(layoutMaterial.flags(), MaterialFlags::Clearcoat) &&
                 hasFlag(layoutMaterial.flags(), MaterialFlags::Transmission),
             "shared GPU material flags");
@@ -147,21 +157,45 @@ int main()
         require(texturedMaterial.baseColorTexture >= 0, "base-color texture reference");
         require(texturedMaterial.emissiveTexture == texturedMaterial.baseColorTexture,
                 "sRGB texture cache deduplication");
-        require(texturedMaterial.normalTexture >= 0 && texturedMaterial.metallicRoughnessTexture >= 0 &&
+        require(texturedMaterial.normalTexture < 0 && texturedMaterial.heightTexture >= 0 &&
+                    texturedMaterial.metallicRoughnessTexture >= 0 &&
                     texturedMaterial.occlusionTexture >= 0,
-                "normal, metallic-roughness, and AO texture references");
-        require(texturedMaterial.normalTexture == texturedMaterial.metallicRoughnessTexture &&
-                    texturedMaterial.normalTexture == texturedMaterial.occlusionTexture,
+                "height, metallic-roughness, and AO texture references");
+        require(texturedMaterial.heightTexture == texturedMaterial.metallicRoughnessTexture &&
+                    texturedMaterial.heightTexture == texturedMaterial.occlusionTexture,
                 "linear texture cache deduplication");
         require(texturedImport.scene.textures.size() == 2, "color-space-aware texture cache entries");
         const GpuMaterial texturedGpu = texturedMaterial.toGpu();
+        const TextureReference& heightTexture = texturedImport.scene.textures[
+            static_cast<std::size_t>(texturedMaterial.heightTexture)];
         require(texturedGpu.textureIndices0[0] == static_cast<std::uint32_t>(texturedMaterial.baseColorTexture) &&
                     texturedGpu.textureIndices0[3] == static_cast<std::uint32_t>(texturedMaterial.emissiveTexture),
                 "stable CPU/GPU texture indices");
+        require(texturedGpu.materialFlags[2] == static_cast<std::uint32_t>(texturedMaterial.heightTexture) &&
+                    (texturedGpu.materialFlags[3] & 0xffffu) == heightTexture.width &&
+                    (texturedGpu.materialFlags[3] >> 16u) == heightTexture.height,
+                "stable height texture metadata");
         const Vec4 tangent = texturedImport.scene.meshes.front().vertices.front().tangent;
         require(std::abs(length(Vec3{tangent.x, tangent.y, tangent.z}) - 1.0f) < 1.0e-4f &&
                     std::abs(std::abs(tangent.w) - 1.0f) < 1.0e-4f,
                 "normalized tangent and handedness import");
+    }
+
+    AssetLoadResult transparentImport = assetLoader.load(projectRoot / "assets" / "TransparentTriangle.obj");
+    require(static_cast<bool>(transparentImport), "transparent Assimp sample import");
+    if (transparentImport)
+    {
+        require(!transparentImport.scene.materials.empty(), "transparent material count");
+        const Material& transparentMaterial = transparentImport.scene.materials[
+            transparentImport.scene.meshes.front().materialIndex];
+        require(transparentMaterial.alphaMode == AlphaMode::Blend, "OBJ opacity enables alpha blending");
+        require(std::abs(transparentMaterial.baseColor.w - 0.4f) < 1.0e-5f,
+                "OBJ scalar opacity import");
+        require(transparentMaterial.opacityTexture >= 0, "OBJ opacity texture import");
+        const GpuMaterial transparentGpu = transparentMaterial.toGpu();
+        require(transparentGpu.textureIndices3[0] ==
+                    static_cast<std::uint32_t>(transparentMaterial.opacityTexture),
+                "stable opacity CPU/GPU texture index");
     }
 
     AssetLoadResult importedWithMaterialOverride = assetLoader.load(projectRoot / "assets" / "SampleTriangle.obj");
@@ -231,6 +265,26 @@ int main()
                       << importedFbx.scene.instances.size() << " instances, "
                       << importedFbx.scene.triangleCount() << " triangles, "
                       << importedFbx.scene.meshletCount() << " meshlets\n";
+        }
+    }
+
+    const std::filesystem::path flightHelmetPath = projectRoot / "assets" / "FlightHelmet" / "FlightHelmet.gltf";
+    if (std::filesystem::exists(flightHelmetPath))
+    {
+        AssetLoadResult flightHelmet = assetLoader.load(
+            flightHelmetPath, {.enableOptionalMeshoptimizerPasses = false});
+        require(static_cast<bool>(flightHelmet), "FlightHelmet glTF import");
+        if (flightHelmet)
+        {
+            require(flightHelmet.scene.meshes.size() == 6, "FlightHelmet mesh count");
+            const Vec2 firstUv = flightHelmet.scene.meshes.front().vertices.front().uv;
+            require(std::abs(firstUv.x - 0.0167168f) < 1.0e-5f &&
+                        std::abs(firstUv.y - 0.45894498f) < 1.0e-5f,
+                    "FlightHelmet glTF upper-left UV convention");
+            const Material& helmetMaterial = flightHelmet.scene.materials[
+                flightHelmet.scene.meshes.front().materialIndex];
+            require(helmetMaterial.normalTexture >= 0 && helmetMaterial.heightTexture < 0,
+                    "FlightHelmet normal map remains distinct from height mapping");
         }
     }
 

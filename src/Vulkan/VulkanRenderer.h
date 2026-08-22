@@ -49,6 +49,8 @@ private:
     static constexpr std::uint32_t kFramesInFlight = 2;
     static constexpr std::uint32_t kMeshletsPerTaskGroup = 32;
     static constexpr std::uint32_t kMaxMaterialTextures = 1024;
+    static constexpr std::uint32_t kRenderFlagPostProcessInput = 1u << 0;
+    static constexpr std::uint32_t kRenderFlagTransparentPass = 1u << 1;
 
     struct FrameResources
     {
@@ -120,7 +122,8 @@ private:
         std::uint32_t meshletCount{};
         std::uint32_t materialOverrideId{kInvalidMaterialId};
         std::uint32_t showMeshlets{};
-        std::uint32_t padding[2]{};
+        std::uint32_t renderFlags{};
+        std::uint32_t environmentMipCount{};
     };
     static_assert(sizeof(FramePushConstants) == 256);
 
@@ -188,8 +191,10 @@ private:
 
     VkPipelineLayout meshPipelineLayout_{VK_NULL_HANDLE};
     VkPipeline meshPipeline_{VK_NULL_HANDLE};
+    VkPipeline transparentMeshPipeline_{VK_NULL_HANDLE};
     VkPipeline backgroundPipeline_{VK_NULL_HANDLE};
     VkPipeline denoiserMeshPipeline_{VK_NULL_HANDLE};
+    VkPipeline denoiserTransparentMeshPipeline_{VK_NULL_HANDLE};
     VkPipeline denoiserBackgroundPipeline_{VK_NULL_HANDLE};
     PFN_vkCmdDrawMeshTasksEXT cmdDrawMeshTasks_{};
     VkDescriptorSetLayout sceneDescriptorSetLayout_{VK_NULL_HANDLE};

@@ -50,23 +50,25 @@ struct alignas(16) GpuMaterial
     Vec4 emissiveAndMetallic{};
     Vec4 surfaceParameters{};             // roughness, normal scale, AO strength, alpha cutoff
     Vec4 transmissionClearcoat{};         // transmission, IOR, clearcoat, clearcoat roughness
-    Vec4 anisotropySheen{};               // anisotropy, rotation, sheen roughness, reserved
+    Vec4 anisotropySheen{};               // anisotropy, rotation, sheen roughness, bump scale
     Vec4 sheenColorAbsorptionDistance{};
     Vec4 absorptionColorSubsurface{};     // absorption RGB, subsurface weight
     Vec4 subsurfaceColorRadius{};
     Vec4 volumeAbsorptionDensity{};
     Vec4 volumeScatteringAnisotropy{};
-    std::array<std::uint32_t, 4> materialFlags{}; // flags, alpha mode, reserved, reserved
+    std::array<std::uint32_t, 4> materialFlags{}; // flags, alpha mode, height texture, packed height dimensions
     std::array<std::uint32_t, 4> textureIndices0{}; // base color, metallic/roughness, normal, emissive
     std::array<std::uint32_t, 4> textureIndices1{}; // AO, transmission, clearcoat, clearcoat roughness
     std::array<std::uint32_t, 4> textureIndices2{}; // clearcoat normal, sheen color, sheen roughness, anisotropy
+    std::array<std::uint32_t, 4> textureIndices3{}; // opacity, reserved, reserved, reserved
 };
 
 static_assert(std::is_standard_layout_v<GpuMaterial>);
 static_assert(alignof(GpuMaterial) == 16);
-static_assert(sizeof(GpuMaterial) == 224);
+static_assert(sizeof(GpuMaterial) == 240);
 static_assert(offsetof(GpuMaterial, materialFlags) == 160);
 static_assert(offsetof(GpuMaterial, textureIndices0) == 176);
 static_assert(offsetof(GpuMaterial, textureIndices1) == 192);
 static_assert(offsetof(GpuMaterial, textureIndices2) == 208);
+static_assert(offsetof(GpuMaterial, textureIndices3) == 224);
 } // namespace vor

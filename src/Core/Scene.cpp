@@ -43,19 +43,23 @@ GpuMaterial Material::toGpu() const
     result.emissiveAndMetallic = {emissive.x, emissive.y, emissive.z, metallic};
     result.surfaceParameters = {roughness, normalScale, occlusionStrength, alphaCutoff};
     result.transmissionClearcoat = {transmission, indexOfRefraction, clearcoat, clearcoatRoughness};
-    result.anisotropySheen = {anisotropy, anisotropyRotation, sheenRoughness, 0.0f};
+    result.anisotropySheen = {anisotropy, anisotropyRotation, sheenRoughness, bumpScale};
     result.sheenColorAbsorptionDistance = {sheenColor.x, sheenColor.y, sheenColor.z, absorptionDistance};
     result.absorptionColorSubsurface = {absorptionColor.x, absorptionColor.y, absorptionColor.z, subsurface};
     result.subsurfaceColorRadius = {subsurfaceColor.x, subsurfaceColor.y, subsurfaceColor.z, subsurfaceRadius};
     result.volumeAbsorptionDensity = {volumeAbsorption.x, volumeAbsorption.y, volumeAbsorption.z, volumeDensity};
     result.volumeScatteringAnisotropy = {volumeScattering.x, volumeScattering.y, volumeScattering.z, volumeAnisotropy};
-    result.materialFlags = {static_cast<std::uint32_t>(flags()), static_cast<std::uint32_t>(alphaMode), 0u, 0u};
+    const std::uint32_t packedHeightDimensions = std::min(heightTextureWidth, 0xffffu) |
+                                                 (std::min(heightTextureHeight, 0xffffu) << 16u);
+    result.materialFlags = {static_cast<std::uint32_t>(flags()), static_cast<std::uint32_t>(alphaMode),
+                            textureId(heightTexture), packedHeightDimensions};
     result.textureIndices0 = {textureId(baseColorTexture), textureId(metallicRoughnessTexture),
                               textureId(normalTexture), textureId(emissiveTexture)};
     result.textureIndices1 = {textureId(occlusionTexture), textureId(transmissionTexture),
                               textureId(clearcoatTexture), textureId(clearcoatRoughnessTexture)};
     result.textureIndices2 = {textureId(clearcoatNormalTexture), textureId(sheenColorTexture),
                               textureId(sheenRoughnessTexture), textureId(anisotropyTexture)};
+    result.textureIndices3 = {textureId(opacityTexture), kInvalidTextureId, kInvalidTextureId, kInvalidTextureId};
     return result;
 }
 

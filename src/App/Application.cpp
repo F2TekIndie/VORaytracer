@@ -662,6 +662,7 @@ void Application::drawMaterialEditor()
     changed |= ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f);
     changed |= ImGui::SliderFloat("Roughness", &material.roughness, 0.02f, 1.0f);
     changed |= ImGui::DragFloat("Normal scale", &material.normalScale, 0.01f, 0.0f, 4.0f);
+    changed |= ImGui::DragFloat("Bump scale", &material.bumpScale, 0.01f, 0.0f, 16.0f);
     changed |= ImGui::SliderFloat("AO strength", &material.occlusionStrength, 0.0f, 1.0f);
     int alphaMode = static_cast<int>(material.alphaMode);
     static constexpr const char* alphaModeNames[] = {"Opaque", "Mask", "Blend"};
@@ -694,8 +695,9 @@ void Application::drawMaterialEditor()
 
     if (ImGui::TreeNode("Texture assignments"))
     {
-        ImGui::Text("Base color: %d | Normal: %d | Metallic-Roughness: %d", material.baseColorTexture,
-                    material.normalTexture, material.metallicRoughnessTexture);
+        ImGui::Text("Base color: %d | Opacity: %d", material.baseColorTexture, material.opacityTexture);
+        ImGui::Text("Normal: %d | Height: %d", material.normalTexture, material.heightTexture);
+        ImGui::Text("Metallic-Roughness: %d", material.metallicRoughnessTexture);
         ImGui::Text("AO: %d | Emissive: %d | Transmission: %d", material.occlusionTexture,
                     material.emissiveTexture, material.transmissionTexture);
         ImGui::Text("Clearcoat: %d | Roughness: %d | Normal: %d", material.clearcoatTexture,

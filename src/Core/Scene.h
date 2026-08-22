@@ -82,6 +82,7 @@ struct Material
     float metallic{};
     float roughness{1.0f};
     float normalScale{1.0f};
+    float bumpScale{1.0f};
     float occlusionStrength{1.0f};
     float alphaCutoff{0.5f};
     float transmission{};
@@ -104,7 +105,11 @@ struct Material
     AlphaMode alphaMode{AlphaMode::Opaque};
     bool doubleSided{};
     std::int32_t baseColorTexture{-1};
+    std::int32_t opacityTexture{-1};
     std::int32_t normalTexture{-1};
+    std::int32_t heightTexture{-1};
+    std::uint32_t heightTextureWidth{};
+    std::uint32_t heightTextureHeight{};
     std::int32_t metallicRoughnessTexture{-1};
     std::int32_t occlusionTexture{-1};
     std::int32_t emissiveTexture{-1};
