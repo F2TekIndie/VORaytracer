@@ -261,6 +261,14 @@ int main()
             require(!importedFbx.scene.instances.empty(), "FBX instance count");
             require(importedFbx.scene.triangleCount() > 0, "FBX triangle count");
             require(importedFbx.scene.meshletCount() > 0, "FBX meshlet count");
+            bool hasGeneratedLods = false;
+            for (const Mesh& fbxMesh : importedFbx.scene.meshes)
+            {
+                hasGeneratedLods |= fbxMesh.lods.size() > 1;
+                for (const MeshLod& lod : fbxMesh.lods)
+                    require(!lod.meshlets.empty(), "every generated FBX LOD has renderable meshlets");
+            }
+            require(hasGeneratedLods, "FBX runtime LODs generated");
             std::cout << "FBX diagnostic: " << importedFbx.scene.meshes.size() << " meshes, "
                       << importedFbx.scene.instances.size() << " instances, "
                       << importedFbx.scene.triangleCount() << " triangles, "

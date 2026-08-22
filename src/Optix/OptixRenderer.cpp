@@ -242,10 +242,12 @@ bool OptixRenderer::initialize(GLFWwindow* window)
         checkCuda(cuDeviceGet(&cudaDevice_, 0), "cuDeviceGet");
         checkCuda(cuCtxCreate(&cudaContext_, nullptr, 0, cudaDevice_), "cuCtxCreate");
         checkCuda(cuStreamCreate(&cudaStream_, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
-        checkCuda(cuEventCreate(&launchParameterCopyComplete_, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        for (CUevent& event : launchSlotComplete_)
+            checkCuda(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING), "cuEventCreate(launch slot)");
         checkCuda(cuEventCreate(&launchTimingStart_, CU_EVENT_DEFAULT), "cuEventCreate(launch timing start)");
         checkCuda(cuEventCreate(&launchTimingEnd_, CU_EVENT_DEFAULT), "cuEventCreate(launch timing end)");
-        checkCuda(cuMemHostAlloc(&launchParametersHost_, sizeof(LaunchParameters), CU_MEMHOSTALLOC_PORTABLE),
+        checkCuda(cuMemHostAlloc(&launchParametersHost_, sizeof(LaunchParameters) * kLaunchSlotCount,
+                                 CU_MEMHOSTALLOC_PORTABLE),
                   "cuMemHostAlloc(launch parameters)");
         checkOptix(optixInit(), "optixInit");
 
@@ -301,9 +303,14 @@ void OptixRenderer::shutdown()
     if (launchParametersHost_)
         cuMemFreeHost(launchParametersHost_);
     launchParametersHost_ = nullptr;
-    if (launchParameterCopyComplete_)
-        cuEventDestroy(launchParameterCopyComplete_);
-    launchParameterCopyComplete_ = nullptr;
+    for (CUevent& event : launchSlotComplete_)
+    {
+        if (event)
+            cuEventDestroy(event);
+        event = nullptr;
+    }
+    launchSlotPending_.fill(false);
+    launchSlotCursor_ = 0;
     if (launchTimingStart_)
         cuEventDestroy(launchTimingStart_);
     if (launchTimingEnd_)
@@ -445,7 +452,8 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
     try
     {
         checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
-        if (!updateShaderBindingTable(camera, settings))
+        const std::uint32_t launchSlot = static_cast<std::uint32_t>(launchSlotCursor_ % kLaunchSlotCount);
+        if (!waitForLaunchSlot(launchSlot) || !updateShaderBindingTable(camera, settings, launchSlot))
             return false;
         if (launchTimingPending_ && cuEventQuery(launchTimingEnd_) == CUDA_SUCCESS)
         {
@@ -457,7 +465,7 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         }
         const bool recordLaunchTiming = !launchTimingPending_;
         OptixShaderBindingTable shaderBindingTable{};
-        shaderBindingTable.raygenRecord = raygenRecord_;
+        shaderBindingTable.raygenRecord = raygenRecords_[launchSlot];
         shaderBindingTable.missRecordBase = missRecord_;
         shaderBindingTable.missRecordStrideInBytes = OPTIX_SBT_RECORD_HEADER_SIZE;
         shaderBindingTable.missRecordCount = 1;
@@ -473,6 +481,10 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         if (recordLaunchTiming)
             checkCuda(cuEventRecord(launchTimingStart_, cudaStream_), "cuEventRecord(OptiX launch start)");
         checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &shaderBindingTable, width_, height_, 1), "optixLaunch");
+        checkCuda(cuEventRecord(launchSlotComplete_[launchSlot], cudaStream_),
+                  "cuEventRecord(OptiX launch slot)");
+        launchSlotPending_[launchSlot] = true;
+        ++launchSlotCursor_;
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
         checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
                   "cuSignalExternalSemaphoresAsync(CUDA ready)");
@@ -512,10 +524,10 @@ bool OptixRenderer::denoiseVulkanFrame(float exposure)
                   "cuWaitExternalSemaphoresAsync(Vulkan denoiser input)");
         if (!invokeDenoiser())
             return false;
-        if (launchParameterCopyPending_)
-            checkCuda(cuEventSynchronize(launchParameterCopyComplete_),
-                      "cuEventSynchronize(Vulkan tone map parameters)");
-        auto& parameters = *static_cast<LaunchParameters*>(launchParametersHost_);
+        const std::uint32_t launchSlot = static_cast<std::uint32_t>(launchSlotCursor_ % kLaunchSlotCount);
+        if (!waitForLaunchSlot(launchSlot))
+            return false;
+        auto& parameters = static_cast<LaunchParameters*>(launchParametersHost_)[launchSlot];
         parameters = {};
         parameters.denoisedOutput = {interopDenoisedBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.displayOutput = {interopOutputBuffer_, static_cast<std::size_t>(width_) * height_};
@@ -523,16 +535,17 @@ bool OptixRenderer::denoiseVulkanFrame(float exposure)
         parameters.height = height_;
         parameters.displayBgra = interopBgra_ ? 1u : 0u;
         parameters.exposure = exposure;
-        checkCuda(cuMemcpyHtoDAsync(toneMapRecord_ + offsetof(RaygenRecord, parameters), &parameters,
+        checkCuda(cuMemcpyHtoDAsync(toneMapRecords_[launchSlot] + offsetof(RaygenRecord, parameters), &parameters,
                                     sizeof(parameters), cudaStream_),
                   "cuMemcpyHtoDAsync(Vulkan tone map parameters)");
         OptixShaderBindingTable toneMapBindingTable{};
-        toneMapBindingTable.raygenRecord = toneMapRecord_;
+        toneMapBindingTable.raygenRecord = toneMapRecords_[launchSlot];
         checkOptix(optixLaunch(pipeline_, cudaStream_, 0, 0, &toneMapBindingTable, width_, height_, 1),
                    "optixLaunch(Vulkan post-denoiser tone map)");
-        checkCuda(cuEventRecord(launchParameterCopyComplete_, cudaStream_),
-                  "cuEventRecord(Vulkan tone map parameters)");
-        launchParameterCopyPending_ = true;
+        checkCuda(cuEventRecord(launchSlotComplete_[launchSlot], cudaStream_),
+                  "cuEventRecord(Vulkan tone map slot)");
+        launchSlotPending_[launchSlot] = true;
+        ++launchSlotCursor_;
         CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS signalParams{};
         checkCuda(cuSignalExternalSemaphoresAsync(&cudaReadySemaphore_, &signalParams, 1, cudaStream_),
                   "cuSignalExternalSemaphoresAsync(Vulkan denoised)");
@@ -964,7 +977,10 @@ bool OptixRenderer::buildSceneAcceleration()
         const Vec4 fallbackEnvironment{0.0f, 0.0f, 0.0f, 1.0f};
         const Vec4* environmentData = scene_->environment.hasHdr() ? scene_->environment.hdrPixels.data()
                                                                    : &fallbackEnvironment;
-        environmentPixelCount_ = scene_->environment.hasHdr() ? scene_->environment.hdrPixels.size() : 1;
+        environmentPixelCount_ = scene_->environment.hasHdr()
+                                     ? static_cast<std::size_t>(scene_->environment.hdrWidth) *
+                                           scene_->environment.hdrHeight
+                                     : 1;
         const std::size_t environmentBytes = environmentPixelCount_ * sizeof(Vec4);
         constexpr std::array<float, 2> fallbackCdf{0.0f, 1.0f};
         const bool validImportance = scene_->environment.hasHdr() &&
@@ -1020,7 +1036,7 @@ bool OptixRenderer::buildSceneAcceleration()
 
         const std::uint32_t geometryFlags = OPTIX_GEOMETRY_FLAG_NONE;
         OptixAccelBuildOptions buildOptions{};
-        buildOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+        buildOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE | OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
         buildOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
         struct GasBuildRecord
         {
@@ -1061,23 +1077,66 @@ bool OptixRenderer::buildSceneAcceleration()
 
         CUdeviceptr temporaryBuffer = 0;
         checkCuda(cuMemAlloc(&temporaryBuffer, maximumGasTemporarySize), "cuMemAlloc(OptiX GAS temporary)");
+        CUdeviceptr compactedSizeBuffer = 0;
+        checkCuda(cuMemAlloc(&compactedSizeBuffer, gasBuilds.size() * sizeof(std::uint64_t)),
+                  "cuMemAlloc(OptiX GAS compacted sizes)");
         std::vector<OptixTraversableHandle> meshHandles(scene_->meshes.size(), 0);
+        std::vector<CUdeviceptr> originalGasBuffers;
+        originalGasBuffers.reserve(gasBuilds.size());
         std::size_t accelerationBytes = 0;
-        for (GasBuildRecord& record : gasBuilds)
+        for (std::size_t buildIndex = 0; buildIndex < gasBuilds.size(); ++buildIndex)
         {
+            GasBuildRecord& record = gasBuilds[buildIndex];
             CUdeviceptr output = 0;
             checkCuda(cuMemAlloc(&output, record.sizes.outputSizeInBytes), "cuMemAlloc(OptiX mesh GAS)");
             meshGasBuffers_.push_back(output);
+            originalGasBuffers.push_back(output);
             OptixTraversableHandle handle = 0;
+            OptixAccelEmitDesc compactedSize{};
+            compactedSize.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+            compactedSize.result = compactedSizeBuffer + buildIndex * sizeof(std::uint64_t);
             checkOptix(optixAccelBuild(optixContext_, cudaStream_, &buildOptions, &record.input, 1,
                                        temporaryBuffer, record.sizes.tempSizeInBytes, output,
-                                       record.sizes.outputSizeInBytes, &handle, nullptr, 0),
+                                       record.sizes.outputSizeInBytes, &handle, &compactedSize, 1),
                        "optixAccelBuild(mesh GAS)");
             meshHandles[record.meshIndex] = handle;
-            accelerationBytes += record.sizes.outputSizeInBytes;
         }
+        std::vector<std::uint64_t> compactedSizes(gasBuilds.size());
+        checkCuda(cuMemcpyDtoHAsync(compactedSizes.data(), compactedSizeBuffer,
+                                    compactedSizes.size() * sizeof(std::uint64_t), cudaStream_),
+                  "cuMemcpyDtoHAsync(OptiX GAS compacted sizes)");
+        checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(OptiX GAS size query)");
+        cuMemFree(compactedSizeBuffer);
+        compactedSizeBuffer = 0;
         cuMemFree(temporaryBuffer);
         temporaryBuffer = 0;
+
+        std::vector<CUdeviceptr> compactedGasBuffers(gasBuilds.size());
+        std::size_t uncompactedGasBytes = 0;
+        for (std::size_t buildIndex = 0; buildIndex < gasBuilds.size(); ++buildIndex)
+        {
+            GasBuildRecord& record = gasBuilds[buildIndex];
+            const std::uint64_t compactedSize = compactedSizes[buildIndex];
+            uncompactedGasBytes += record.sizes.outputSizeInBytes;
+            if (compactedSize > 0 && compactedSize < record.sizes.outputSizeInBytes)
+            {
+                CUdeviceptr compactedOutput = 0;
+                checkCuda(cuMemAlloc(&compactedOutput, compactedSize), "cuMemAlloc(compacted OptiX mesh GAS)");
+                meshGasBuffers_.push_back(compactedOutput);
+                OptixTraversableHandle compactedHandle = 0;
+                checkOptix(optixAccelCompact(optixContext_, cudaStream_, meshHandles[record.meshIndex],
+                                             compactedOutput, compactedSize, &compactedHandle),
+                           "optixAccelCompact(mesh GAS)");
+                compactedGasBuffers[buildIndex] = compactedOutput;
+                meshHandles[record.meshIndex] = compactedHandle;
+                accelerationBytes += compactedSize;
+            }
+            else
+            {
+                compactedGasBuffers[buildIndex] = originalGasBuffers[buildIndex];
+                accelerationBytes += record.sizes.outputSizeInBytes;
+            }
+        }
 
         std::vector<OptixInstance> optixInstances(gpuInstances.size());
         for (std::uint32_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
@@ -1110,16 +1169,25 @@ bool OptixRenderer::buildSceneAcceleration()
         iasInput.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
         iasInput.instanceArray.instances = iasInstanceBuffer_;
         iasInput.instanceArray.numInstances = static_cast<std::uint32_t>(optixInstances.size());
+        OptixAccelBuildOptions iasBuildOptions{};
+        iasBuildOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+        iasBuildOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
         OptixAccelBufferSizes iasSizes{};
-        checkOptix(optixAccelComputeMemoryUsage(optixContext_, &buildOptions, &iasInput, 1, &iasSizes),
+        checkOptix(optixAccelComputeMemoryUsage(optixContext_, &iasBuildOptions, &iasInput, 1, &iasSizes),
                    "optixAccelComputeMemoryUsage(IAS)");
         checkCuda(cuMemAlloc(&temporaryBuffer, iasSizes.tempSizeInBytes), "cuMemAlloc(OptiX IAS temporary)");
         checkCuda(cuMemAlloc(&gasBuffer_, iasSizes.outputSizeInBytes), "cuMemAlloc(OptiX IAS)");
-        checkOptix(optixAccelBuild(optixContext_, cudaStream_, &buildOptions, &iasInput, 1,
+        checkOptix(optixAccelBuild(optixContext_, cudaStream_, &iasBuildOptions, &iasInput, 1,
                                    temporaryBuffer, iasSizes.tempSizeInBytes, gasBuffer_,
                                    iasSizes.outputSizeInBytes, &gasHandle_, nullptr, 0),
                    "optixAccelBuild(IAS)");
         checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(OptiX GAS/IAS)");
+        for (std::size_t index = 0; index < originalGasBuffers.size(); ++index)
+        {
+            if (compactedGasBuffers[index] != originalGasBuffers[index])
+                cuMemFree(originalGasBuffers[index]);
+        }
+        meshGasBuffers_ = std::move(compactedGasBuffers);
         cuMemFree(temporaryBuffer);
         accelerationBytes += iasSizes.outputSizeInBytes + iasInstanceBytes;
         stats_.materialBytes = materialBytes;
@@ -1143,7 +1211,10 @@ bool OptixRenderer::buildSceneAcceleration()
                                 std::to_string(indices.size() / 3) + " unique triangles, " +
                                 std::to_string(gasBuilds.size()) + " GAS, " +
                                 std::to_string(gpuInstances.size()) + " IAS instances, " +
-                                std::to_string(emissiveTriangleCount_) + " emissive lights");
+                                std::to_string(emissiveTriangleCount_) + " emissive lights, GAS compacted " +
+                                std::to_string(uncompactedGasBytes) + " -> " +
+                                std::to_string(accelerationBytes - iasSizes.outputSizeInBytes - iasInstanceBytes) +
+                                " bytes");
         return true;
     }
     catch (const std::exception& error)
@@ -1301,8 +1372,11 @@ bool OptixRenderer::createPipeline()
         checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 2),
                    "optixPipelineSetStackSize");
 
-        checkCuda(cuMemAlloc(&raygenRecord_, sizeof(RaygenRecord)), "cuMemAlloc(raygen SBT)");
-        checkCuda(cuMemAlloc(&toneMapRecord_, sizeof(RaygenRecord)), "cuMemAlloc(tone map SBT)");
+        for (std::uint32_t slot = 0; slot < kLaunchSlotCount; ++slot)
+        {
+            checkCuda(cuMemAlloc(&raygenRecords_[slot], sizeof(RaygenRecord)), "cuMemAlloc(raygen SBT slot)");
+            checkCuda(cuMemAlloc(&toneMapRecords_[slot], sizeof(RaygenRecord)), "cuMemAlloc(tone map SBT slot)");
+        }
         checkCuda(cuMemAlloc(&missRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(miss SBT)");
         checkCuda(cuMemAlloc(&hitRecord_, OPTIX_SBT_RECORD_HEADER_SIZE), "cuMemAlloc(hit SBT)");
         RaygenRecord raygenRecord{};
@@ -1314,9 +1388,13 @@ bool OptixRenderer::createPipeline()
                    "optixSbtRecordPackHeader(tone map)");
         checkOptix(optixSbtRecordPackHeader(missProgramGroup_, &missRecord), "optixSbtRecordPackHeader(miss)");
         checkOptix(optixSbtRecordPackHeader(hitProgramGroup_, &hitRecord), "optixSbtRecordPackHeader(hit)");
-        checkCuda(cuMemcpyHtoD(raygenRecord_, &raygenRecord, sizeof(raygenRecord)), "cuMemcpyHtoD(raygen SBT)");
-        checkCuda(cuMemcpyHtoD(toneMapRecord_, &toneMapRecord, sizeof(toneMapRecord)),
-                  "cuMemcpyHtoD(tone map SBT)");
+        for (std::uint32_t slot = 0; slot < kLaunchSlotCount; ++slot)
+        {
+            checkCuda(cuMemcpyHtoD(raygenRecords_[slot], &raygenRecord, sizeof(raygenRecord)),
+                      "cuMemcpyHtoD(raygen SBT slot)");
+            checkCuda(cuMemcpyHtoD(toneMapRecords_[slot], &toneMapRecord, sizeof(toneMapRecord)),
+                      "cuMemcpyHtoD(tone map SBT slot)");
+        }
         checkCuda(cuMemcpyHtoD(missRecord_, &missRecord, sizeof(missRecord)), "cuMemcpyHtoD(miss SBT)");
         checkCuda(cuMemcpyHtoD(hitRecord_, &hitRecord, sizeof(hitRecord)), "cuMemcpyHtoD(hit SBT)");
         return true;
@@ -1331,18 +1409,24 @@ bool OptixRenderer::createPipeline()
 
 void OptixRenderer::destroyPipeline()
 {
-    if (toneMapRecord_)
-        cuMemFree(toneMapRecord_);
+    for (CUdeviceptr& record : toneMapRecords_)
+    {
+        if (record)
+            cuMemFree(record);
+        record = 0;
+    }
     if (hitRecord_)
         cuMemFree(hitRecord_);
     if (missRecord_)
         cuMemFree(missRecord_);
-    if (raygenRecord_)
-        cuMemFree(raygenRecord_);
+    for (CUdeviceptr& record : raygenRecords_)
+    {
+        if (record)
+            cuMemFree(record);
+        record = 0;
+    }
     hitRecord_ = 0;
     missRecord_ = 0;
-    raygenRecord_ = 0;
-    toneMapRecord_ = 0;
     if (pipeline_)
         optixPipelineDestroy(pipeline_);
     pipeline_ = nullptr;
@@ -1363,13 +1447,32 @@ void OptixRenderer::destroyPipeline()
     module_ = nullptr;
 }
 
-bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderSettings& settings)
+bool OptixRenderer::waitForLaunchSlot(std::uint32_t launchSlot)
+{
+    if (launchSlot >= kLaunchSlotCount)
+        return false;
+    if (!launchSlotPending_[launchSlot])
+        return true;
+    try
+    {
+        checkCuda(cuEventSynchronize(launchSlotComplete_[launchSlot]),
+                  "cuEventSynchronize(recycled launch slot)");
+        launchSlotPending_[launchSlot] = false;
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        setError(error.what());
+        return false;
+    }
+}
+
+bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderSettings& settings,
+                                             std::uint32_t launchSlot)
 {
     try
     {
-        if (launchParameterCopyPending_)
-            checkCuda(cuEventSynchronize(launchParameterCopyComplete_), "cuEventSynchronize(launch parameter copy)");
-        auto& parameters = *static_cast<LaunchParameters*>(launchParametersHost_);
+        auto& parameters = static_cast<LaunchParameters*>(launchParametersHost_)[launchSlot];
         parameters = {};
         parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.denoisedOutput = {};
@@ -1433,11 +1536,9 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.skyGround = {environment.groundColor.x, environment.groundColor.y,
                                 environment.groundColor.z, 0.0f};
 
-        checkCuda(cuMemcpyHtoDAsync(raygenRecord_ + offsetof(RaygenRecord, parameters), &parameters,
+        checkCuda(cuMemcpyHtoDAsync(raygenRecords_[launchSlot] + offsetof(RaygenRecord, parameters), &parameters,
                                     sizeof(parameters), cudaStream_),
                   "cuMemcpyHtoDAsync(launch parameters)");
-        checkCuda(cuEventRecord(launchParameterCopyComplete_, cudaStream_), "cuEventRecord(launch parameter copy)");
-        launchParameterCopyPending_ = true;
         return true;
     }
     catch (const std::exception& error)

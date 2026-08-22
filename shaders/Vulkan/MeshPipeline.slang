@@ -35,8 +35,8 @@ struct GpuMeshlet
     uint triangleCount;
     uint instanceIndex;
     uint materialIndex;
-    uint padding0;
-    uint padding1;
+    float lodError;
+    float nextLodError;
     float4 boundingSphere;
     float4 normalCone;
 };
@@ -48,9 +48,7 @@ struct GpuInstance
     float4 scaleAndFlags;
     uint4 geometry;
     uint materialIndex;
-    uint padding0;
-    uint padding1;
-    uint padding2;
+    float4 boundsCenter;
 };
 
 struct FramePushConstants
@@ -86,10 +84,11 @@ static const uint RENDER_FLAG_TRANSPARENT_PASS = 1u << 1;
 [[vk::binding(4, 0)]] RaytracingAccelerationStructure sceneTlas;
 [[vk::binding(5, 0)]] StructuredBuffer<GpuInstance> sceneInstances;
 [[vk::binding(6, 0)]] StructuredBuffer<uint> geometryIndices;
-[[vk::binding(7, 0)]] StructuredBuffer<float4> environmentPixels;
+[[vk::binding(7, 0)]] Texture2D<float4> environmentTexture;
 [[vk::binding(8, 0)]] StructuredBuffer<GpuMaterial> sceneMaterials;
 [[vk::binding(9, 0)]] Texture2D<float4> materialTextures[1024];
 [[vk::binding(10, 0)]] SamplerState materialTextureSampler;
+[[vk::binding(11, 0)]] SamplerState environmentSampler;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -327,54 +326,15 @@ float3 rotateEnvironmentDirection(float3 direction)
                   -pitchSine * yawRotated.y + pitchCosine * yawRotated.z);
 }
 
-uint environmentMipOffset(uint mipLevel)
-{
-    uint offset = 0;
-    uint width = uint(frame.environmentParameters.x);
-    uint height = uint(frame.environmentParameters.y);
-    for (uint mip = 0; mip < mipLevel; ++mip)
-    {
-        offset += width * height;
-        width = max(width / 2, 1u);
-        height = max(height / 2, 1u);
-    }
-    return offset;
-}
-
-float3 sampleHdrEnvironmentLevel(float3 rotatedDirection, uint mipLevel)
-{
-    uint width = max(uint(frame.environmentParameters.x) >> mipLevel, 1u);
-    uint height = max(uint(frame.environmentParameters.y) >> mipLevel, 1u);
-    if (width == 0 || height == 0)
-        return float3(0.0);
-    float2 uv = float2(atan2(rotatedDirection.z, rotatedDirection.x) / (2.0 * PI) + 0.5,
-                            acos(clamp(rotatedDirection.y, -1.0, 1.0)) / PI);
-    float2 texel = uv * float2(width, height) - 0.5;
-    int2 base = int2(floor(texel));
-    float2 fraction = frac(texel);
-    uint x0 = uint((base.x % int(width) + int(width)) % int(width));
-    uint x1 = (x0 + 1) % width;
-    uint y0 = uint(clamp(base.y, 0, int(height) - 1));
-    uint y1 = min(y0 + 1, height - 1);
-    uint offset = environmentMipOffset(mipLevel);
-    float3 a = lerp(environmentPixels[offset + y0 * width + x0].xyz,
-                    environmentPixels[offset + y0 * width + x1].xyz, fraction.x);
-    float3 b = lerp(environmentPixels[offset + y1 * width + x0].xyz,
-                    environmentPixels[offset + y1 * width + x1].xyz, fraction.x);
-    return lerp(a, b, fraction.y);
-}
-
 float3 sampleHdrEnvironmentLod(float3 direction, float mipLevel)
 {
     if (frame.environmentMipCount == 0)
         return float3(0.0);
     float3 rotatedDirection = rotateEnvironmentDirection(normalize(direction));
     float clampedLevel = clamp(mipLevel, 0.0, float(frame.environmentMipCount - 1));
-    uint lowerLevel = uint(floor(clampedLevel));
-    uint upperLevel = min(lowerLevel + 1, frame.environmentMipCount - 1);
-    float blend = frac(clampedLevel);
-    return lerp(sampleHdrEnvironmentLevel(rotatedDirection, lowerLevel),
-                sampleHdrEnvironmentLevel(rotatedDirection, upperLevel), blend);
+    float2 uv = float2(atan2(rotatedDirection.z, rotatedDirection.x) / (2.0 * PI) + 0.5,
+                            acos(clamp(rotatedDirection.y, -1.0, 1.0)) / PI);
+    return environmentTexture.SampleLevel(environmentSampler, uv, clampedLevel).xyz;
 }
 
 float3 sampleHdrEnvironment(float3 direction)
@@ -401,49 +361,13 @@ float3 sampleGlobalEnvironment(float3 direction)
     return float3(0.0);
 }
 
-float radicalInverseBase2(uint bits)
-{
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xaaaaaaaau) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xccccccccu) >> 2u);
-    bits = ((bits & 0x0f0f0f0fu) << 4u) | ((bits & 0xf0f0f0f0u) >> 4u);
-    bits = ((bits & 0x00ff00ffu) << 8u) | ((bits & 0xff00ff00u) >> 8u);
-    return float(bits) * 2.3283064365386963e-10;
-}
-
-float2 environmentSample(uint index, uint count)
-{
-    return float2((float(index) + 0.5) / float(count), radicalInverseBase2(index));
-}
-
-void directionBasis(float3 normal, out float3 tangent, out float3 bitangent)
-{
-    tangent = normalize(cross(abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
-                                                       : float3(0.0, 1.0, 0.0), normal));
-    bitangent = cross(normal, tangent);
-}
-
 float3 sampleDiffuseEnvironment(float3 normal)
 {
     uint mode = uint(frame.lightDirectionAndMode.w + 0.5);
     if (mode == 1)
     {
-        static const uint sampleCount = 4u;
-        float3 tangent;
-        float3 bitangent;
-        directionBasis(normalize(normal), tangent, bitangent);
-        float3 irradianceOverPi = float3(0.0);
-        for (uint index = 0; index < sampleCount; ++index)
-        {
-            float2 xi = environmentSample(index, sampleCount);
-            float radius = sqrt(xi.x);
-            float phi = 2.0 * PI * xi.y;
-            float3 direction = normalize(tangent * (radius * cos(phi)) +
-                                         bitangent * (radius * sin(phi)) +
-                                         normal * sqrt(max(1.0 - xi.x, 0.0)));
-            irradianceOverPi += sampleHdrEnvironment(direction);
-        }
-        return irradianceOverPi * (frame.environmentParameters.z / float(sampleCount));
+        float diffuseLod = max(float(frame.environmentMipCount) - 5.0, 0.0);
+        return sampleHdrEnvironmentLod(normal, diffuseLod) * frame.environmentParameters.z;
     }
     if (mode == 0)
         return float3(0.0);
@@ -456,35 +380,8 @@ float3 samplePrefilteredEnvironment(float3 reflectionDirection, float roughness)
     roughness = saturate(roughness);
     if (uint(frame.lightDirectionAndMode.w + 0.5) == 1)
     {
-        if (roughness <= 0.025)
-            return sampleHdrEnvironment(reflectionDirection) * frame.environmentParameters.z;
-        static const uint sampleCount = 4u;
-        float3 tangent;
-        float3 bitangent;
-        directionBasis(reflectionDirection, tangent, bitangent);
-        float alpha = max(roughness * roughness, 0.001);
-        float alphaSquared = alpha * alpha;
-        float3 radiance = float3(0.0);
-        float totalWeight = 0.0;
-        for (uint index = 0; index < sampleCount; ++index)
-        {
-            float2 xi = environmentSample(index, sampleCount);
-            float phi = 2.0 * PI * xi.x;
-            float cosineTheta = sqrt((1.0 - xi.y) /
-                                     max(1.0 + (alphaSquared - 1.0) * xi.y, 1e-6));
-            float sineTheta = sqrt(max(1.0 - cosineTheta * cosineTheta, 0.0));
-            float3 halfway = normalize(tangent * (cos(phi) * sineTheta) +
-                                       bitangent * (sin(phi) * sineTheta) +
-                                       reflectionDirection * cosineTheta);
-            float3 direction = normalize(reflect(-reflectionDirection, halfway));
-            float weight = saturate(dot(reflectionDirection, direction));
-            if (weight > 0.0)
-            {
-                radiance += sampleHdrEnvironment(direction) * weight;
-                totalWeight += weight;
-            }
-        }
-        return radiance * (frame.environmentParameters.z / max(totalWeight, 1e-6));
+        float specularLod = roughness * float(max(frame.environmentMipCount, 1u) - 1u);
+        return sampleHdrEnvironmentLod(reflectionDirection, specularLod) * frame.environmentParameters.z;
     }
     return sampleGlobalEnvironment(reflectionDirection);
 }
@@ -543,7 +440,17 @@ void TaskMain(
         if (visible)
         {
             GpuInstance instance = sceneInstances[meshlet.instanceIndex];
-            if (meshlet.boundingSphere.w > 0.0)
+            float3 worldBoundsCenter = mul(instance.transform, float4(instance.boundsCenter.xyz, 1.0)).xyz;
+            float4 boundsClip = mul(frame.viewProjection, float4(worldBoundsCenter, 1.0));
+            float projectedRadius = instance.scaleAndFlags.w * instance.scaleAndFlags.x *
+                                    abs(frame.viewProjection[1][1]) / max(abs(boundsClip.w), 1e-4);
+            // Errors returned by meshoptimizer are relative to mesh extent. Convert them to NDC and
+            // choose the coarsest LOD whose projected error stays below the pixel-derived tolerance.
+            float projectedError = 2.0 * projectedRadius * meshlet.lodError;
+            float nextProjectedError = 2.0 * projectedRadius * meshlet.nextLodError;
+            visible = projectedError <= frame.environmentParameters.x &&
+                      nextProjectedError > frame.environmentParameters.x;
+            if (visible && meshlet.boundingSphere.w > 0.0)
             {
                 float3 worldCenter = mul(instance.transform, float4(meshlet.boundingSphere.xyz, 1.0)).xyz;
                 float4 clipCenter = mul(frame.viewProjection, float4(worldCenter, 1.0));

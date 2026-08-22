@@ -5,6 +5,7 @@
 #include <cuda.h>
 #include <optix.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -38,6 +39,8 @@ public:
     [[nodiscard]] std::uint32_t outputHeight() const { return height_; }
 
 private:
+    static constexpr std::uint32_t kLaunchSlotCount = 3;
+
     static void contextLog(unsigned int level, const char* tag, const char* message, void* data);
     bool resizeOutput();
     bool createDenoiser();
@@ -53,14 +56,16 @@ private:
     void destroySceneAcceleration();
     bool uploadTextureResources();
     void destroyTextureResources();
-    bool updateShaderBindingTable(const Camera& camera, const RenderSettings& settings);
+    bool updateShaderBindingTable(const Camera& camera, const RenderSettings& settings,
+                                  std::uint32_t launchSlot);
+    bool waitForLaunchSlot(std::uint32_t launchSlot);
     void setError(std::string message);
 
     const Scene* scene_{};
     CUdevice cudaDevice_{};
     CUcontext cudaContext_{};
     CUstream cudaStream_{};
-    CUevent launchParameterCopyComplete_{};
+    std::array<CUevent, kLaunchSlotCount> launchSlotComplete_{};
     CUevent launchTimingStart_{};
     CUevent launchTimingEnd_{};
     OptixDeviceContext optixContext_{};
@@ -78,8 +83,8 @@ private:
     CUexternalMemory externalMemory_{};
     CUexternalSemaphore cudaReadySemaphore_{};
     CUexternalSemaphore vulkanCompleteSemaphore_{};
-    CUdeviceptr raygenRecord_{};
-    CUdeviceptr toneMapRecord_{};
+    std::array<CUdeviceptr, kLaunchSlotCount> raygenRecords_{};
+    std::array<CUdeviceptr, kLaunchSlotCount> toneMapRecords_{};
     CUdeviceptr missRecord_{};
     CUdeviceptr hitRecord_{};
     CUdeviceptr vertexBuffer_{};
@@ -117,11 +122,12 @@ private:
     void* launchParametersHost_{};
     std::uint64_t interopGeneration_{};
     bool firstInteropLaunch_{true};
-    bool launchParameterCopyPending_{};
+    std::array<bool, kLaunchSlotCount> launchSlotPending_{};
     bool launchTimingPending_{};
     bool interopBgra_{true};
     std::uint32_t width_{1};
     std::uint32_t height_{1};
+    std::uint64_t launchSlotCursor_{};
     bool available_{};
     std::string unavailableReason_;
     RendererStats stats_{};

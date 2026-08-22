@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -58,6 +60,38 @@ void check(VkResult result, std::string_view operation)
 {
     if (result != VK_SUCCESS)
         throw std::runtime_error(std::string(operation) + " failed with VkResult " + std::to_string(result));
+}
+
+std::uint16_t floatToHalf(float value)
+{
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+    const std::uint32_t sign = (bits >> 16u) & 0x8000u;
+    const std::uint32_t exponent = (bits >> 23u) & 0xffu;
+    const std::uint32_t mantissa = bits & 0x7fffffu;
+    if (exponent == 0xffu)
+        return static_cast<std::uint16_t>(sign | (mantissa ? 0x7e00u : 0x7c00u));
+    const int halfExponent = static_cast<int>(exponent) - 127 + 15;
+    if (halfExponent >= 31)
+        return static_cast<std::uint16_t>(sign | 0x7c00u);
+    if (halfExponent <= 0)
+    {
+        if (halfExponent < -10)
+            return static_cast<std::uint16_t>(sign);
+        const std::uint32_t normalizedMantissa = mantissa | 0x800000u;
+        const std::uint32_t shift = static_cast<std::uint32_t>(14 - halfExponent);
+        const std::uint32_t rounded = (normalizedMantissa + ((1u << (shift - 1u)) - 1u) +
+                                       ((normalizedMantissa >> shift) & 1u)) >> shift;
+        return static_cast<std::uint16_t>(sign | rounded);
+    }
+    const std::uint32_t roundedMantissa = mantissa + 0xfffu + ((mantissa >> 13u) & 1u);
+    if ((roundedMantissa & 0x800000u) != 0)
+    {
+        const std::uint32_t incrementedExponent = static_cast<std::uint32_t>(halfExponent + 1);
+        return static_cast<std::uint16_t>(sign | (incrementedExponent >= 31u ? 0x7c00u
+                                                                            : incrementedExponent << 10u));
+    }
+    return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(halfExponent) << 10u) |
+                                      (roundedMantissa >> 13u));
 }
 
 std::vector<std::byte> readBinary(const std::filesystem::path& path)
@@ -495,8 +529,8 @@ void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSett
     framePushConstants_.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
     framePushConstants_.lightDirectionAndMode = {light.direction.x, light.direction.y, light.direction.z,
                                                  static_cast<float>(environment.mode)};
-    framePushConstants_.environmentParameters = {static_cast<float>(environment.hdrWidth),
-                                                  static_cast<float>(environment.hdrHeight),
+    const float lodErrorTolerance = 4.0f / static_cast<float>(std::max(swapchainExtent_.height, 1u));
+    framePushConstants_.environmentParameters = {lodErrorTolerance, 0.0f,
                                                   environment.intensity, environment.rotationRadians};
     framePushConstants_.skyZenithAndVisibility = {environment.zenithColor.x, environment.zenithColor.y,
                                                   environment.zenithColor.z,
@@ -1050,10 +1084,16 @@ bool VulkanRenderer::createDevice()
         vkGetDeviceProcAddr(device_, "vkGetAccelerationStructureBuildSizesKHR"));
     cmdBuildAccelerationStructures_ = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
         vkGetDeviceProcAddr(device_, "vkCmdBuildAccelerationStructuresKHR"));
+    cmdWriteAccelerationStructuresProperties_ =
+        reinterpret_cast<PFN_vkCmdWriteAccelerationStructuresPropertiesKHR>(
+            vkGetDeviceProcAddr(device_, "vkCmdWriteAccelerationStructuresPropertiesKHR"));
+    cmdCopyAccelerationStructure_ = reinterpret_cast<PFN_vkCmdCopyAccelerationStructureKHR>(
+        vkGetDeviceProcAddr(device_, "vkCmdCopyAccelerationStructureKHR"));
     getAccelerationStructureDeviceAddress_ = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
         vkGetDeviceProcAddr(device_, "vkGetAccelerationStructureDeviceAddressKHR"));
     if (!createAccelerationStructure_ || !destroyAccelerationStructure_ || !getAccelerationStructureBuildSizes_ ||
-        !cmdBuildAccelerationStructures_ || !getAccelerationStructureDeviceAddress_)
+        !cmdBuildAccelerationStructures_ || !cmdWriteAccelerationStructuresProperties_ ||
+        !cmdCopyAccelerationStructure_ || !getAccelerationStructureDeviceAddress_)
         throw std::runtime_error("Required Vulkan acceleration-structure entry points are unavailable");
     return true;
 }
@@ -1218,7 +1258,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 11> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -1241,7 +1281,7 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[6].descriptorCount = 1;
     bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings[7].binding = 7;
-    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[7].descriptorCount = 1;
     bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings[8].binding = 8;
@@ -1257,7 +1297,11 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     bindings[10].descriptorCount = 1;
     bindings[10].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    std::array<VkDescriptorBindingFlags, 11> bindingFlags{};
+    bindings[11].binding = 11;
+    bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    bindings[11].descriptorCount = 1;
+    bindings[11].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    std::array<VkDescriptorBindingFlags, 12> bindingFlags{};
     bindingFlags[9] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
@@ -1270,10 +1314,10 @@ bool VulkanRenderer::createSceneDescriptors()
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
 
     const std::array poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, 1},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures + 1},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, 2},
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;
@@ -1550,7 +1594,6 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(meshletTriangleBuffer_);
     destroyBuffer(geometryIndexBuffer_);
     destroyBuffer(sceneInstanceBuffer_);
-    destroyBuffer(environmentBuffer_);
     destroyBuffer(materialBuffer_);
     destroyTextureResources();
     uploadedGeometries_.clear();
@@ -1575,6 +1618,9 @@ void VulkanRenderer::destroyTextureResources()
     if (materialTextureSampler_)
         vkDestroySampler(device_, materialTextureSampler_, nullptr);
     materialTextureSampler_ = VK_NULL_HANDLE;
+    if (environmentSampler_)
+        vkDestroySampler(device_, environmentSampler_, nullptr);
+    environmentSampler_ = VK_NULL_HANDLE;
     for (GpuTexture& texture : materialTextures_)
     {
         if (texture.view)
@@ -1585,6 +1631,14 @@ void VulkanRenderer::destroyTextureResources()
             vkFreeMemory(device_, texture.memory, nullptr);
     }
     materialTextures_.clear();
+    if (environmentTexture_.view)
+        vkDestroyImageView(device_, environmentTexture_.view, nullptr);
+    if (environmentTexture_.image)
+        vkDestroyImage(device_, environmentTexture_.image, nullptr);
+    if (environmentTexture_.memory)
+        vkFreeMemory(device_, environmentTexture_.memory, nullptr);
+    environmentTexture_ = {};
+    environmentTextureBytes_ = 0;
 }
 
 bool VulkanRenderer::uploadTextureResources()
@@ -1607,6 +1661,24 @@ bool VulkanRenderer::uploadTextureResources()
     }
     else
         sources.push_back(&fallback);
+
+    const bool hasEnvironment = scene_ && scene_->environment.hasHdr();
+    const std::uint32_t environmentWidth = hasEnvironment ? scene_->environment.hdrWidth : 1u;
+    const std::uint32_t environmentHeight = hasEnvironment ? scene_->environment.hdrHeight : 1u;
+    const std::uint32_t environmentMipCount = hasEnvironment ? scene_->environment.hdrMipCount : 1u;
+    const Vec4 fallbackEnvironment{};
+    const std::span<const Vec4> environmentSource = hasEnvironment
+                                                        ? std::span<const Vec4>(scene_->environment.hdrPixels)
+                                                        : std::span<const Vec4>(&fallbackEnvironment, 1);
+    std::vector<std::uint16_t> environmentHalf;
+    environmentHalf.reserve(environmentSource.size() * 4);
+    for (const Vec4& pixel : environmentSource)
+    {
+        environmentHalf.push_back(floatToHalf(std::clamp(pixel.x, -65504.0f, 65504.0f)));
+        environmentHalf.push_back(floatToHalf(std::clamp(pixel.y, -65504.0f, 65504.0f)));
+        environmentHalf.push_back(floatToHalf(std::clamp(pixel.z, -65504.0f, 65504.0f)));
+        environmentHalf.push_back(floatToHalf(std::clamp(pixel.w, -65504.0f, 65504.0f)));
+    }
 
     GpuBuffer staging{};
     VkCommandBuffer command = VK_NULL_HANDLE;
@@ -1647,6 +1719,34 @@ bool VulkanRenderer::uploadTextureResources()
                   "vkBindImageMemory(material texture)");
         }
 
+        stagingSize = (stagingSize + 7u) & ~VkDeviceSize{7u};
+        const VkDeviceSize environmentOffset = stagingSize;
+        environmentTextureBytes_ = environmentHalf.size() * sizeof(std::uint16_t);
+        stagingSize += environmentTextureBytes_;
+        VkImageCreateInfo environmentImageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        environmentImageInfo.imageType = VK_IMAGE_TYPE_2D;
+        environmentImageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        environmentImageInfo.extent = {environmentWidth, environmentHeight, 1};
+        environmentImageInfo.mipLevels = environmentMipCount;
+        environmentImageInfo.arrayLayers = 1;
+        environmentImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        environmentImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        environmentImageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        environmentImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        environmentImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(device_, &environmentImageInfo, nullptr, &environmentTexture_.image),
+              "vkCreateImage(HDR environment)");
+        VkMemoryRequirements environmentRequirements{};
+        vkGetImageMemoryRequirements(device_, environmentTexture_.image, &environmentRequirements);
+        VkMemoryAllocateInfo environmentAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        environmentAllocation.allocationSize = environmentRequirements.size;
+        environmentAllocation.memoryTypeIndex = findMemoryType(environmentRequirements.memoryTypeBits,
+                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device_, &environmentAllocation, nullptr, &environmentTexture_.memory),
+              "vkAllocateMemory(HDR environment)");
+        check(vkBindImageMemory(device_, environmentTexture_.image, environmentTexture_.memory, 0),
+              "vkBindImageMemory(HDR environment)");
+
         staging.size = stagingSize;
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufferInfo.size = stagingSize;
@@ -1669,6 +1769,8 @@ bool VulkanRenderer::uploadTextureResources()
         for (std::size_t index = 0; index < sources.size(); ++index)
             std::memcpy(static_cast<std::byte*>(mapped) + offsets[index], sources[index]->rgba8Pixels.data(),
                         sources[index]->rgba8Pixels.size());
+        std::memcpy(static_cast<std::byte*>(mapped) + environmentOffset, environmentHalf.data(),
+                    environmentTextureBytes_);
         vkUnmapMemory(device_, staging.memory);
 
         VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1701,6 +1803,21 @@ bool VulkanRenderer::uploadTextureResources()
         toTransferDependency.pImageMemoryBarriers = toTransfer.data();
         vkCmdPipelineBarrier2(command, &toTransferDependency);
 
+        VkImageMemoryBarrier2 environmentToTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        environmentToTransfer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        environmentToTransfer.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        environmentToTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        environmentToTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        environmentToTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        environmentToTransfer.image = environmentTexture_.image;
+        environmentToTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        environmentToTransfer.subresourceRange.levelCount = environmentMipCount;
+        environmentToTransfer.subresourceRange.layerCount = 1;
+        VkDependencyInfo environmentToTransferDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        environmentToTransferDependency.imageMemoryBarrierCount = 1;
+        environmentToTransferDependency.pImageMemoryBarriers = &environmentToTransfer;
+        vkCmdPipelineBarrier2(command, &environmentToTransferDependency);
+
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
             const TextureReference& source = *sources[index];
@@ -1723,6 +1840,27 @@ bool VulkanRenderer::uploadTextureResources()
                                    static_cast<std::uint32_t>(copies.size()), copies.data());
         }
 
+        std::vector<VkBufferImageCopy> environmentCopies(environmentMipCount);
+        VkDeviceSize environmentMipOffset = 0;
+        std::uint32_t environmentMipWidth = environmentWidth;
+        std::uint32_t environmentMipHeight = environmentHeight;
+        for (std::uint32_t mip = 0; mip < environmentMipCount; ++mip)
+        {
+            VkBufferImageCopy& copy = environmentCopies[mip];
+            copy.bufferOffset = environmentOffset + environmentMipOffset;
+            copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.imageSubresource.mipLevel = mip;
+            copy.imageSubresource.layerCount = 1;
+            copy.imageExtent = {environmentMipWidth, environmentMipHeight, 1};
+            environmentMipOffset += static_cast<VkDeviceSize>(environmentMipWidth) * environmentMipHeight *
+                                    sizeof(std::uint16_t) * 4;
+            environmentMipWidth = std::max(environmentMipWidth / 2, 1u);
+            environmentMipHeight = std::max(environmentMipHeight / 2, 1u);
+        }
+        vkCmdCopyBufferToImage(command, staging.buffer, environmentTexture_.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               static_cast<std::uint32_t>(environmentCopies.size()), environmentCopies.data());
+
         std::vector<VkImageMemoryBarrier2> toShader(sources.size());
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
@@ -1743,6 +1881,21 @@ bool VulkanRenderer::uploadTextureResources()
         toShaderDependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(toShader.size());
         toShaderDependency.pImageMemoryBarriers = toShader.data();
         vkCmdPipelineBarrier2(command, &toShaderDependency);
+        VkImageMemoryBarrier2 environmentToShader{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        environmentToShader.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        environmentToShader.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        environmentToShader.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        environmentToShader.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        environmentToShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        environmentToShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        environmentToShader.image = environmentTexture_.image;
+        environmentToShader.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        environmentToShader.subresourceRange.levelCount = environmentMipCount;
+        environmentToShader.subresourceRange.layerCount = 1;
+        VkDependencyInfo environmentToShaderDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        environmentToShaderDependency.imageMemoryBarrierCount = 1;
+        environmentToShaderDependency.pImageMemoryBarriers = &environmentToShader;
+        vkCmdPipelineBarrier2(command, &environmentToShaderDependency);
         check(vkEndCommandBuffer(command), "vkEndCommandBuffer(texture upload)");
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         check(vkCreateFence(device_, &fenceInfo, nullptr, &fence), "vkCreateFence(texture upload)");
@@ -1764,6 +1917,15 @@ bool VulkanRenderer::uploadTextureResources()
             check(vkCreateImageView(device_, &viewInfo, nullptr, &materialTextures_[index].view),
                   "vkCreateImageView(material texture)");
         }
+        VkImageViewCreateInfo environmentViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        environmentViewInfo.image = environmentTexture_.image;
+        environmentViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        environmentViewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        environmentViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        environmentViewInfo.subresourceRange.levelCount = environmentMipCount;
+        environmentViewInfo.subresourceRange.layerCount = 1;
+        check(vkCreateImageView(device_, &environmentViewInfo, nullptr, &environmentTexture_.view),
+              "vkCreateImageView(HDR environment)");
         VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         samplerInfo.magFilter = VK_FILTER_LINEAR;
         samplerInfo.minFilter = VK_FILTER_LINEAR;
@@ -1774,6 +1936,9 @@ bool VulkanRenderer::uploadTextureResources()
         samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
         check(vkCreateSampler(device_, &samplerInfo, nullptr, &materialTextureSampler_),
               "vkCreateSampler(material textures)");
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        check(vkCreateSampler(device_, &samplerInfo, nullptr, &environmentSampler_),
+              "vkCreateSampler(HDR environment)");
 
         vkDestroyFence(device_, fence, nullptr);
         fence = VK_NULL_HANDLE;
@@ -1822,7 +1987,8 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t triangleCount;
         std::uint32_t instanceIndex;
         std::uint32_t materialIndex;
-        std::uint32_t padding[2];
+        float lodError;
+        float nextLodError;
         Vec4 boundingSphere;
         Vec4 normalCone;
     };
@@ -1834,9 +2000,12 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t geometry[4];
         std::uint32_t materialIndex;
         std::uint32_t padding[3];
+        Vec4 boundsCenter;
     };
     static_assert(sizeof(GpuMeshlet) == 64);
-    static_assert(sizeof(GpuInstance) == 176);
+    static_assert(sizeof(GpuInstance) == 192);
+    static_assert(offsetof(GpuInstance, materialIndex) == 160);
+    static_assert(offsetof(GpuInstance, boundsCenter) == 176);
     static_assert(sizeof(GpuMaterial) == 240);
     struct RasterMeshRange
     {
@@ -1852,12 +2021,9 @@ bool VulkanRenderer::uploadSceneResources()
     std::vector<std::uint32_t> packedTriangles;
     std::vector<std::uint32_t> geometryIndices;
     std::vector<GpuMaterial> gpuMaterials;
-    const Vec4 fallbackEnvironment{0.0f, 0.0f, 0.0f, 1.0f};
-    const std::span<const Vec4> environmentPixels = scene_->environment.hasHdr()
-                                                        ? std::span<const Vec4>(scene_->environment.hdrPixels)
-                                                        : std::span<const Vec4>(&fallbackEnvironment, 1);
     std::vector<std::uint32_t> meshToGeometry(scene_->meshes.size(), UINT32_MAX);
     std::vector<RasterMeshRange> rasterRanges(scene_->meshes.size());
+    std::vector<Vec4> meshBounds(scene_->meshes.size());
 
     for (std::uint32_t meshIndex = 0; meshIndex < scene_->meshes.size(); ++meshIndex)
     {
@@ -1879,24 +2045,50 @@ bool VulkanRenderer::uploadSceneResources()
         }
 
         const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
+        Vec3 minimum = mesh.vertices.front().position;
+        Vec3 maximum = minimum;
+        for (const Vertex& vertex : mesh.vertices)
+        {
+            minimum.x = std::min(minimum.x, vertex.position.x);
+            minimum.y = std::min(minimum.y, vertex.position.y);
+            minimum.z = std::min(minimum.z, vertex.position.z);
+            maximum.x = std::max(maximum.x, vertex.position.x);
+            maximum.y = std::max(maximum.y, vertex.position.y);
+            maximum.z = std::max(maximum.z, vertex.position.z);
+        }
+        const Vec3 boundsCenter = (minimum + maximum) * 0.5f;
+        float boundsRadius = 0.0f;
+        for (const Vertex& vertex : mesh.vertices)
+            boundsRadius = std::max(boundsRadius, length(vertex.position - boundsCenter));
+        meshBounds[meshIndex] = {boundsCenter.x, boundsCenter.y, boundsCenter.z, boundsRadius};
         RasterMeshRange& rasterRange = rasterRanges[meshIndex];
         rasterRange.firstMeshlet = static_cast<std::uint32_t>(meshletTemplates.size());
-        for (const Meshlet& meshlet : lod.meshlets)
+        const std::uint32_t lodCount = static_cast<std::uint32_t>(mesh.lods.size());
+        for (std::uint32_t lodLevel = 0; lodLevel < lodCount; ++lodLevel)
         {
-            const std::uint32_t meshletVertexOffset = static_cast<std::uint32_t>(meshletVertices.size());
-            for (std::uint32_t index = 0; index < meshlet.vertexCount; ++index)
-                meshletVertices.push_back(vertexBase + lod.meshletVertices[meshlet.vertexOffset + index]);
-            const std::uint32_t triangleOffset = static_cast<std::uint32_t>(packedTriangles.size());
-            for (std::uint32_t triangle = 0; triangle < meshlet.triangleCount; ++triangle)
+            const MeshLod& rasterLod = mesh.lods[lodLevel];
+            const float lodError = lodLevel == 0 ? 0.0f : rasterLod.simplificationError;
+            const float nextLodError = lodLevel + 1 < lodCount
+                                           ? std::max(mesh.lods[lodLevel + 1].simplificationError, lodError)
+                                           : 1.0e30f;
+            for (const Meshlet& meshlet : rasterLod.meshlets)
             {
-                const std::size_t byteOffset = static_cast<std::size_t>(meshlet.triangleOffset) + triangle * 3;
-                const std::uint32_t packed = static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset]) |
-                                             (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 1]) << 8) |
-                                             (static_cast<std::uint32_t>(lod.meshletTriangles[byteOffset + 2]) << 16);
-                packedTriangles.push_back(packed);
+                const std::uint32_t meshletVertexOffset = static_cast<std::uint32_t>(meshletVertices.size());
+                for (std::uint32_t index = 0; index < meshlet.vertexCount; ++index)
+                    meshletVertices.push_back(vertexBase + rasterLod.meshletVertices[meshlet.vertexOffset + index]);
+                const std::uint32_t triangleOffset = static_cast<std::uint32_t>(packedTriangles.size());
+                for (std::uint32_t triangle = 0; triangle < meshlet.triangleCount; ++triangle)
+                {
+                    const std::size_t byteOffset = static_cast<std::size_t>(meshlet.triangleOffset) + triangle * 3;
+                    const std::uint32_t packed = static_cast<std::uint32_t>(rasterLod.meshletTriangles[byteOffset]) |
+                                                 (static_cast<std::uint32_t>(rasterLod.meshletTriangles[byteOffset + 1]) << 8) |
+                                                 (static_cast<std::uint32_t>(rasterLod.meshletTriangles[byteOffset + 2]) << 16);
+                    packedTriangles.push_back(packed);
+                }
+                meshletTemplates.push_back({meshletVertexOffset, triangleOffset, meshlet.vertexCount,
+                                            meshlet.triangleCount, 0, materialIndex, lodError, nextLodError,
+                                            meshlet.boundingSphere, meshlet.normalCone});
             }
-            meshletTemplates.push_back({meshletVertexOffset, triangleOffset, meshlet.vertexCount, meshlet.triangleCount,
-                                        0, materialIndex, {}, meshlet.boundingSphere, meshlet.normalCone});
         }
         rasterRange.meshletCount = static_cast<std::uint32_t>(meshletTemplates.size()) - rasterRange.firstMeshlet;
         for (std::uint32_t index : lod.indices)
@@ -1918,13 +2110,15 @@ bool VulkanRenderer::uploadSceneResources()
         const std::uint32_t gpuInstanceIndex = static_cast<std::uint32_t>(gpuInstances.size());
         const UploadedGeometry& geometry = uploadedGeometries_[meshToGeometry[meshIndex]];
         const Mesh& mesh = scene_->meshes[meshIndex];
+        const Vec4 bounds = meshBounds[meshIndex];
         const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
         gpuInstances.push_back({transform,
                                 normalTransformMatrix(transform),
-                                {maxScale, minScale, transformHandedness, 0.0f},
+                                {maxScale, minScale, transformHandedness, bounds.w},
                                 {geometry.vertexOffset, geometry.indexOffset, geometry.indexCount, 0},
                                 materialIndex,
-                                {}});
+                                {},
+                                {bounds.x, bounds.y, bounds.z, 0.0f}});
         const RasterMeshRange range = rasterRanges[meshIndex];
         for (std::uint32_t index = 0; index < range.meshletCount; ++index)
         {
@@ -1975,7 +2169,6 @@ bool VulkanRenderer::uploadSceneResources()
                                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     sceneInstanceBuffer_ = createDeviceLocalBuffer(gpuInstances.size() * sizeof(GpuInstance),
                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    environmentBuffer_ = createDeviceLocalBuffer(environmentPixels.size_bytes(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     materialBuffer_ = createDeviceLocalBuffer(gpuMaterials.size() * sizeof(GpuMaterial),
                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const std::array uploads{
@@ -1985,7 +2178,6 @@ bool VulkanRenderer::uploadSceneResources()
         BufferUpload{&meshletTriangleBuffer_, packedTriangles.data(), packedTriangles.size() * sizeof(std::uint32_t)},
         BufferUpload{&geometryIndexBuffer_, geometryIndices.data(), geometryIndices.size() * sizeof(std::uint32_t)},
         BufferUpload{&sceneInstanceBuffer_, gpuInstances.data(), gpuInstances.size() * sizeof(GpuInstance)},
-        BufferUpload{&environmentBuffer_, environmentPixels.data(), environmentPixels.size_bytes()},
         BufferUpload{&materialBuffer_, gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)},
     };
     if (!uploadDeviceLocalBuffers(uploads))
@@ -2002,17 +2194,16 @@ bool VulkanRenderer::uploadSceneResources()
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &sceneDescriptorSetLayout_;
     check(vkAllocateDescriptorSets(device_, &allocateInfo, &sceneDescriptorSet_), "vkAllocateDescriptorSets");
-    const std::array<VkDescriptorBufferInfo, 8> bufferInfos{{
+    const std::array<VkDescriptorBufferInfo, 7> bufferInfos{{
         {vertexBuffer_.buffer, 0, vertexBuffer_.size},
         {meshletBuffer_.buffer, 0, meshletBuffer_.size},
         {meshletVertexBuffer_.buffer, 0, meshletVertexBuffer_.size},
         {meshletTriangleBuffer_.buffer, 0, meshletTriangleBuffer_.size},
         {sceneInstanceBuffer_.buffer, 0, sceneInstanceBuffer_.size},
         {geometryIndexBuffer_.buffer, 0, geometryIndexBuffer_.size},
-        {environmentBuffer_.buffer, 0, environmentBuffer_.size},
         {materialBuffer_.buffer, 0, materialBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 11> writes{};
+    std::array<VkWriteDescriptorSet, 12> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2048,14 +2239,17 @@ bool VulkanRenderer::uploadSceneResources()
     writes[7].dstSet = sceneDescriptorSet_;
     writes[7].dstBinding = 7;
     writes[7].descriptorCount = 1;
-    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[7].pBufferInfo = &bufferInfos[6];
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    VkDescriptorImageInfo environmentInfo{};
+    environmentInfo.imageView = environmentTexture_.view;
+    environmentInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    writes[7].pImageInfo = &environmentInfo;
     writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[8].dstSet = sceneDescriptorSet_;
     writes[8].dstBinding = 8;
     writes[8].descriptorCount = 1;
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[8].pBufferInfo = &bufferInfos[7];
+    writes[8].pBufferInfo = &bufferInfos[6];
     std::vector<VkDescriptorImageInfo> textureInfos(materialTextures_.size());
     for (std::size_t index = 0; index < materialTextures_.size(); ++index)
     {
@@ -2076,6 +2270,14 @@ bool VulkanRenderer::uploadSceneResources()
     writes[10].descriptorCount = 1;
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     writes[10].pImageInfo = &samplerInfo;
+    VkDescriptorImageInfo environmentSamplerInfo{};
+    environmentSamplerInfo.sampler = environmentSampler_;
+    writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[11].dstSet = sceneDescriptorSet_;
+    writes[11].dstBinding = 11;
+    writes[11].descriptorCount = 1;
+    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[11].pImageInfo = &environmentSamplerInfo;
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
@@ -2093,7 +2295,7 @@ bool VulkanRenderer::uploadSceneResources()
         stats_.textureBytes = 4;
     stats_.gpuSceneBytes = vertexBuffer_.size + meshletBuffer_.size + meshletVertexBuffer_.size +
                            meshletTriangleBuffer_.size + geometryIndexBuffer_.size + sceneInstanceBuffer_.size +
-                           environmentBuffer_.size + materialBuffer_.size + accelerationInstanceBuffer_.size +
+                           environmentTextureBytes_ + materialBuffer_.size + accelerationInstanceBuffer_.size +
                            tlasStorage_.size + stats_.textureBytes;
     for (const BlasResource& blas : blases_)
         stats_.gpuSceneBytes += blas.storage.size;
@@ -2107,6 +2309,15 @@ bool VulkanRenderer::uploadSceneResources()
 
 bool VulkanRenderer::buildAccelerationStructures()
 {
+    VkQueryPool compactedSizeQueryPool = VK_NULL_HANDLE;
+    GpuBuffer scratch{};
+    const auto destroyLocalBuffer = [&](GpuBuffer& buffer) {
+        if (buffer.buffer)
+            vkDestroyBuffer(device_, buffer.buffer, nullptr);
+        if (buffer.memory)
+            vkFreeMemory(device_, buffer.memory, nullptr);
+        buffer = {};
+    };
     try
     {
         destroyAccelerationStructures();
@@ -2118,12 +2329,31 @@ bool VulkanRenderer::buildAccelerationStructures()
             info.buffer = buffer;
             return vkGetBufferDeviceAddress(device_, &info);
         };
-        const auto destroyBuffer = [&](GpuBuffer& buffer) {
-            if (buffer.buffer)
-                vkDestroyBuffer(device_, buffer.buffer, nullptr);
-            if (buffer.memory)
-                vkFreeMemory(device_, buffer.memory, nullptr);
-            buffer = {};
+        const auto beginCommands = [&]() {
+            VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            allocation.commandPool = commandPool_;
+            allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocation.commandBufferCount = 1;
+            VkCommandBuffer command = VK_NULL_HANDLE;
+            check(vkAllocateCommandBuffers(device_, &allocation, &command),
+                  "vkAllocateCommandBuffers(AS build)");
+            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(AS build)");
+            return command;
+        };
+        const auto submitAndWait = [&](VkCommandBuffer command, const char* operation) {
+            check(vkEndCommandBuffer(command), "vkEndCommandBuffer(AS build)");
+            VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VkFence fence = VK_NULL_HANDLE;
+            check(vkCreateFence(device_, &fenceInfo, nullptr, &fence), "vkCreateFence(AS build)");
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &command;
+            check(vkQueueSubmit(graphicsQueue_, 1, &submit, fence), operation);
+            check(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(AS build)");
+            vkDestroyFence(device_, fence, nullptr);
+            vkFreeCommandBuffers(device_, commandPool_, 1, &command);
         };
 
         struct BlasBuildRecord
@@ -2163,7 +2393,8 @@ bool VulkanRenderer::buildAccelerationStructures()
             record.geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
             record.geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
             record.build.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-            record.build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+            record.build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                                 VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
             record.build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             record.build.geometryCount = 1;
             record.build.pGeometries = &record.geometry;
@@ -2190,16 +2421,98 @@ bool VulkanRenderer::buildAccelerationStructures()
             blases_.push_back(blas);
         }
 
+        scratch = createDeviceLocalBuffer(blasScratchSize,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        const VkDeviceAddress scratchAddress = deviceAddress(scratch.buffer);
+        for (BlasBuildRecord& record : blasBuilds)
+            record.build.scratchData.deviceAddress = scratchAddress + record.scratchOffset;
+
+        VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        queryInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+        queryInfo.queryCount = static_cast<std::uint32_t>(blases_.size());
+        check(vkCreateQueryPool(device_, &queryInfo, nullptr, &compactedSizeQueryPool),
+              "vkCreateQueryPool(BLAS compacted sizes)");
+        VkCommandBuffer buildCommand = beginCommands();
+        vkCmdResetQueryPool(buildCommand, compactedSizeQueryPool, 0, queryInfo.queryCount);
+        for (BlasBuildRecord& record : blasBuilds)
+        {
+            const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = {&record.range};
+            cmdBuildAccelerationStructures_(buildCommand, 1, &record.build, ranges);
+        }
+        VkMemoryBarrier2 queryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        queryBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        queryBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        queryBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        queryBarrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        VkDependencyInfo queryDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        queryDependency.memoryBarrierCount = 1;
+        queryDependency.pMemoryBarriers = &queryBarrier;
+        vkCmdPipelineBarrier2(buildCommand, &queryDependency);
+        std::vector<VkAccelerationStructureKHR> originalHandles;
+        originalHandles.reserve(blases_.size());
+        for (const BlasResource& blas : blases_)
+            originalHandles.push_back(blas.handle);
+        cmdWriteAccelerationStructuresProperties_(buildCommand, static_cast<std::uint32_t>(originalHandles.size()),
+                                                   originalHandles.data(),
+                                                   VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                                                   compactedSizeQueryPool, 0);
+        submitAndWait(buildCommand, "vkQueueSubmit(BLAS build and compact-size query)");
+
+        std::vector<VkDeviceSize> compactedSizes(blases_.size());
+        check(vkGetQueryPoolResults(device_, compactedSizeQueryPool, 0,
+                                    static_cast<std::uint32_t>(compactedSizes.size()),
+                                    compactedSizes.size() * sizeof(VkDeviceSize), compactedSizes.data(),
+                                    sizeof(VkDeviceSize), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+              "vkGetQueryPoolResults(BLAS compacted sizes)");
+        vkDestroyQueryPool(device_, compactedSizeQueryPool, nullptr);
+        compactedSizeQueryPool = VK_NULL_HANDLE;
+
+        const std::size_t originalBlasCount = blases_.size();
+        std::vector<std::size_t> finalBlasIndices(originalBlasCount);
+        std::vector<std::pair<std::size_t, std::size_t>> compactCopies;
+        VkDeviceSize originalBlasBytes = 0;
+        VkDeviceSize compactedBlasBytes = 0;
+        for (std::size_t index = 0; index < originalBlasCount; ++index)
+        {
+            originalBlasBytes += blases_[index].storage.size;
+            const VkDeviceSize compactedSize = compactedSizes[index];
+            if (compactedSize > 0 && compactedSize < blases_[index].storage.size)
+            {
+                BlasResource compacted{};
+                compacted.storage = createDeviceLocalBuffer(
+                    compactedSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                VkAccelerationStructureCreateInfoKHR createInfo{
+                    VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+                createInfo.buffer = compacted.storage.buffer;
+                createInfo.size = compactedSize;
+                createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+                check(createAccelerationStructure_(device_, &createInfo, nullptr, &compacted.handle),
+                      "vkCreateAccelerationStructureKHR(compacted BLAS)");
+                const std::size_t compactedIndex = blases_.size();
+                blases_.push_back(compacted);
+                finalBlasIndices[index] = compactedIndex;
+                compactCopies.emplace_back(index, compactedIndex);
+                compactedBlasBytes += compactedSize;
+            }
+            else
+            {
+                finalBlasIndices[index] = index;
+                compactedBlasBytes += blases_[index].storage.size;
+            }
+        }
+
         std::vector<VkAccelerationStructureInstanceKHR> accelerationInstances;
         accelerationInstances.reserve(uploadedInstances_.size());
         for (std::uint32_t instanceIndex = 0; instanceIndex < uploadedInstances_.size(); ++instanceIndex)
         {
             const UploadedInstance& uploaded = uploadedInstances_[instanceIndex];
-            if (uploaded.geometryIndex >= blases_.size())
+            if (uploaded.geometryIndex >= finalBlasIndices.size())
                 continue;
             VkAccelerationStructureDeviceAddressInfoKHR addressInfo{
                 VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
-            addressInfo.accelerationStructure = blases_[uploaded.geometryIndex].handle;
+            addressInfo.accelerationStructure = blases_[finalBlasIndices[uploaded.geometryIndex]].handle;
             VkAccelerationStructureInstanceKHR instance{};
             const Mat4& transform = uploaded.transform;
             instance.transform.matrix[0][0] = transform.m[0];
@@ -2258,27 +2571,28 @@ bool VulkanRenderer::buildAccelerationStructures()
         tlasCreate.size = tlasSizes.accelerationStructureSize;
         tlasCreate.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
         check(createAccelerationStructure_(device_, &tlasCreate, nullptr, &tlas_), "vkCreateAccelerationStructureKHR(TLAS)");
-        const VkDeviceSize scratchSize = std::max(blasScratchSize, tlasSizes.buildScratchSize);
-        GpuBuffer scratch = createDeviceLocalBuffer(scratchSize,
-                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        const VkDeviceAddress scratchAddress = deviceAddress(scratch.buffer);
-        for (BlasBuildRecord& record : blasBuilds)
-            record.build.scratchData.deviceAddress = scratchAddress + record.scratchOffset;
+        if (scratch.size < tlasSizes.buildScratchSize)
+        {
+            destroyLocalBuffer(scratch);
+            scratch = createDeviceLocalBuffer(tlasSizes.buildScratchSize,
+                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        }
         tlasBuild.dstAccelerationStructure = tlas_;
-        tlasBuild.scratchData.deviceAddress = scratchAddress;
+        tlasBuild.scratchData.deviceAddress = deviceAddress(scratch.buffer);
         VkAccelerationStructureBuildRangeInfoKHR tlasRange{};
         tlasRange.primitiveCount = instanceCount;
 
-        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        allocation.commandPool = commandPool_;
-        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocation.commandBufferCount = 1;
-        VkCommandBuffer command = VK_NULL_HANDLE;
-        check(vkAllocateCommandBuffers(device_, &allocation, &command), "vkAllocateCommandBuffers(AS batch)");
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer(AS batch)");
+        VkCommandBuffer command = beginCommands();
+        for (const auto& [sourceIndex, destinationIndex] : compactCopies)
+        {
+            VkCopyAccelerationStructureInfoKHR copyInfo{
+                VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR};
+            copyInfo.src = blases_[sourceIndex].handle;
+            copyInfo.dst = blases_[destinationIndex].handle;
+            copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+            cmdCopyAccelerationStructure_(command, &copyInfo);
+        }
         VkMemoryBarrier2 buildBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         buildBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
         buildBarrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
@@ -2288,30 +2602,41 @@ bool VulkanRenderer::buildAccelerationStructures()
         VkDependencyInfo buildDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         buildDependency.memoryBarrierCount = 1;
         buildDependency.pMemoryBarriers = &buildBarrier;
-        for (BlasBuildRecord& record : blasBuilds)
-        {
-            const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = {&record.range};
-            cmdBuildAccelerationStructures_(command, 1, &record.build, ranges);
-        }
         vkCmdPipelineBarrier2(command, &buildDependency);
         const VkAccelerationStructureBuildRangeInfoKHR* tlasRanges[] = {&tlasRange};
         cmdBuildAccelerationStructures_(command, 1, &tlasBuild, tlasRanges);
-        check(vkEndCommandBuffer(command), "vkEndCommandBuffer(AS batch)");
-        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VkFence buildFence = VK_NULL_HANDLE;
-        check(vkCreateFence(device_, &fenceInfo, nullptr, &buildFence), "vkCreateFence(AS batch)");
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &command;
-        check(vkQueueSubmit(graphicsQueue_, 1, &submit, buildFence), "vkQueueSubmit(AS batch)");
-        check(vkWaitForFences(device_, 1, &buildFence, VK_TRUE, UINT64_MAX), "vkWaitForFences(AS batch)");
-        vkDestroyFence(device_, buildFence, nullptr);
-        vkFreeCommandBuffers(device_, commandPool_, 1, &command);
-        destroyBuffer(scratch);
+        submitAndWait(command, "vkQueueSubmit(BLAS compaction and TLAS build)");
+
+        std::vector<bool> keepBlas(blases_.size(), false);
+        for (std::size_t index : finalBlasIndices)
+            keepBlas[index] = true;
+        std::vector<BlasResource> finalBlases;
+        finalBlases.reserve(finalBlasIndices.size());
+        for (std::size_t index : finalBlasIndices)
+        {
+            finalBlases.push_back(blases_[index]);
+            blases_[index] = {};
+        }
+        for (std::size_t index = 0; index < blases_.size(); ++index)
+        {
+            if (keepBlas[index])
+                continue;
+            if (blases_[index].handle)
+                destroyAccelerationStructure_(device_, blases_[index].handle, nullptr);
+            destroyLocalBuffer(blases_[index].storage);
+        }
+        blases_ = std::move(finalBlases);
+        destroyLocalBuffer(scratch);
+        log(LogLevel::Info, "Vulkan BLAS compaction: " + std::to_string(originalBlasBytes) + " -> " +
+                                std::to_string(compactedBlasBytes) + " bytes across " +
+                                std::to_string(blases_.size()) + " BLAS");
         return true;
     }
     catch (const std::exception& error)
     {
+        if (compactedSizeQueryPool)
+            vkDestroyQueryPool(device_, compactedSizeQueryPool, nullptr);
+        destroyLocalBuffer(scratch);
         setError(error.what());
         destroyAccelerationStructures();
         return false;

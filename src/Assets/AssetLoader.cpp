@@ -789,58 +789,70 @@ void AssetLoader::processMesh(Mesh& mesh, bool enableOptionalPasses)
                                     mesh.vertices.size(), sizeof(Vertex));
     }
 
-    constexpr std::size_t kMaxVertices = 64;
-    constexpr std::size_t kMaxTriangles = 124;
-    const std::size_t maxMeshlets = meshopt_buildMeshletsBound(base.indices.size(), kMaxVertices, kMaxTriangles);
-    std::vector<meshopt_Meshlet> nativeMeshlets(maxMeshlets);
-    base.meshletVertices.resize(maxMeshlets * kMaxVertices);
-    base.meshletTriangles.resize(maxMeshlets * kMaxTriangles * 3);
-    const std::size_t meshletCount = meshopt_buildMeshlets(
-        nativeMeshlets.data(), base.meshletVertices.data(), base.meshletTriangles.data(), base.indices.data(),
-        base.indices.size(), &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex), kMaxVertices, kMaxTriangles, 0.5f);
-    nativeMeshlets.resize(meshletCount);
-    base.meshlets.reserve(meshletCount);
-    for (const meshopt_Meshlet& native : nativeMeshlets)
-    {
-        Meshlet meshlet{native.vertex_offset, native.triangle_offset, native.vertex_count, native.triangle_count};
-        if (enableOptionalPasses)
+    const auto buildMeshlets = [&](MeshLod& lod, bool buildBounds) {
+        constexpr std::size_t kMaxVertices = 64;
+        constexpr std::size_t kMaxTriangles = 124;
+        const std::size_t maxMeshlets = meshopt_buildMeshletsBound(lod.indices.size(), kMaxVertices, kMaxTriangles);
+        std::vector<meshopt_Meshlet> nativeMeshlets(maxMeshlets);
+        lod.meshletVertices.resize(maxMeshlets * kMaxVertices);
+        lod.meshletTriangles.resize(maxMeshlets * kMaxTriangles * 3);
+        const std::size_t meshletCount = meshopt_buildMeshlets(
+            nativeMeshlets.data(), lod.meshletVertices.data(), lod.meshletTriangles.data(), lod.indices.data(),
+            lod.indices.size(), &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex),
+            kMaxVertices, kMaxTriangles, 0.5f);
+        nativeMeshlets.resize(meshletCount);
+        lod.meshlets.clear();
+        lod.meshlets.reserve(meshletCount);
+        for (const meshopt_Meshlet& native : nativeMeshlets)
         {
-            const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
-                base.meshletVertices.data() + native.vertex_offset,
-                base.meshletTriangles.data() + native.triangle_offset,
-                native.triangle_count, &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex));
-            meshlet.boundingSphere = {bounds.center[0], bounds.center[1], bounds.center[2], bounds.radius};
-            meshlet.normalCone = {static_cast<float>(bounds.cone_axis_s8[0]) / 127.0f,
-                                  static_cast<float>(bounds.cone_axis_s8[1]) / 127.0f,
-                                  static_cast<float>(bounds.cone_axis_s8[2]) / 127.0f,
-                                  static_cast<float>(bounds.cone_cutoff_s8) / 127.0f};
+            Meshlet meshlet{native.vertex_offset, native.triangle_offset, native.vertex_count, native.triangle_count};
+            if (buildBounds)
+            {
+                const meshopt_Bounds bounds = meshopt_computeMeshletBounds(
+                    lod.meshletVertices.data() + native.vertex_offset,
+                    lod.meshletTriangles.data() + native.triangle_offset,
+                    native.triangle_count, &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex));
+                meshlet.boundingSphere = {bounds.center[0], bounds.center[1], bounds.center[2], bounds.radius};
+                meshlet.normalCone = {static_cast<float>(bounds.cone_axis_s8[0]) / 127.0f,
+                                      static_cast<float>(bounds.cone_axis_s8[1]) / 127.0f,
+                                      static_cast<float>(bounds.cone_axis_s8[2]) / 127.0f,
+                                      static_cast<float>(bounds.cone_cutoff_s8) / 127.0f};
+            }
+            lod.meshlets.push_back(meshlet);
         }
-        base.meshlets.push_back(meshlet);
-    }
-
-    if (!nativeMeshlets.empty())
-    {
-        const meshopt_Meshlet& last = nativeMeshlets.back();
-        base.meshletVertices.resize(last.vertex_offset + last.vertex_count);
-        base.meshletTriangles.resize(last.triangle_offset + ((last.triangle_count * 3 + 3) & ~3u));
-    }
+        if (!nativeMeshlets.empty())
+        {
+            const meshopt_Meshlet& last = nativeMeshlets.back();
+            lod.meshletVertices.resize(last.vertex_offset + last.vertex_count);
+            lod.meshletTriangles.resize(last.triangle_offset + ((last.triangle_count * 3 + 3) & ~3u));
+        }
+    };
+    buildMeshlets(base, enableOptionalPasses);
 
     if (!enableOptionalPasses)
         return;
 
     constexpr std::array<float, 2> lodRatios{0.5f, 0.25f};
+    constexpr std::array<float, 9> attributeWeights{
+        1.0f, 1.0f, 1.0f,       // normal
+        0.25f, 0.25f, 0.25f, 0.1f, // tangent and handedness
+        1.0f, 1.0f,              // UV
+    };
     const std::vector<std::uint32_t> sourceIndices = base.indices;
     for (const float ratio : lodRatios)
     {
         const std::size_t targetCount = std::max<std::size_t>(3, static_cast<std::size_t>(sourceIndices.size() * ratio) / 3 * 3);
         MeshLod lod{};
         lod.indices.resize(sourceIndices.size());
-        lod.indices.resize(meshopt_simplify(lod.indices.data(), sourceIndices.data(), sourceIndices.size(),
-                                            &mesh.vertices[0].position.x, mesh.vertices.size(), sizeof(Vertex), targetCount,
-                                            1e-2f, meshopt_SimplifyLockBorder, &lod.simplificationError));
+        lod.indices.resize(meshopt_simplifyWithAttributes(
+            lod.indices.data(), sourceIndices.data(), sourceIndices.size(), &mesh.vertices[0].position.x,
+            mesh.vertices.size(), sizeof(Vertex), &mesh.vertices[0].normal.x, sizeof(Vertex),
+            attributeWeights.data(), attributeWeights.size(), nullptr, targetCount, 1e-2f,
+            meshopt_SimplifyLockBorder, &lod.simplificationError));
         if (lod.indices.size() >= 3 && lod.indices.size() < base.indices.size())
         {
             meshopt_optimizeVertexCache(lod.indices.data(), lod.indices.data(), lod.indices.size(), mesh.vertices.size());
+            buildMeshlets(lod, true);
             mesh.lods.push_back(std::move(lod));
         }
     }

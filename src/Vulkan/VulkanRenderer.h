@@ -206,10 +206,12 @@ private:
     GpuBuffer meshletTriangleBuffer_{};
     GpuBuffer geometryIndexBuffer_{};
     GpuBuffer sceneInstanceBuffer_{};
-    GpuBuffer environmentBuffer_{};
     GpuBuffer materialBuffer_{};
     std::vector<GpuTexture> materialTextures_;
+    GpuTexture environmentTexture_{};
+    VkDeviceSize environmentTextureBytes_{};
     VkSampler materialTextureSampler_{VK_NULL_HANDLE};
+    VkSampler environmentSampler_{VK_NULL_HANDLE};
     GpuBuffer tlasStorage_{};
     GpuBuffer accelerationInstanceBuffer_{};
     std::vector<BlasResource> blases_;
@@ -220,6 +222,8 @@ private:
     PFN_vkDestroyAccelerationStructureKHR destroyAccelerationStructure_{};
     PFN_vkGetAccelerationStructureBuildSizesKHR getAccelerationStructureBuildSizes_{};
     PFN_vkCmdBuildAccelerationStructuresKHR cmdBuildAccelerationStructures_{};
+    PFN_vkCmdWriteAccelerationStructuresPropertiesKHR cmdWriteAccelerationStructuresProperties_{};
+    PFN_vkCmdCopyAccelerationStructureKHR cmdCopyAccelerationStructure_{};
     PFN_vkGetAccelerationStructureDeviceAddressKHR getAccelerationStructureDeviceAddress_{};
     std::uint32_t uploadedMeshletCount_{};
     std::uint32_t uploadedVertexCount_{};
