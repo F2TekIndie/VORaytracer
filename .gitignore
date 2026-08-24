@@ -22,6 +22,10 @@
 !/assets/TransparentTriangle.obj
 !/assets/TransparentTriangle.mtl
 !/assets/TestTexture.ppm
+!/assets/Regression/
+/assets/Regression/*
+!/assets/Regression/vulkan-obj-emissive.ppm
+!/assets/Regression/optix-obj-emissive.ppm
 
 # Logs and crash/debug output
 *.log

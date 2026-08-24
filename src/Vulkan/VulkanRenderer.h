@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <vector>
@@ -44,6 +45,9 @@ public:
     void setGpuInteropFrameReady(bool ready) { gpuInteropFrameReady_ = ready; }
     [[nodiscard]] bool rayQueryAvailable() const { return rayQueryAvailable_; }
     [[nodiscard]] bool taskShaderAvailable() const { return taskShaderAvailable_; }
+    bool requestImageCapture(std::filesystem::path outputPath,
+                             std::filesystem::path referencePath = {},
+                             float maximumRmse = 0.02f);
 
 private:
     static constexpr std::uint32_t kFramesInFlight = 2;
@@ -158,6 +162,7 @@ private:
     VkSemaphore createExternalSemaphore(HANDLE& semaphoreHandle) const;
     VkShaderModule loadShaderModule(const wchar_t* relativePath) const;
     void setError(std::string message);
+    bool finalizeImageCapture();
 
     GLFWwindow* window_{};
     const Scene* scene_{};
@@ -207,10 +212,15 @@ private:
     GpuBuffer geometryIndexBuffer_{};
     GpuBuffer sceneInstanceBuffer_{};
     GpuBuffer materialBuffer_{};
+    GpuBuffer lightBuffer_{};
+    GpuBuffer emissiveTriangleBuffer_{};
+    GpuBuffer textureMetadataBuffer_{};
     std::vector<GpuTexture> materialTextures_;
     GpuTexture environmentTexture_{};
+    GpuTexture iblTexture_{};
     VkDeviceSize environmentTextureBytes_{};
-    VkSampler materialTextureSampler_{VK_NULL_HANDLE};
+    VkDeviceSize iblTextureBytes_{};
+    std::vector<VkSampler> materialTextureSamplers_;
     VkSampler environmentSampler_{VK_NULL_HANDLE};
     GpuBuffer tlasStorage_{};
     GpuBuffer accelerationInstanceBuffer_{};
@@ -230,6 +240,7 @@ private:
     std::uint32_t uploadedTriangleCount_{};
     FramePushConstants framePushConstants_{};
     GpuBuffer gpuInteropBuffer_{};
+    GpuBuffer captureBuffer_{};
     VkImage denoiserInputImage_{VK_NULL_HANDLE};
     VkDeviceMemory denoiserInputImageMemory_{VK_NULL_HANDLE};
     VkImageView denoiserInputImageView_{VK_NULL_HANDLE};
@@ -246,6 +257,12 @@ private:
     bool resizePending_{};
     bool rayQueryAvailable_{};
     bool taskShaderAvailable_{};
+    bool swapchainTransferSourceAvailable_{};
+    bool capturePending_{};
+    bool captureRecorded_{};
+    std::filesystem::path captureOutputPath_;
+    std::filesystem::path captureReferencePath_;
+    float captureMaximumRmse_{0.02f};
     std::uint32_t requestedWidth_{};
     std::uint32_t requestedHeight_{};
     std::string unavailableReason_;

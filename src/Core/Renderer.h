@@ -50,6 +50,7 @@ struct RenderSettings
     bool rayTracedReflections{true};
     bool indirectLighting{true};
     bool denoiser{false};
+    bool temporalRendering{true};
     bool vsync{true};
     bool showMeshlets{false};
     DebugView debugView{DebugView::Beauty};

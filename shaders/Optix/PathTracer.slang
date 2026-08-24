@@ -36,7 +36,23 @@ struct GpuEmissiveTriangle
     float4 cdfAndPower;
     float4 uv0Uv1;
     float4 uv2AndPadding;
+    float4 uvSet1_0_1;
+    float4 uvSet1_2AndPadding;
     uint4 materialData;
+};
+
+struct GpuTextureMetadata
+{
+    float4 scaleAndOffset;
+    float4 rotationAndUvSet;
+};
+
+struct GpuLight
+{
+    float4 positionAndType;
+    float4 directionAndRange;
+    float4 colorAndIntensity;
+    float4 coneAndArea;
 };
 
 struct GpuOptixInstance
@@ -59,11 +75,13 @@ struct LaunchParameters
     StructuredBuffer<float3> positions;
     StructuredBuffer<float3> normals;
     StructuredBuffer<float4> tangents;
-    StructuredBuffer<float2> uvs;
+    StructuredBuffer<float4> uvs;
     StructuredBuffer<uint3> indices;
     StructuredBuffer<GpuOptixInstance> instances;
     StructuredBuffer<GpuMaterial> materials;
     StructuredBuffer<GpuEmissiveTriangle> emissiveTriangles;
+    StructuredBuffer<GpuLight> lights;
+    StructuredBuffer<GpuTextureMetadata> textureMetadata;
     StructuredBuffer<float4> environmentPixels;
     StructuredBuffer<float> environmentConditionalCdf;
     StructuredBuffer<float> environmentMarginalCdf;
@@ -103,13 +121,24 @@ struct LaunchParameters
     float4 skyGround;
 };
 
-float4 sampleMaterialTexture(LaunchParameters parameters, uint textureId, float2 uv, float4 fallback,
+float2 transformedTextureUv(LaunchParameters parameters, uint textureId, float4 uvSets)
+{
+    GpuTextureMetadata metadata = parameters.textureMetadata[textureId];
+    float2 uv = metadata.rotationAndUvSet.z >= 0.5 ? uvSets.zw : uvSets.xy;
+    uv -= float2(0.5);
+    uv = float2(uv.x * metadata.rotationAndUvSet.x - uv.y * metadata.rotationAndUvSet.y,
+                uv.x * metadata.rotationAndUvSet.y + uv.y * metadata.rotationAndUvSet.x);
+    return uv * metadata.scaleAndOffset.xy + float2(0.5) + metadata.scaleAndOffset.zw;
+}
+
+float4 sampleMaterialTexture(LaunchParameters parameters, uint textureId, float4 uvSets, float4 fallback,
                              float textureLod)
 {
     return textureId == INVALID_TEXTURE_ID
                ? fallback
                : parameters.materialTextureTable.textures[textureId].SampleLevel(
-                     parameters.materialTextureTable.sampler, uv, max(textureLod, 0.0));
+                      parameters.materialTextureTable.sampler,
+                      transformedTextureUv(parameters, textureId, uvSets), max(textureLod, 0.0));
 }
 
 float heightValue(float4 sampleValue)
@@ -117,7 +146,7 @@ float heightValue(float4 sampleValue)
     return dot(sampleValue.xyz, float3(0.2126, 0.7152, 0.0722));
 }
 
-float2 sampleHeightGradient(LaunchParameters parameters, GpuMaterial material, float2 uv, float textureLod)
+float2 sampleHeightGradient(LaunchParameters parameters, GpuMaterial material, float4 uvSets, float textureLod)
 {
     uint textureId = material.materialFlags.z;
     uint packedDimensions = material.materialFlags.w;
@@ -129,48 +158,50 @@ float2 sampleHeightGradient(LaunchParameters parameters, GpuMaterial material, f
     float lod = max(textureLod, 0.0);
     float mipScale = exp2(floor(lod));
     float2 texelSize = min(mipScale / float2(width, height), float2(0.5));
-    float left = heightValue(sampleMaterialTexture(parameters, textureId,
-                                                    uv - float2(texelSize.x, 0.0), float4(0.0), lod));
-    float right = heightValue(sampleMaterialTexture(parameters, textureId,
-                                                     uv + float2(texelSize.x, 0.0), float4(0.0), lod));
-    float up = heightValue(sampleMaterialTexture(parameters, textureId,
-                                                  uv - float2(0.0, texelSize.y), float4(0.0), lod));
-    float down = heightValue(sampleMaterialTexture(parameters, textureId,
-                                                    uv + float2(0.0, texelSize.y), float4(0.0), lod));
+    float2 uv = transformedTextureUv(parameters, textureId, uvSets);
+    float left = heightValue(parameters.materialTextureTable.textures[textureId].SampleLevel(
+        parameters.materialTextureTable.sampler, uv - float2(texelSize.x, 0.0), lod));
+    float right = heightValue(parameters.materialTextureTable.textures[textureId].SampleLevel(
+        parameters.materialTextureTable.sampler, uv + float2(texelSize.x, 0.0), lod));
+    float up = heightValue(parameters.materialTextureTable.textures[textureId].SampleLevel(
+        parameters.materialTextureTable.sampler, uv - float2(0.0, texelSize.y), lod));
+    float down = heightValue(parameters.materialTextureTable.textures[textureId].SampleLevel(
+        parameters.materialTextureTable.sampler, uv + float2(0.0, texelSize.y), lod));
     return float2(left - right, up - down);
 }
 
 SurfaceData resolveMaterialSurface(LaunchParameters parameters, GpuMaterial material, float3 position,
                                    float3 geometricNormal, float3 shadingNormal,
-                                   float4 tangentAndSign, float2 uv, float textureLod)
+                                    float4 tangentAndSign, float4 uvSets, float textureLod)
 {
-    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign, uv);
+    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign,
+                                          uvSets.xy);
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
-    samples.baseColor = sampleMaterialTexture(parameters, material.textureIndices0.x, uv, samples.baseColor,
+    samples.baseColor = sampleMaterialTexture(parameters, material.textureIndices0.x, uvSets, samples.baseColor,
                                                textureLod);
-    samples.opacity = sampleMaterialTexture(parameters, material.textureIndices3.x, uv, samples.opacity,
+    samples.opacity = sampleMaterialTexture(parameters, material.textureIndices3.x, uvSets, samples.opacity,
                                              textureLod);
-    samples.metallicRoughness = sampleMaterialTexture(parameters, material.textureIndices0.y, uv,
+    samples.metallicRoughness = sampleMaterialTexture(parameters, material.textureIndices0.y, uvSets,
                                                       samples.metallicRoughness, textureLod);
-    samples.normal = sampleMaterialTexture(parameters, material.textureIndices0.z, uv, samples.normal, textureLod);
-    samples.heightGradient = sampleHeightGradient(parameters, material, uv, textureLod);
-    samples.emissive = sampleMaterialTexture(parameters, material.textureIndices0.w, uv, samples.emissive,
+    samples.normal = sampleMaterialTexture(parameters, material.textureIndices0.z, uvSets, samples.normal, textureLod);
+    samples.heightGradient = sampleHeightGradient(parameters, material, uvSets, textureLod);
+    samples.emissive = sampleMaterialTexture(parameters, material.textureIndices0.w, uvSets, samples.emissive,
                                               textureLod);
-    samples.occlusion = sampleMaterialTexture(parameters, material.textureIndices1.x, uv, samples.occlusion,
+    samples.occlusion = sampleMaterialTexture(parameters, material.textureIndices1.x, uvSets, samples.occlusion,
                                                textureLod);
-    samples.transmission = sampleMaterialTexture(parameters, material.textureIndices1.y, uv, samples.transmission,
+    samples.transmission = sampleMaterialTexture(parameters, material.textureIndices1.y, uvSets, samples.transmission,
                                                   textureLod);
-    samples.clearcoat = sampleMaterialTexture(parameters, material.textureIndices1.z, uv, samples.clearcoat,
+    samples.clearcoat = sampleMaterialTexture(parameters, material.textureIndices1.z, uvSets, samples.clearcoat,
                                                textureLod);
-    samples.clearcoatRoughness = sampleMaterialTexture(parameters, material.textureIndices1.w, uv,
+    samples.clearcoatRoughness = sampleMaterialTexture(parameters, material.textureIndices1.w, uvSets,
                                                        samples.clearcoatRoughness, textureLod);
-    samples.clearcoatNormal = sampleMaterialTexture(parameters, material.textureIndices2.x, uv,
+    samples.clearcoatNormal = sampleMaterialTexture(parameters, material.textureIndices2.x, uvSets,
                                                     samples.clearcoatNormal, textureLod);
-    samples.anisotropy = sampleMaterialTexture(parameters, material.textureIndices2.w, uv, samples.anisotropy,
+    samples.anisotropy = sampleMaterialTexture(parameters, material.textureIndices2.w, uvSets, samples.anisotropy,
                                                 textureLod);
-    samples.sheenColor = sampleMaterialTexture(parameters, material.textureIndices2.y, uv, samples.sheenColor,
+    samples.sheenColor = sampleMaterialTexture(parameters, material.textureIndices2.y, uvSets, samples.sheenColor,
                                                 textureLod);
-    samples.sheenRoughness = sampleMaterialTexture(parameters, material.textureIndices2.z, uv,
+    samples.sheenRoughness = sampleMaterialTexture(parameters, material.textureIndices2.z, uvSets,
                                                    samples.sheenRoughness, textureLod);
     return applyBaseMaterialTextures(material, surface, samples);
 }
@@ -210,7 +241,7 @@ ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, Ray
                            parameters.tangents[triangle.z] * payload.barycentrics.y;
     vertexTangent.xyz = normalize(mul((float3x3)hitInstance.transform, vertexTangent.xyz));
     vertexTangent.w *= hitInstance.handedness;
-    float2 uv = parameters.uvs[triangle.x] * barycentric0 +
+    float4 uv = parameters.uvs[triangle.x] * barycentric0 +
                 parameters.uvs[triangle.y] * payload.barycentrics.x +
                 parameters.uvs[triangle.z] * payload.barycentrics.y;
 
@@ -375,7 +406,7 @@ float emissiveMeshHitPdf(LaunchParameters parameters, ResolvedHit hit, float3 ra
         return 0.0;
     float solidAnglePdf = emissionPower * hitDistance * hitDistance /
                           max(parameters.emissiveLightPower * cosineAtLight, 1e-8);
-    return solidAnglePdf * (1.0 - environmentLightSelectionProbability(parameters));
+    return solidAnglePdf * emissiveLightSelectionProbability(parameters);
 }
 
 float3 rotateEnvironmentDirection(float3 direction, float angle, float3 lightDirection)
@@ -527,13 +558,42 @@ float environmentLightPower(LaunchParameters parameters)
 {
     if (parameters.globalLightMode == 1)
         return max(parameters.environmentImportanceTotal * parameters.environmentIntensity, 0.0);
-    return max(luminance(parameters.lightColorAndIntensity.xyz) * parameters.lightColorAndIntensity.w, 0.0);
+    return 0.0;
+}
+
+float analyticLightPower(LaunchParameters parameters)
+{
+    if (parameters.globalLightMode == 1)
+        return 0.0;
+    uint count;
+    uint stride;
+    parameters.lights.GetDimensions(count, stride);
+    float power = 0.0;
+    for (uint index = 0u; index < count; ++index)
+    {
+        GpuLight light = parameters.lights[index];
+        float contribution = max(luminance(light.colorAndIntensity.xyz) * light.colorAndIntensity.w, 0.0);
+        if (uint(light.positionAndType.w + 0.5) == 3u)
+            contribution *= max(light.coneAndArea.z * light.coneAndArea.w, 1e-6);
+        power += contribution;
+    }
+    return power;
+}
+
+float allLightPower(LaunchParameters parameters)
+{
+    return environmentLightPower(parameters) + max(parameters.emissiveLightPower, 0.0) +
+           analyticLightPower(parameters);
 }
 
 float environmentLightSelectionProbability(LaunchParameters parameters)
 {
-    float environmentPower = environmentLightPower(parameters);
-    return environmentPower / max(environmentPower + parameters.emissiveLightPower, 1e-8);
+    return environmentLightPower(parameters) / max(allLightPower(parameters), 1e-8);
+}
+
+float emissiveLightSelectionProbability(LaunchParameters parameters)
+{
+    return max(parameters.emissiveLightPower, 0.0) / max(allLightPower(parameters), 1e-8);
 }
 
 uint sampleEmissiveTriangle(LaunchParameters parameters, float randomValue)
@@ -600,10 +660,103 @@ MeshLightSample sampleEmissiveMesh(LaunchParameters parameters, float3 position,
     sample.pdf = areaPdf * distanceSquared / max(cosineAtLight, 1e-6);
     float2 uv = triangle.uv0Uv1.xy * barycentric0 + triangle.uv0Uv1.zw * barycentric1 +
                 triangle.uv2AndPadding.xy * barycentric2;
+    float2 uv1 = triangle.uvSet1_0_1.xy * barycentric0 + triangle.uvSet1_0_1.zw * barycentric1 +
+                 triangle.uvSet1_2AndPadding.xy * barycentric2;
     float textureLod = log2(max(sample.distance * 0.05, 1.0));
-    float3 emissiveTexture = sampleMaterialTexture(parameters, triangle.materialData.x, uv,
+    float3 emissiveTexture = sampleMaterialTexture(parameters, triangle.materialData.x, float4(uv, uv1),
                                                     float4(1.0), textureLod).xyz;
     sample.radiance = triangle.emissionAndArea.xyz * max(emissiveTexture, 0.0);
+    return sample;
+}
+
+struct AnalyticLightSample
+{
+    float3 direction;
+    float3 radiance;
+    float distance;
+    float selectionPdf;
+    float solidAnglePdf;
+    bool delta;
+};
+
+AnalyticLightSample sampleAnalyticLight(LaunchParameters parameters, float3 position, float3 randomSample)
+{
+    AnalyticLightSample sample;
+    sample.direction = float3(0.0, 1.0, 0.0);
+    sample.radiance = float3(0.0);
+    sample.distance = 0.0;
+    sample.selectionPdf = 0.0;
+    sample.solidAnglePdf = 0.0;
+    sample.delta = true;
+    float totalPower = analyticLightPower(parameters);
+    if (totalPower <= 0.0)
+        return sample;
+    uint count;
+    uint stride;
+    parameters.lights.GetDimensions(count, stride);
+    float target = randomSample.x * totalPower;
+    float accumulated = 0.0;
+    GpuLight light = parameters.lights[0];
+    float selectedPower = 0.0;
+    for (uint index = 0u; index < count; ++index)
+    {
+        GpuLight candidate = parameters.lights[index];
+        float power = max(luminance(candidate.colorAndIntensity.xyz) * candidate.colorAndIntensity.w, 0.0);
+        if (uint(candidate.positionAndType.w + 0.5) == 3u)
+            power *= max(candidate.coneAndArea.z * candidate.coneAndArea.w, 1e-6);
+        accumulated += power;
+        if (target <= accumulated || index + 1u == count)
+        {
+            light = candidate;
+            selectedPower = power;
+            break;
+        }
+    }
+    sample.selectionPdf = selectedPower / max(totalPower, 1e-8);
+    uint type = uint(light.positionAndType.w + 0.5);
+    sample.radiance = max(light.colorAndIntensity.xyz, 0.0) * max(light.colorAndIntensity.w, 0.0);
+    if (type == 0u)
+    {
+        sample.direction = normalize(-light.directionAndRange.xyz);
+        sample.distance = 10000.0;
+        sample.solidAnglePdf = 1.0;
+        return sample;
+    }
+    float3 lightPosition = light.positionAndType.xyz;
+    if (type == 3u)
+    {
+        float3 lightNormal = normalize(light.directionAndRange.xyz);
+        float3 helper = abs(lightNormal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 tangent = normalize(cross(helper, lightNormal));
+        float3 bitangent = cross(lightNormal, tangent);
+        lightPosition += tangent * (randomSample.y - 0.5) * light.coneAndArea.z +
+                         bitangent * (randomSample.z - 0.5) * light.coneAndArea.w;
+        sample.delta = false;
+    }
+    float3 toLight = lightPosition - position;
+    float distanceSquared = max(dot(toLight, toLight), 1e-8);
+    sample.distance = sqrt(distanceSquared);
+    sample.direction = toLight / sample.distance;
+    float range = max(light.directionAndRange.w, 1e-4);
+    float rangeAttenuation = saturate(1.0 - pow(sample.distance / range, 4.0));
+    rangeAttenuation *= rangeAttenuation;
+    if (type == 3u)
+    {
+        float cosineAtLight = max(dot(normalize(light.directionAndRange.xyz), -sample.direction), 0.0);
+        float area = max(light.coneAndArea.z * light.coneAndArea.w, 1e-8);
+        sample.solidAnglePdf = distanceSquared / max(area * cosineAtLight, 1e-8);
+        sample.radiance *= rangeAttenuation;
+    }
+    else
+    {
+        sample.solidAnglePdf = 1.0;
+        sample.radiance *= rangeAttenuation / distanceSquared;
+        if (type == 2u)
+        {
+            float coneCosine = dot(normalize(light.directionAndRange.xyz), -sample.direction);
+            sample.radiance *= smoothstep(light.coneAndArea.y, light.coneAndArea.x, coneCosine);
+        }
+    }
     return sample;
 }
 
@@ -785,27 +938,16 @@ void RayGen(LaunchParameters parameters)
                         throughput *= exp(-sigmaT * freeFlightDistance) * sigmaS /
                                       max(proposalPdf, 1e-20);
                         float environmentProbability = environmentLightSelectionProbability(parameters);
+                        float emissiveProbability = emissiveLightSelectionProbability(parameters);
+                        float analyticProbability = analyticLightPower(parameters) /
+                                                    max(allLightPower(parameters), 1e-8);
                         float volumeLightSelector = random01(seed ^ ((bounce + 1) * 0x6c8e9cf5u));
-                        bool chooseEnvironment = volumeLightSelector < environmentProbability ||
-                                                 parameters.emissiveLightPower <= 0.0;
-                        float3 volumeLightDirection;
-                        float3 volumeLightRadiance;
-                        float volumeLightPdf;
+                        float3 volumeLightDirection = float3(0.0, 1.0, 0.0);
+                        float3 volumeLightRadiance = float3(0.0);
+                        float volumeLightPdf = 0.0;
                         float volumeLightDistance = 10000.0;
                         bool volumeLightDelta = false;
-                        if (!chooseEnvironment)
-                        {
-                            MeshLightSample meshLight = sampleEmissiveMesh(
-                                parameters, volumePosition, -ray.Direction,
-                                float3(random01(seed ^ ((bounce + 1) * 0x85ebca6bu)),
-                                       random01(seed ^ ((bounce + 1) * 0xc2b2ae35u)),
-                                       random01(seed ^ ((bounce + 1) * 0x27d4eb2fu))));
-                            volumeLightDirection = meshLight.direction;
-                            volumeLightRadiance = meshLight.radiance;
-                            volumeLightDistance = meshLight.distance;
-                            volumeLightPdf = meshLight.pdf * (1.0 - environmentProbability);
-                        }
-                        else if (parameters.globalLightMode == 1)
+                        if (volumeLightSelector < environmentProbability)
                         {
                             EnvironmentLightSample environmentLight = sampleHdrImportance(
                                 parameters,
@@ -815,13 +957,32 @@ void RayGen(LaunchParameters parameters)
                             volumeLightRadiance = environmentLight.radiance;
                             volumeLightPdf = environmentLight.pdf * environmentProbability;
                         }
-                        else
+                        else if (volumeLightSelector < environmentProbability + emissiveProbability)
                         {
-                            volumeLightDirection = normalize(-parameters.lightDirection.xyz);
-                            volumeLightRadiance = parameters.lightColorAndIntensity.xyz *
-                                                  parameters.lightColorAndIntensity.w;
-                            volumeLightPdf = max(environmentProbability, 1e-8);
-                            volumeLightDelta = true;
+                            MeshLightSample meshLight = sampleEmissiveMesh(
+                                parameters, volumePosition, -ray.Direction,
+                                float3(random01(seed ^ ((bounce + 1) * 0x85ebca6bu)),
+                                       random01(seed ^ ((bounce + 1) * 0xc2b2ae35u)),
+                                       random01(seed ^ ((bounce + 1) * 0x27d4eb2fu))));
+                            volumeLightDirection = meshLight.direction;
+                            volumeLightRadiance = meshLight.radiance;
+                            volumeLightDistance = meshLight.distance;
+                            volumeLightPdf = meshLight.pdf * emissiveProbability;
+                        }
+                        else if (analyticProbability > 0.0)
+                        {
+                            AnalyticLightSample analyticLight = sampleAnalyticLight(
+                                parameters,
+                                volumePosition,
+                                float3(random01(seed ^ ((bounce + 1) * 0x9e3779b9u)),
+                                       random01(seed ^ ((bounce + 1) * 0x7f4a7c15u)),
+                                       random01(seed ^ ((bounce + 1) * 0x27d4eb2fu))));
+                            volumeLightDirection = analyticLight.direction;
+                            volumeLightRadiance = analyticLight.radiance;
+                            volumeLightDistance = analyticLight.distance;
+                            volumeLightPdf = analyticProbability * analyticLight.selectionPdf *
+                                             analyticLight.solidAnglePdf;
+                            volumeLightDelta = analyticLight.delta;
                         }
                         if (volumeLightPdf > 0.0)
                         {
@@ -919,30 +1080,17 @@ void RayGen(LaunchParameters parameters)
             }
             sampleRadiance += throughput * surface.emissive * emissiveMisWeight;
 
-            float3 sampledLightDirection = normalize(-parameters.lightDirection.xyz);
-            float3 sampledLightRadiance = parameters.lightColorAndIntensity.xyz *
-                                          parameters.lightColorAndIntensity.w;
-            float sampledLightPdf = 1.0;
+            float3 sampledLightDirection = float3(0.0, 1.0, 0.0);
+            float3 sampledLightRadiance = float3(0.0);
+            float sampledLightPdf = 0.0;
             float sampledLightDistance = 10000.0;
             bool sampledLightDelta = true;
             float environmentSelectionProbability = environmentLightSelectionProbability(parameters);
+            float emissiveSelectionProbability = emissiveLightSelectionProbability(parameters);
+            float analyticSelectionProbability = analyticLightPower(parameters) /
+                                                 max(allLightPower(parameters), 1e-8);
             float lightSelector = random01(seed ^ ((bounce + 1) * 0x6c8e9cf5u));
-            bool sampleEnvironmentLight = lightSelector < environmentSelectionProbability ||
-                                          parameters.emissiveLightPower <= 0.0;
-            if (!sampleEnvironmentLight)
-            {
-                MeshLightSample meshLightSample = sampleEmissiveMesh(
-                    parameters, worldPosition, normal,
-                    float3(random01(seed ^ ((bounce + 1) * 0x85ebca6bu)),
-                           random01(seed ^ ((bounce + 1) * 0xc2b2ae35u)),
-                           random01(seed ^ ((bounce + 1) * 0x27d4eb2fu))));
-                sampledLightDirection = meshLightSample.direction;
-                sampledLightRadiance = meshLightSample.radiance;
-                sampledLightDistance = meshLightSample.distance;
-                sampledLightPdf = meshLightSample.pdf * (1.0 - environmentSelectionProbability);
-                sampledLightDelta = false;
-            }
-            else if (parameters.globalLightMode == 1)
+            if (lightSelector < environmentSelectionProbability)
             {
                 EnvironmentLightSample environmentSample = sampleHdrImportance(
                     parameters,
@@ -953,8 +1101,34 @@ void RayGen(LaunchParameters parameters)
                 sampledLightPdf = environmentSample.pdf * environmentSelectionProbability;
                 sampledLightDelta = false;
             }
-            else
-                sampledLightPdf = max(environmentSelectionProbability, 1e-8);
+            else if (lightSelector < environmentSelectionProbability + emissiveSelectionProbability)
+            {
+                MeshLightSample meshLightSample = sampleEmissiveMesh(
+                    parameters, worldPosition, normal,
+                    float3(random01(seed ^ ((bounce + 1) * 0x85ebca6bu)),
+                           random01(seed ^ ((bounce + 1) * 0xc2b2ae35u)),
+                           random01(seed ^ ((bounce + 1) * 0x27d4eb2fu))));
+                sampledLightDirection = meshLightSample.direction;
+                sampledLightRadiance = meshLightSample.radiance;
+                sampledLightDistance = meshLightSample.distance;
+                sampledLightPdf = meshLightSample.pdf * emissiveSelectionProbability;
+                sampledLightDelta = false;
+            }
+            else if (analyticSelectionProbability > 0.0)
+            {
+                AnalyticLightSample analyticSample = sampleAnalyticLight(
+                    parameters,
+                    worldPosition,
+                    float3(random01(seed ^ ((bounce + 1) * 0x2c1b3c6du)),
+                           random01(seed ^ ((bounce + 1) * 0x297a2d39u)),
+                           random01(seed ^ ((bounce + 1) * 0x94d049bbu))));
+                sampledLightDirection = analyticSample.direction;
+                sampledLightRadiance = analyticSample.radiance;
+                sampledLightDistance = analyticSample.distance;
+                sampledLightPdf = analyticSelectionProbability * analyticSample.selectionPdf *
+                                  analyticSample.solidAnglePdf;
+                sampledLightDelta = analyticSample.delta;
+            }
 
             float3 visibility = float3(1.0);
             float signedNDotLight = dot(normal, sampledLightDirection);

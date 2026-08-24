@@ -63,6 +63,20 @@ GpuMaterial Material::toGpu() const
     return result;
 }
 
+GpuLight Light::toGpu() const
+{
+    return {{position.x, position.y, position.z, static_cast<float>(type)},
+            {direction.x, direction.y, direction.z, range},
+            {color.x, color.y, color.z, intensity},
+            {std::cos(innerCone), std::cos(outerCone), areaSize.x, areaSize.y}};
+}
+
+GpuTextureMetadata TextureReference::toGpuMetadata() const
+{
+    return {{uvScale.x, uvScale.y, uvOffset.x, uvOffset.y},
+            {std::cos(uvRotation), std::sin(uvRotation), static_cast<float>(std::min(uvSet, 1u)), 0.0f}};
+}
+
 std::size_t Scene::triangleCount() const
 {
     std::size_t count = 0;

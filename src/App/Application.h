@@ -7,6 +7,7 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
 
 struct GLFWwindow;
 
@@ -54,5 +55,10 @@ private:
     std::uint32_t selectedMaterialIndex_{};
     std::uint32_t interopWidth_{};
     std::uint32_t interopHeight_{};
+    std::filesystem::path captureOutputPath_;
+    std::filesystem::path captureReferencePath_;
+    std::uint64_t captureFrame_{8};
+    float captureMaximumRmse_{0.02f};
+    bool hideUi_{};
 };
 } // namespace vor

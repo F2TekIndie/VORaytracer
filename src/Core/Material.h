@@ -71,4 +71,20 @@ static_assert(offsetof(GpuMaterial, textureIndices0) == 176);
 static_assert(offsetof(GpuMaterial, textureIndices1) == 192);
 static_assert(offsetof(GpuMaterial, textureIndices2) == 208);
 static_assert(offsetof(GpuMaterial, textureIndices3) == 224);
+
+struct alignas(16) GpuLight
+{
+    Vec4 positionAndType{};       // world position, LightType
+    Vec4 directionAndRange{};     // world direction, finite-light range
+    Vec4 colorAndIntensity{};
+    Vec4 coneAndArea{};           // cos(inner), cos(outer), area width, area height
+};
+static_assert(sizeof(GpuLight) == 64);
+
+struct alignas(16) GpuTextureMetadata
+{
+    Vec4 scaleAndOffset{1.0f, 1.0f, 0.0f, 0.0f};
+    Vec4 rotationAndUvSet{1.0f, 0.0f, 0.0f, 0.0f}; // cos(rotation), sin(rotation), UV set, reserved
+};
+static_assert(sizeof(GpuTextureMetadata) == 32);
 } // namespace vor

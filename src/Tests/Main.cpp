@@ -34,6 +34,36 @@ int main()
     require(offsetof(GpuMaterial, materialFlags) == 160, "shared GPU material flag offset");
     require(offsetof(GpuMaterial, textureIndices0) == 176, "shared GPU material texture offset");
     require(offsetof(GpuMaterial, textureIndices3) == 224, "shared GPU opacity texture offset");
+    require(sizeof(GpuTextureMetadata) == 32, "shared GPU texture metadata size");
+    require(sizeof(GpuLight) == 64, "shared GPU light size");
+    Light spotLight{.name = "Spot",
+                    .type = LightType::Spot,
+                    .color = {0.5f, 0.75f, 1.0f},
+                    .intensity = 4.0f,
+                    .position = {1.0f, 2.0f, 3.0f},
+                    .range = 12.0f,
+                    .direction = {0.0f, -1.0f, 0.0f},
+                    .innerCone = 0.25f,
+                    .outerCone = 0.5f};
+    const GpuLight spotGpu = spotLight.toGpu();
+    require(spotGpu.positionAndType.w == static_cast<float>(LightType::Spot) &&
+                spotGpu.directionAndRange.w == 12.0f && spotGpu.colorAndIntensity.w == 4.0f &&
+                std::abs(spotGpu.coneAndArea.x - std::cos(0.25f)) < 1.0e-6f &&
+                std::abs(spotGpu.coneAndArea.y - std::cos(0.5f)) < 1.0e-6f,
+            "analytic light GPU conversion");
+    TextureReference transformedTexture{};
+    transformedTexture.uvSet = 1;
+    transformedTexture.uvScale = {2.0f, 3.0f};
+    transformedTexture.uvOffset = {0.25f, -0.5f};
+    transformedTexture.uvRotation = 0.5f;
+    const GpuTextureMetadata transformedMetadata = transformedTexture.toGpuMetadata();
+    require(transformedMetadata.scaleAndOffset.x == 2.0f && transformedMetadata.scaleAndOffset.y == 3.0f &&
+                transformedMetadata.scaleAndOffset.z == 0.25f && transformedMetadata.scaleAndOffset.w == -0.5f,
+            "texture UV scale and offset metadata");
+    require(std::abs(transformedMetadata.rotationAndUvSet.x - std::cos(0.5f)) < 1.0e-6f &&
+                std::abs(transformedMetadata.rotationAndUvSet.y - std::sin(0.5f)) < 1.0e-6f &&
+                transformedMetadata.rotationAndUvSet.z == 1.0f,
+            "texture UV rotation and set metadata");
     Material layoutMaterial{};
     layoutMaterial.baseColor = {0.2f, 0.3f, 0.4f, 0.8f};
     layoutMaterial.metallic = 0.6f;
@@ -316,6 +346,16 @@ int main()
                     std::abs(environment.hdrMarginalCdf.back() - 1.0f) < 1.0e-5f,
                 "HDR marginal importance CDF normalization");
         require(environment.hdrImportanceTotal > 0.0f, "HDR importance distribution weight");
+        require(environment.hasIbl(), "Vulkan IBL atlas generation");
+        if (environment.hasIbl())
+        {
+            const Vec4 irradiance = environment.iblPixels[64u * Environment::kIblAtlasWidth + 256u];
+            const Vec4 brdf = environment.iblPixels[128u * Environment::kIblAtlasWidth + 256u];
+            require(std::isfinite(irradiance.x) && std::isfinite(irradiance.y) && std::isfinite(irradiance.z),
+                    "finite cosine-convolved irradiance");
+            require(std::isfinite(brdf.x) && std::isfinite(brdf.y) && brdf.x >= 0.0f && brdf.y >= 0.0f,
+                    "finite split-sum BRDF LUT");
+        }
     }
 
     const Scene comparison = assetLoader.createPbrMaterialComparisonScene(

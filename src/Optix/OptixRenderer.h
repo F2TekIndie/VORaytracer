@@ -32,7 +32,7 @@ public:
     [[nodiscard]] const char* unavailableReason() const override { return unavailableReason_.c_str(); }
     [[nodiscard]] const RendererStats& stats() const override { return stats_; }
     bool setGpuInteropSurface(const GpuInteropSurface& surface);
-    bool denoiseVulkanFrame(float exposure);
+    bool denoiseVulkanFrame(float exposure, bool temporalRendering);
     void clearGpuInteropSurface();
     [[nodiscard]] bool hasGpuInteropSurface() const { return interopOutputBuffer_ != 0; }
     [[nodiscard]] std::uint32_t outputWidth() const { return width_; }
@@ -46,7 +46,7 @@ private:
     bool createDenoiser();
     bool ensureDenoiserResources();
     bool resizeDenoiser();
-    bool invokeDenoiser();
+    bool invokeDenoiser(bool temporalRendering);
     void destroyDenoiserResources();
     void destroyDenoiser();
     void destroyOutputBuffers();
@@ -94,6 +94,8 @@ private:
     CUdeviceptr indexBuffer_{};
     CUdeviceptr instanceBuffer_{};
     CUdeviceptr materialBuffer_{};
+    CUdeviceptr textureMetadataBuffer_{};
+    CUdeviceptr lightBuffer_{};
     CUdeviceptr emissiveTriangleBuffer_{};
     CUdeviceptr environmentBuffer_{};
     CUdeviceptr environmentConditionalCdfBuffer_{};
@@ -104,6 +106,8 @@ private:
     std::size_t vertexCount_{};
     std::size_t triangleCount_{};
     std::size_t materialCount_{};
+    std::size_t textureMetadataCount_{};
+    std::size_t lightCount_{};
     std::size_t instanceCount_{};
     std::size_t emissiveTriangleCount_{};
     float emissiveLightPower_{};
@@ -117,8 +121,14 @@ private:
     OptixDenoiser denoiser_{};
     CUdeviceptr denoiserState_{};
     CUdeviceptr denoiserScratch_{};
+    CUdeviceptr denoiserFlow_{};
+    CUdeviceptr denoiserPreviousOutput_{};
+    CUdeviceptr denoiserPreviousInternalGuide_{};
+    CUdeviceptr denoiserOutputInternalGuide_{};
     std::size_t denoiserStateSize_{};
     std::size_t denoiserScratchSize_{};
+    std::size_t denoiserInternalGuidePixelSize_{};
+    bool denoiserTemporalHistoryValid_{};
     void* launchParametersHost_{};
     std::uint64_t interopGeneration_{};
     bool firstInteropLaunch_{true};

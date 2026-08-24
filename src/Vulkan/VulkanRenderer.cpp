@@ -187,6 +187,44 @@ RenderPassAvailability renderPassAvailability(const Scene* scene, std::uint32_t 
     }
     return result;
 }
+
+struct RegressionImage
+{
+    std::uint32_t width{};
+    std::uint32_t height{};
+    std::vector<std::uint8_t> rgb;
+};
+
+bool writePpm(const std::filesystem::path& path, const RegressionImage& image)
+{
+    std::error_code error;
+    if (path.has_parent_path())
+        std::filesystem::create_directories(path.parent_path(), error);
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream)
+        return false;
+    stream << "P6\n" << image.width << ' ' << image.height << "\n255\n";
+    stream.write(reinterpret_cast<const char*>(image.rgb.data()),
+                 static_cast<std::streamsize>(image.rgb.size()));
+    return stream.good();
+}
+
+std::optional<RegressionImage> readPpm(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    std::string magic;
+    RegressionImage image{};
+    unsigned maximum = 0;
+    if (!(stream >> magic >> image.width >> image.height >> maximum) || magic != "P6" || maximum != 255 ||
+        image.width == 0 || image.height == 0)
+        return std::nullopt;
+    stream.get();
+    image.rgb.resize(static_cast<std::size_t>(image.width) * image.height * 3);
+    if (!stream.read(reinterpret_cast<char*>(image.rgb.data()),
+                     static_cast<std::streamsize>(image.rgb.size())))
+        return std::nullopt;
+    return image;
+}
 } // namespace
 
 VulkanRenderer::~VulkanRenderer()
@@ -254,6 +292,11 @@ void VulkanRenderer::shutdown()
         if (timestampQueryPool_)
             vkDestroyQueryPool(device_, timestampQueryPool_, nullptr);
         timestampQueryPool_ = VK_NULL_HANDLE;
+        if (captureBuffer_.buffer)
+            vkDestroyBuffer(device_, captureBuffer_.buffer, nullptr);
+        if (captureBuffer_.memory)
+            vkFreeMemory(device_, captureBuffer_.memory, nullptr);
+        captureBuffer_ = {};
         destroySwapchain();
         vkDestroyDevice(device_, nullptr);
     }
@@ -317,6 +360,96 @@ void VulkanRenderer::resize(std::uint32_t width, std::uint32_t height)
 void VulkanRenderer::resetAccumulation()
 {
     stats_.accumulatedSamples = 0;
+}
+
+bool VulkanRenderer::requestImageCapture(std::filesystem::path outputPath,
+                                         std::filesystem::path referencePath,
+                                         float maximumRmse)
+{
+    if (!initialized_ || outputPath.empty() || !swapchainTransferSourceAvailable_)
+        return false;
+    if (captureBuffer_.buffer)
+        vkDestroyBuffer(device_, captureBuffer_.buffer, nullptr);
+    if (captureBuffer_.memory)
+        vkFreeMemory(device_, captureBuffer_.memory, nullptr);
+    captureBuffer_ = {};
+    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(swapchainExtent_.width) * swapchainExtent_.height * 4;
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = byteSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device_, &bufferInfo, nullptr, &captureBuffer_.buffer) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(device_, captureBuffer_.buffer, &requirements);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits,
+                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(device_, &allocation, nullptr, &captureBuffer_.memory) != VK_SUCCESS ||
+        vkBindBufferMemory(device_, captureBuffer_.buffer, captureBuffer_.memory, 0) != VK_SUCCESS)
+    {
+        if (captureBuffer_.memory)
+            vkFreeMemory(device_, captureBuffer_.memory, nullptr);
+        vkDestroyBuffer(device_, captureBuffer_.buffer, nullptr);
+        captureBuffer_ = {};
+        return false;
+    }
+    captureBuffer_.size = byteSize;
+    captureOutputPath_ = std::move(outputPath);
+    captureReferencePath_ = std::move(referencePath);
+    captureMaximumRmse_ = std::max(maximumRmse, 0.0f);
+    capturePending_ = true;
+    captureRecorded_ = false;
+    return true;
+}
+
+bool VulkanRenderer::finalizeImageCapture()
+{
+    if (!captureRecorded_ || !captureBuffer_.memory)
+        return true;
+    void* mapped = nullptr;
+    check(vkMapMemory(device_, captureBuffer_.memory, 0, captureBuffer_.size, 0, &mapped),
+          "vkMapMemory(image regression capture)");
+    RegressionImage image{};
+    image.width = swapchainExtent_.width;
+    image.height = swapchainExtent_.height;
+    image.rgb.resize(static_cast<std::size_t>(image.width) * image.height * 3);
+    const auto* source = static_cast<const std::uint8_t*>(mapped);
+    const bool bgra = swapchainFormat_ == VK_FORMAT_B8G8R8A8_SRGB ||
+                      swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM;
+    for (std::size_t pixel = 0; pixel < static_cast<std::size_t>(image.width) * image.height; ++pixel)
+    {
+        image.rgb[pixel * 3 + 0] = source[pixel * 4 + (bgra ? 2 : 0)];
+        image.rgb[pixel * 3 + 1] = source[pixel * 4 + 1];
+        image.rgb[pixel * 3 + 2] = source[pixel * 4 + (bgra ? 0 : 2)];
+    }
+    vkUnmapMemory(device_, captureBuffer_.memory);
+    if (!writePpm(captureOutputPath_, image))
+        throw std::runtime_error("Cannot write image regression capture: " + captureOutputPath_.string());
+
+    if (!captureReferencePath_.empty())
+    {
+        const std::optional<RegressionImage> reference = readPpm(captureReferencePath_);
+        if (!reference || reference->width != image.width || reference->height != image.height)
+            throw std::runtime_error("Image regression reference is missing, invalid, or has different dimensions: " +
+                                     captureReferencePath_.string());
+        double squaredError = 0.0;
+        for (std::size_t index = 0; index < image.rgb.size(); ++index)
+        {
+            const double difference = static_cast<double>(image.rgb[index]) - reference->rgb[index];
+            squaredError += difference * difference;
+        }
+        const double rmse = std::sqrt(squaredError / static_cast<double>(image.rgb.size())) / 255.0;
+        log(LogLevel::Info, "Image regression RMSE: " + std::to_string(rmse) + " (limit " +
+                                std::to_string(captureMaximumRmse_) + ")");
+        if (rmse > captureMaximumRmse_)
+            throw std::runtime_error("Image regression exceeded RMSE limit");
+    }
+    log(LogLevel::Info, "Captured regression image: " + captureOutputPath_.string());
+    captureRecorded_ = false;
+    return true;
 }
 
 void VulkanRenderer::beginUiFrame()
@@ -605,6 +738,26 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(commandBuffer, &begin), "vkBeginCommandBuffer(Vulkan denoiser input)");
+    if (scene_ && lightBuffer_.buffer && !scene_->lights.empty() &&
+        scene_->lights.size() * sizeof(GpuLight) <= lightBuffer_.size)
+    {
+        std::vector<GpuLight> lights;
+        lights.reserve(scene_->lights.size());
+        for (const Light& light : scene_->lights)
+            lights.push_back(light.toGpu());
+        vkCmdUpdateBuffer(commandBuffer, lightBuffer_.buffer, 0, lights.size() * sizeof(GpuLight), lights.data());
+        VkBufferMemoryBarrier2 lightBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        lightBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        lightBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        lightBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        lightBarrier.buffer = lightBuffer_.buffer;
+        lightBarrier.size = lightBuffer_.size;
+        VkDependencyInfo lightDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        lightDependency.bufferMemoryBarrierCount = 1;
+        lightDependency.pBufferMemoryBarriers = &lightBarrier;
+        vkCmdPipelineBarrier2(commandBuffer, &lightDependency);
+    }
 
     VkBufferMemoryBarrier2 acquireBuffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
     acquireBuffer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
@@ -822,6 +975,13 @@ bool VulkanRenderer::render(const Camera& camera, const RenderSettings& settings
             resizePending_ = true;
         else
             check(presentResult, "vkQueuePresentKHR");
+        if (captureRecorded_)
+        {
+            check(vkWaitForFences(device_, 1, &frame.inFlight, VK_TRUE, UINT64_MAX),
+                  "vkWaitForFences(image regression capture)");
+            if (!finalizeImageCapture())
+                return false;
+        }
 
         frameSlot_ = (frameSlot_ + 1) % kFramesInFlight;
         ++stats_.frameIndex;
@@ -1148,6 +1308,10 @@ bool VulkanRenderer::createSwapchain()
     createInfo.imageExtent = swapchainExtent_;
     createInfo.imageArrayLayers = 1;
     createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    swapchainTransferSourceAvailable_ =
+        (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    if (swapchainTransferSourceAvailable_)
+        createInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     createInfo.preTransform = capabilities.currentTransform;
     createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -1258,7 +1422,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -1295,14 +1459,30 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings[10].binding = 10;
     bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    bindings[10].descriptorCount = 1;
+    bindings[10].descriptorCount = kMaxMaterialTextures;
     bindings[10].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings[11].binding = 11;
     bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     bindings[11].descriptorCount = 1;
     bindings[11].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    std::array<VkDescriptorBindingFlags, 12> bindingFlags{};
+    bindings[12].binding = 12;
+    bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[12].descriptorCount = 1;
+    bindings[12].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (std::uint32_t bindingIndex = 13; bindingIndex <= 14; ++bindingIndex)
+    {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[bindingIndex].descriptorCount = 1;
+        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    bindings[15].binding = 15;
+    bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[15].descriptorCount = 1;
+    bindings[15].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    std::array<VkDescriptorBindingFlags, 16> bindingFlags{};
     bindingFlags[9] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    bindingFlags[10] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     bindingFlagsInfo.bindingCount = static_cast<std::uint32_t>(bindingFlags.size());
@@ -1314,10 +1494,10 @@ bool VulkanRenderer::createSceneDescriptors()
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
 
     const std::array poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures + 1},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures + 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, kMaxMaterialTextures + 1},
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;
@@ -1595,6 +1775,9 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(geometryIndexBuffer_);
     destroyBuffer(sceneInstanceBuffer_);
     destroyBuffer(materialBuffer_);
+    destroyBuffer(lightBuffer_);
+    destroyBuffer(emissiveTriangleBuffer_);
+    destroyBuffer(textureMetadataBuffer_);
     destroyTextureResources();
     uploadedGeometries_.clear();
     uploadedInstances_.clear();
@@ -1615,9 +1798,9 @@ void VulkanRenderer::destroyTextureResources()
 {
     if (!device_)
         return;
-    if (materialTextureSampler_)
-        vkDestroySampler(device_, materialTextureSampler_, nullptr);
-    materialTextureSampler_ = VK_NULL_HANDLE;
+    for (VkSampler sampler : materialTextureSamplers_)
+        vkDestroySampler(device_, sampler, nullptr);
+    materialTextureSamplers_.clear();
     if (environmentSampler_)
         vkDestroySampler(device_, environmentSampler_, nullptr);
     environmentSampler_ = VK_NULL_HANDLE;
@@ -1638,7 +1821,15 @@ void VulkanRenderer::destroyTextureResources()
     if (environmentTexture_.memory)
         vkFreeMemory(device_, environmentTexture_.memory, nullptr);
     environmentTexture_ = {};
+    if (iblTexture_.view)
+        vkDestroyImageView(device_, iblTexture_.view, nullptr);
+    if (iblTexture_.image)
+        vkDestroyImage(device_, iblTexture_.image, nullptr);
+    if (iblTexture_.memory)
+        vkFreeMemory(device_, iblTexture_.memory, nullptr);
+    iblTexture_ = {};
     environmentTextureBytes_ = 0;
+    iblTextureBytes_ = 0;
 }
 
 bool VulkanRenderer::uploadTextureResources()
@@ -1670,6 +1861,12 @@ bool VulkanRenderer::uploadTextureResources()
     const std::span<const Vec4> environmentSource = hasEnvironment
                                                         ? std::span<const Vec4>(scene_->environment.hdrPixels)
                                                         : std::span<const Vec4>(&fallbackEnvironment, 1);
+    const bool hasIbl = scene_ && scene_->environment.hasIbl();
+    const std::uint32_t iblWidth = hasIbl ? Environment::kIblAtlasWidth : 1u;
+    const std::uint32_t iblHeight = hasIbl ? Environment::kIblAtlasHeight : 1u;
+    const std::span<const Vec4> iblSource = hasIbl
+                                               ? std::span<const Vec4>(scene_->environment.iblPixels)
+                                               : std::span<const Vec4>(&fallbackEnvironment, 1);
     std::vector<std::uint16_t> environmentHalf;
     environmentHalf.reserve(environmentSource.size() * 4);
     for (const Vec4& pixel : environmentSource)
@@ -1678,6 +1875,15 @@ bool VulkanRenderer::uploadTextureResources()
         environmentHalf.push_back(floatToHalf(std::clamp(pixel.y, -65504.0f, 65504.0f)));
         environmentHalf.push_back(floatToHalf(std::clamp(pixel.z, -65504.0f, 65504.0f)));
         environmentHalf.push_back(floatToHalf(std::clamp(pixel.w, -65504.0f, 65504.0f)));
+    }
+    std::vector<std::uint16_t> iblHalf;
+    iblHalf.reserve(iblSource.size() * 4);
+    for (const Vec4& pixel : iblSource)
+    {
+        iblHalf.push_back(floatToHalf(std::clamp(pixel.x, -65504.0f, 65504.0f)));
+        iblHalf.push_back(floatToHalf(std::clamp(pixel.y, -65504.0f, 65504.0f)));
+        iblHalf.push_back(floatToHalf(std::clamp(pixel.z, -65504.0f, 65504.0f)));
+        iblHalf.push_back(floatToHalf(std::clamp(pixel.w, -65504.0f, 65504.0f)));
     }
 
     GpuBuffer staging{};
@@ -1747,6 +1953,34 @@ bool VulkanRenderer::uploadTextureResources()
         check(vkBindImageMemory(device_, environmentTexture_.image, environmentTexture_.memory, 0),
               "vkBindImageMemory(HDR environment)");
 
+        stagingSize = (stagingSize + 7u) & ~VkDeviceSize{7u};
+        const VkDeviceSize iblOffset = stagingSize;
+        iblTextureBytes_ = iblHalf.size() * sizeof(std::uint16_t);
+        stagingSize += iblTextureBytes_;
+        VkImageCreateInfo iblImageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        iblImageInfo.imageType = VK_IMAGE_TYPE_2D;
+        iblImageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        iblImageInfo.extent = {iblWidth, iblHeight, 1};
+        iblImageInfo.mipLevels = 1;
+        iblImageInfo.arrayLayers = 1;
+        iblImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        iblImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        iblImageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        iblImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        iblImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(device_, &iblImageInfo, nullptr, &iblTexture_.image),
+              "vkCreateImage(IBL atlas)");
+        VkMemoryRequirements iblRequirements{};
+        vkGetImageMemoryRequirements(device_, iblTexture_.image, &iblRequirements);
+        VkMemoryAllocateInfo iblAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        iblAllocation.allocationSize = iblRequirements.size;
+        iblAllocation.memoryTypeIndex = findMemoryType(iblRequirements.memoryTypeBits,
+                                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device_, &iblAllocation, nullptr, &iblTexture_.memory),
+              "vkAllocateMemory(IBL atlas)");
+        check(vkBindImageMemory(device_, iblTexture_.image, iblTexture_.memory, 0),
+              "vkBindImageMemory(IBL atlas)");
+
         staging.size = stagingSize;
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufferInfo.size = stagingSize;
@@ -1771,6 +2005,7 @@ bool VulkanRenderer::uploadTextureResources()
                         sources[index]->rgba8Pixels.size());
         std::memcpy(static_cast<std::byte*>(mapped) + environmentOffset, environmentHalf.data(),
                     environmentTextureBytes_);
+        std::memcpy(static_cast<std::byte*>(mapped) + iblOffset, iblHalf.data(), iblTextureBytes_);
         vkUnmapMemory(device_, staging.memory);
 
         VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -1818,6 +2053,21 @@ bool VulkanRenderer::uploadTextureResources()
         environmentToTransferDependency.pImageMemoryBarriers = &environmentToTransfer;
         vkCmdPipelineBarrier2(command, &environmentToTransferDependency);
 
+        VkImageMemoryBarrier2 iblToTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        iblToTransfer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        iblToTransfer.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        iblToTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        iblToTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        iblToTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        iblToTransfer.image = iblTexture_.image;
+        iblToTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iblToTransfer.subresourceRange.levelCount = 1;
+        iblToTransfer.subresourceRange.layerCount = 1;
+        VkDependencyInfo iblToTransferDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        iblToTransferDependency.imageMemoryBarrierCount = 1;
+        iblToTransferDependency.pImageMemoryBarriers = &iblToTransfer;
+        vkCmdPipelineBarrier2(command, &iblToTransferDependency);
+
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
             const TextureReference& source = *sources[index];
@@ -1861,6 +2111,14 @@ bool VulkanRenderer::uploadTextureResources()
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                static_cast<std::uint32_t>(environmentCopies.size()), environmentCopies.data());
 
+        VkBufferImageCopy iblCopy{};
+        iblCopy.bufferOffset = iblOffset;
+        iblCopy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iblCopy.imageSubresource.layerCount = 1;
+        iblCopy.imageExtent = {iblWidth, iblHeight, 1};
+        vkCmdCopyBufferToImage(command, staging.buffer, iblTexture_.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &iblCopy);
+
         std::vector<VkImageMemoryBarrier2> toShader(sources.size());
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
@@ -1896,6 +2154,21 @@ bool VulkanRenderer::uploadTextureResources()
         environmentToShaderDependency.imageMemoryBarrierCount = 1;
         environmentToShaderDependency.pImageMemoryBarriers = &environmentToShader;
         vkCmdPipelineBarrier2(command, &environmentToShaderDependency);
+        VkImageMemoryBarrier2 iblToShader{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        iblToShader.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        iblToShader.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        iblToShader.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        iblToShader.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        iblToShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        iblToShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        iblToShader.image = iblTexture_.image;
+        iblToShader.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iblToShader.subresourceRange.levelCount = 1;
+        iblToShader.subresourceRange.layerCount = 1;
+        VkDependencyInfo iblToShaderDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        iblToShaderDependency.imageMemoryBarrierCount = 1;
+        iblToShaderDependency.pImageMemoryBarriers = &iblToShader;
+        vkCmdPipelineBarrier2(command, &iblToShaderDependency);
         check(vkEndCommandBuffer(command), "vkEndCommandBuffer(texture upload)");
         VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         check(vkCreateFence(device_, &fenceInfo, nullptr, &fence), "vkCreateFence(texture upload)");
@@ -1926,6 +2199,15 @@ bool VulkanRenderer::uploadTextureResources()
         environmentViewInfo.subresourceRange.layerCount = 1;
         check(vkCreateImageView(device_, &environmentViewInfo, nullptr, &environmentTexture_.view),
               "vkCreateImageView(HDR environment)");
+        VkImageViewCreateInfo iblViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        iblViewInfo.image = iblTexture_.image;
+        iblViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        iblViewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        iblViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        iblViewInfo.subresourceRange.levelCount = 1;
+        iblViewInfo.subresourceRange.layerCount = 1;
+        check(vkCreateImageView(device_, &iblViewInfo, nullptr, &iblTexture_.view),
+              "vkCreateImageView(IBL atlas)");
         VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         samplerInfo.magFilter = VK_FILTER_LINEAR;
         samplerInfo.minFilter = VK_FILTER_LINEAR;
@@ -1934,8 +2216,20 @@ bool VulkanRenderer::uploadTextureResources()
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
-        check(vkCreateSampler(device_, &samplerInfo, nullptr, &materialTextureSampler_),
-              "vkCreateSampler(material textures)");
+        const auto vulkanAddressMode = [](TextureAddressMode mode) {
+            return mode == TextureAddressMode::Clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                 : mode == TextureAddressMode::Mirror ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT
+                                                      : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        };
+        materialTextureSamplers_.resize(sources.size());
+        for (std::size_t index = 0; index < sources.size(); ++index)
+        {
+            samplerInfo.addressModeU = vulkanAddressMode(sources[index]->addressU);
+            samplerInfo.addressModeV = vulkanAddressMode(sources[index]->addressV);
+            check(vkCreateSampler(device_, &samplerInfo, nullptr, &materialTextureSamplers_[index]),
+                  "vkCreateSampler(material texture)");
+        }
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         check(vkCreateSampler(device_, &samplerInfo, nullptr, &environmentSampler_),
               "vkCreateSampler(HDR environment)");
@@ -2002,10 +2296,24 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t padding[3];
         Vec4 boundsCenter;
     };
+    struct alignas(16) GpuEmissiveTriangle
+    {
+        Vec4 position0;
+        Vec4 position1;
+        Vec4 position2;
+        Vec4 emissionAndArea;
+        Vec4 cdfAndPower;
+        Vec4 uv0Uv1;
+        Vec4 uv2AndPadding;
+        Vec4 uvSet1_0_1;
+        Vec4 uvSet1_2AndPadding;
+        std::uint32_t materialData[4];
+    };
     static_assert(sizeof(GpuMeshlet) == 64);
     static_assert(sizeof(GpuInstance) == 192);
     static_assert(offsetof(GpuInstance, materialIndex) == 160);
     static_assert(offsetof(GpuInstance, boundsCenter) == 176);
+    static_assert(sizeof(GpuEmissiveTriangle) == 160);
     static_assert(sizeof(GpuMaterial) == 240);
     struct RasterMeshRange
     {
@@ -2021,6 +2329,9 @@ bool VulkanRenderer::uploadSceneResources()
     std::vector<std::uint32_t> packedTriangles;
     std::vector<std::uint32_t> geometryIndices;
     std::vector<GpuMaterial> gpuMaterials;
+    std::vector<GpuLight> gpuLights;
+    std::vector<GpuEmissiveTriangle> emissiveTriangles;
+    std::vector<GpuTextureMetadata> textureMetadata;
     std::vector<std::uint32_t> meshToGeometry(scene_->meshes.size(), UINT32_MAX);
     std::vector<RasterMeshRange> rasterRanges(scene_->meshes.size());
     std::vector<Vec4> meshBounds(scene_->meshes.size());
@@ -2041,7 +2352,7 @@ bool VulkanRenderer::uploadSceneResources()
             vertices.push_back({{vertex.position.x, vertex.position.y, vertex.position.z, 1.0f},
                                 {vertex.normal.x, vertex.normal.y, vertex.normal.z, 0.0f},
                                 vertex.tangent,
-                                {vertex.uv.x, vertex.uv.y, 0.0f, 0.0f}});
+                                {vertex.uv.x, vertex.uv.y, vertex.uv1.x, vertex.uv1.y}});
         }
 
         const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
@@ -2154,6 +2465,92 @@ bool VulkanRenderer::uploadSceneResources()
         }
     }
 
+    if (scene_->lights.empty())
+        gpuLights.push_back(Light{.intensity = 0.0f}.toGpu());
+    else
+    {
+        gpuLights.reserve(scene_->lights.size());
+        for (const Light& light : scene_->lights)
+            gpuLights.push_back(light.toGpu());
+    }
+    if (scene_->textures.empty())
+        textureMetadata.push_back(TextureReference{}.toGpuMetadata());
+    else
+    {
+        textureMetadata.reserve(scene_->textures.size());
+        for (const TextureReference& texture : scene_->textures)
+            textureMetadata.push_back(texture.toGpuMetadata());
+    }
+
+    float emissiveTotalPower = 0.0f;
+    const auto appendEmissiveInstance = [&](std::uint32_t meshIndex, const Mat4& transform) {
+        if (meshIndex >= scene_->meshes.size())
+            return;
+        const Mesh& mesh = scene_->meshes[meshIndex];
+        if (mesh.lods.empty() || mesh.materialIndex >= scene_->materials.size())
+            return;
+        const Material& material = scene_->materials[mesh.materialIndex];
+        const float emissionLuminance = material.emissive.x * 0.2126f + material.emissive.y * 0.7152f +
+                                        material.emissive.z * 0.0722f;
+        if (emissionLuminance <= 0.0f)
+            return;
+        const auto worldPoint = [&](Vec3 point) {
+            return Vec3{transform.m[0] * point.x + transform.m[4] * point.y + transform.m[8] * point.z + transform.m[12],
+                        transform.m[1] * point.x + transform.m[5] * point.y + transform.m[9] * point.z + transform.m[13],
+                        transform.m[2] * point.x + transform.m[6] * point.y + transform.m[10] * point.z + transform.m[14]};
+        };
+        const std::vector<std::uint32_t>& indices = mesh.lods.front().indices;
+        for (std::size_t triangle = 0; triangle + 2 < indices.size(); triangle += 3)
+        {
+            const Vertex& v0 = mesh.vertices[indices[triangle + 0]];
+            const Vertex& v1 = mesh.vertices[indices[triangle + 1]];
+            const Vertex& v2 = mesh.vertices[indices[triangle + 2]];
+            const Vec3 p0 = worldPoint(v0.position);
+            const Vec3 p1 = worldPoint(v1.position);
+            const Vec3 p2 = worldPoint(v2.position);
+            const float area = length(cross(p1 - p0, p2 - p0)) * 0.5f;
+            const float power = emissionLuminance * area * (material.doubleSided ? 2.0f : 1.0f);
+            if (power <= 1.0e-8f)
+                continue;
+            emissiveTotalPower += power;
+            emissiveTriangles.push_back({{p0.x, p0.y, p0.z, 1.0f},
+                                         {p1.x, p1.y, p1.z, 1.0f},
+                                         {p2.x, p2.y, p2.z, 1.0f},
+                                         {material.emissive.x, material.emissive.y, material.emissive.z, area},
+                                         {emissiveTotalPower, emissiveTotalPower, power, 0.0f},
+                                         {v0.uv.x, v0.uv.y, v1.uv.x, v1.uv.y},
+                                         {v2.uv.x, v2.uv.y, 0.0f, 0.0f},
+                                         {v0.uv1.x, v0.uv1.y, v1.uv1.x, v1.uv1.y},
+                                         {v2.uv1.x, v2.uv1.y, 0.0f, 0.0f},
+                                         {material.emissiveTexture >= 0
+                                              ? static_cast<std::uint32_t>(material.emissiveTexture)
+                                              : kInvalidTextureId,
+                                          material.doubleSided ? 1u : 0u, mesh.materialIndex, 0u}});
+        }
+    };
+    if (!scene_->instances.empty())
+    {
+        for (const Instance& instance : scene_->instances)
+            appendEmissiveInstance(instance.meshIndex, instance.transform);
+    }
+    else
+    {
+        const Mat4 identity = Mat4::identity();
+        for (std::uint32_t meshIndex = 0; meshIndex < scene_->meshes.size(); ++meshIndex)
+            appendEmissiveInstance(meshIndex, identity);
+    }
+    if (emissiveTriangles.empty())
+        emissiveTriangles.push_back({});
+    else
+    {
+        for (GpuEmissiveTriangle& triangle : emissiveTriangles)
+        {
+            triangle.cdfAndPower.x /= emissiveTotalPower;
+            triangle.cdfAndPower.y /= emissiveTotalPower;
+            triangle.cdfAndPower.w = emissiveTotalPower;
+        }
+    }
+
     vertexBuffer_ = createDeviceLocalBuffer(vertices.size() * sizeof(GpuVertex),
                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
@@ -2171,6 +2568,12 @@ bool VulkanRenderer::uploadSceneResources()
                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     materialBuffer_ = createDeviceLocalBuffer(gpuMaterials.size() * sizeof(GpuMaterial),
                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    lightBuffer_ = createDeviceLocalBuffer(gpuLights.size() * sizeof(GpuLight),
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    emissiveTriangleBuffer_ = createDeviceLocalBuffer(emissiveTriangles.size() * sizeof(GpuEmissiveTriangle),
+                                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    textureMetadataBuffer_ = createDeviceLocalBuffer(textureMetadata.size() * sizeof(GpuTextureMetadata),
+                                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const std::array uploads{
         BufferUpload{&vertexBuffer_, vertices.data(), vertices.size() * sizeof(GpuVertex)},
         BufferUpload{&meshletBuffer_, meshlets.data(), meshlets.size() * sizeof(GpuMeshlet)},
@@ -2179,6 +2582,11 @@ bool VulkanRenderer::uploadSceneResources()
         BufferUpload{&geometryIndexBuffer_, geometryIndices.data(), geometryIndices.size() * sizeof(std::uint32_t)},
         BufferUpload{&sceneInstanceBuffer_, gpuInstances.data(), gpuInstances.size() * sizeof(GpuInstance)},
         BufferUpload{&materialBuffer_, gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)},
+        BufferUpload{&lightBuffer_, gpuLights.data(), gpuLights.size() * sizeof(GpuLight)},
+        BufferUpload{&emissiveTriangleBuffer_, emissiveTriangles.data(),
+                     emissiveTriangles.size() * sizeof(GpuEmissiveTriangle)},
+        BufferUpload{&textureMetadataBuffer_, textureMetadata.data(),
+                     textureMetadata.size() * sizeof(GpuTextureMetadata)},
     };
     if (!uploadDeviceLocalBuffers(uploads))
         throw std::runtime_error("Failed to stage Vulkan scene geometry into device-local memory");
@@ -2194,7 +2602,7 @@ bool VulkanRenderer::uploadSceneResources()
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &sceneDescriptorSetLayout_;
     check(vkAllocateDescriptorSets(device_, &allocateInfo, &sceneDescriptorSet_), "vkAllocateDescriptorSets");
-    const std::array<VkDescriptorBufferInfo, 7> bufferInfos{{
+    const std::array<VkDescriptorBufferInfo, 10> bufferInfos{{
         {vertexBuffer_.buffer, 0, vertexBuffer_.size},
         {meshletBuffer_.buffer, 0, meshletBuffer_.size},
         {meshletVertexBuffer_.buffer, 0, meshletVertexBuffer_.size},
@@ -2202,8 +2610,11 @@ bool VulkanRenderer::uploadSceneResources()
         {sceneInstanceBuffer_.buffer, 0, sceneInstanceBuffer_.size},
         {geometryIndexBuffer_.buffer, 0, geometryIndexBuffer_.size},
         {materialBuffer_.buffer, 0, materialBuffer_.size},
+        {lightBuffer_.buffer, 0, lightBuffer_.size},
+        {emissiveTriangleBuffer_.buffer, 0, emissiveTriangleBuffer_.size},
+        {textureMetadataBuffer_.buffer, 0, textureMetadataBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 12> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2262,14 +2673,15 @@ bool VulkanRenderer::uploadSceneResources()
     writes[9].descriptorCount = static_cast<std::uint32_t>(textureInfos.size());
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     writes[9].pImageInfo = textureInfos.data();
-    VkDescriptorImageInfo samplerInfo{};
-    samplerInfo.sampler = materialTextureSampler_;
+    std::vector<VkDescriptorImageInfo> materialSamplerInfos(materialTextureSamplers_.size());
+    for (std::size_t index = 0; index < materialTextureSamplers_.size(); ++index)
+        materialSamplerInfos[index].sampler = materialTextureSamplers_[index];
     writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[10].dstSet = sceneDescriptorSet_;
     writes[10].dstBinding = 10;
-    writes[10].descriptorCount = 1;
+    writes[10].descriptorCount = static_cast<std::uint32_t>(materialSamplerInfos.size());
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    writes[10].pImageInfo = &samplerInfo;
+    writes[10].pImageInfo = materialSamplerInfos.data();
     VkDescriptorImageInfo environmentSamplerInfo{};
     environmentSamplerInfo.sampler = environmentSampler_;
     writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2278,6 +2690,30 @@ bool VulkanRenderer::uploadSceneResources()
     writes[11].descriptorCount = 1;
     writes[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     writes[11].pImageInfo = &environmentSamplerInfo;
+    VkDescriptorImageInfo iblInfo{};
+    iblInfo.imageView = iblTexture_.view;
+    iblInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[12].dstSet = sceneDescriptorSet_;
+    writes[12].dstBinding = 12;
+    writes[12].descriptorCount = 1;
+    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[12].pImageInfo = &iblInfo;
+    for (std::uint32_t writeIndex = 13; writeIndex <= 14; ++writeIndex)
+    {
+        writes[writeIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[writeIndex].dstSet = sceneDescriptorSet_;
+        writes[writeIndex].dstBinding = writeIndex;
+        writes[writeIndex].descriptorCount = 1;
+        writes[writeIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[writeIndex].pBufferInfo = &bufferInfos[writeIndex - 6];
+    }
+    writes[15].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[15].dstSet = sceneDescriptorSet_;
+    writes[15].dstBinding = 15;
+    writes[15].descriptorCount = 1;
+    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[15].pBufferInfo = &bufferInfos[9];
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
@@ -2295,7 +2731,8 @@ bool VulkanRenderer::uploadSceneResources()
         stats_.textureBytes = 4;
     stats_.gpuSceneBytes = vertexBuffer_.size + meshletBuffer_.size + meshletVertexBuffer_.size +
                            meshletTriangleBuffer_.size + geometryIndexBuffer_.size + sceneInstanceBuffer_.size +
-                           environmentTextureBytes_ + materialBuffer_.size + accelerationInstanceBuffer_.size +
+                           environmentTextureBytes_ + iblTextureBytes_ + materialBuffer_.size + lightBuffer_.size +
+                           emissiveTriangleBuffer_.size + textureMetadataBuffer_.size + accelerationInstanceBuffer_.size +
                            tlasStorage_.size + stats_.textureBytes;
     for (const BlasResource& blas : blases_)
         stats_.gpuSceneBytes += blas.storage.size;
@@ -2921,6 +3358,27 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+    if (scene_ && lightBuffer_.buffer && !scene_->lights.empty() &&
+        scene_->lights.size() * sizeof(GpuLight) <= lightBuffer_.size)
+    {
+        std::vector<GpuLight> lights;
+        lights.reserve(scene_->lights.size());
+        for (const Light& light : scene_->lights)
+            lights.push_back(light.toGpu());
+        vkCmdUpdateBuffer(commandBuffer, lightBuffer_.buffer, 0,
+                          lights.size() * sizeof(GpuLight), lights.data());
+        VkBufferMemoryBarrier2 lightBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        lightBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        lightBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        lightBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        lightBarrier.buffer = lightBuffer_.buffer;
+        lightBarrier.size = lightBuffer_.size;
+        VkDependencyInfo lightDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        lightDependency.bufferMemoryBarrierCount = 1;
+        lightDependency.pBufferMemoryBarriers = &lightBarrier;
+        vkCmdPipelineBarrier2(commandBuffer, &lightDependency);
+    }
     const std::uint32_t timestampBase = frameSlot_ * 2;
     vkCmdResetQueryPool(commandBuffer, timestampQueryPool_, timestampBase, 2);
     vkCmdWriteTimestamp2(commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
@@ -3067,11 +3525,41 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
     vkCmdEndRendering(commandBuffer);
 
+    const bool captureThisFrame = capturePending_ && captureBuffer_.buffer &&
+                                  captureBuffer_.size >= static_cast<VkDeviceSize>(swapchainExtent_.width) *
+                                                             swapchainExtent_.height * 4;
+    if (captureThisFrame)
+    {
+        VkImageMemoryBarrier2 toCapture{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        toCapture.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toCapture.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toCapture.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toCapture.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        toCapture.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toCapture.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toCapture.image = swapchainImages_[imageIndex];
+        toCapture.subresourceRange = toTarget.subresourceRange;
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &toCapture;
+        vkCmdPipelineBarrier2(commandBuffer, &dependency);
+        VkBufferImageCopy captureCopy{};
+        captureCopy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        captureCopy.imageSubresource.layerCount = 1;
+        captureCopy.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};
+        vkCmdCopyImageToBuffer(commandBuffer, swapchainImages_[imageIndex],
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffer_.buffer, 1, &captureCopy);
+        capturePending_ = false;
+        captureRecorded_ = true;
+    }
+
     VkImageMemoryBarrier2 toPresent{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toPresent.srcStageMask = captureThisFrame ? VK_PIPELINE_STAGE_2_TRANSFER_BIT
+                                              : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toPresent.srcAccessMask = captureThisFrame ? VK_ACCESS_2_TRANSFER_READ_BIT
+                                                : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     toPresent.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
-    toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toPresent.oldLayout = captureThisFrame ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                           : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     toPresent.image = swapchainImages_[imageIndex];
     toPresent.subresourceRange = toTarget.subresourceRange;

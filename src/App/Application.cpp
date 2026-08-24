@@ -190,6 +190,15 @@ int Application::run()
     if (const char* testFrames = std::getenv("VOR_TEST_FRAMES"); testFrames && *testFrames)
         testFrameLimit = std::strtoull(testFrames, nullptr, 10);
     std::uint64_t renderedFrames = 0;
+    if (const char* capturePath = std::getenv("VOR_CAPTURE_PATH"); capturePath && *capturePath)
+        captureOutputPath_ = std::filesystem::path(capturePath);
+    if (const char* referencePath = std::getenv("VOR_REFERENCE_PATH"); referencePath && *referencePath)
+        captureReferencePath_ = std::filesystem::path(referencePath);
+    if (const char* captureFrame = std::getenv("VOR_CAPTURE_FRAME"); captureFrame && *captureFrame)
+        captureFrame_ = std::max<std::uint64_t>(std::strtoull(captureFrame, nullptr, 10), 1u);
+    if (const char* maximumRmse = std::getenv("VOR_IMAGE_MAX_RMSE"); maximumRmse && *maximumRmse)
+        captureMaximumRmse_ = std::max(std::strtof(maximumRmse, nullptr), 0.0f);
+    hideUi_ = std::getenv("VOR_HIDE_UI") != nullptr;
     bool renderLoopSucceeded = true;
     while (!glfwWindowShouldClose(window_))
     {
@@ -219,7 +228,8 @@ int Application::run()
         }
         vulkanRenderer_.beginUiFrame();
         handleCameraNavigation();
-        drawUi();
+        if (!hideUi_)
+            drawUi();
 
         if (settings_.backend != previousBackend_)
         {
@@ -241,13 +251,20 @@ int Application::run()
                  optixRenderer_.available())
         {
             if (vulkanRenderer_.renderDenoiserInput(scene_.camera, settings_) &&
-                optixRenderer_.denoiseVulkanFrame(settings_.exposure))
+                optixRenderer_.denoiseVulkanFrame(settings_.exposure, settings_.temporalRendering))
                 vulkanRenderer_.setGpuInteropFrameReady(true);
             else
                 vulkanRenderer_.clearExternalImage();
         }
         else
             vulkanRenderer_.clearExternalImage();
+        if (!captureOutputPath_.empty() && renderedFrames + 1 == captureFrame_ &&
+            !vulkanRenderer_.requestImageCapture(captureOutputPath_, captureReferencePath_, captureMaximumRmse_))
+        {
+            log(LogLevel::Error, "Could not configure Vulkan image regression capture");
+            renderLoopSucceeded = false;
+            break;
+        }
         if (!vulkanRenderer_.render(scene_.camera, settings_))
         {
             renderLoopSucceeded = false;
@@ -282,7 +299,15 @@ bool Application::initialize()
     }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    window_ = glfwCreateWindow(1600, 900, "VORaytracer - Vulkan Mesh Shaders + OptiX", nullptr, nullptr);
+    int initialWidth = 1600;
+    int initialHeight = 900;
+    if (const char* width = std::getenv("VOR_TEST_WIDTH"); width && *width)
+        initialWidth = std::max(std::atoi(width), 64);
+    if (const char* height = std::getenv("VOR_TEST_HEIGHT"); height && *height)
+        initialHeight = std::max(std::atoi(height), 64);
+    if (std::getenv("VOR_HEADLESS"))
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    window_ = glfwCreateWindow(initialWidth, initialHeight, "VORaytracer - Vulkan Mesh Shaders + OptiX", nullptr, nullptr);
     if (!window_)
     {
         log(LogLevel::Error, "glfwCreateWindow failed");
@@ -305,6 +330,8 @@ bool Application::initialize()
     if (const char* requestedDenoiser = std::getenv("VOR_DENOISER");
         requestedDenoiser && std::strcmp(requestedDenoiser, "1") == 0)
         settings_.denoiser = true;
+    if (const char* requestedTemporal = std::getenv("VOR_TEMPORAL_RENDERING"); requestedTemporal)
+        settings_.temporalRendering = std::strcmp(requestedTemporal, "0") != 0;
     if (const char* requestedMeshletDebug = std::getenv("VOR_MESHLET_DEBUG");
         requestedMeshletDebug && std::strcmp(requestedMeshletDebug, "1") == 0)
         settings_.showMeshlets = true;
@@ -777,6 +804,12 @@ void Application::drawRenderPanel()
         ImGui::BeginDisabled();
     if (ImGui::Checkbox("Vulkan post-render denoiser", &settings_.denoiser))
         resetCameraAccumulation();
+    if (!settings_.denoiser)
+        ImGui::BeginDisabled();
+    if (ImGui::Checkbox("Temporal stabilization", &settings_.temporalRendering))
+        resetCameraAccumulation();
+    if (!settings_.denoiser)
+        ImGui::EndDisabled();
     if (settings_.backend != BackendKind::VulkanHybrid || !optixRenderer_.available())
         ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1113,7 +1146,6 @@ void Application::frameCameraToScene()
     const float lightDistance = radius * 2.5f;
     light.position = lightTarget_ - lightDirection * lightDistance;
     light.direction = normalize(lightTarget_ - light.position);
-    light.type = LightType::Directional;
     syncGlobalLightTransform();
     light.range = radius * 10.0f;
     resetCameraAccumulation();
@@ -1202,7 +1234,6 @@ void Application::syncGlobalLightTransform()
     const Vec3 direction = lightTarget_ - light.position;
     if (length(direction) > 1e-6f)
         light.direction = normalize(direction);
-    light.type = LightType::Directional;
     // Equirectangular HDR maps only have a meaningful rotational component. The same
     // shared transform drives the sun direction of the procedural sky.
     scene_.environment.rotationRadians = std::atan2(light.direction.x, light.direction.z);

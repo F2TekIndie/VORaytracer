@@ -51,6 +51,34 @@ struct GpuInstance
     float4 boundsCenter;
 };
 
+struct GpuLight
+{
+    float4 positionAndType;
+    float4 directionAndRange;
+    float4 colorAndIntensity;
+    float4 coneAndArea;
+};
+
+struct GpuEmissiveTriangle
+{
+    float4 position0;
+    float4 position1;
+    float4 position2;
+    float4 emissionAndArea;
+    float4 cdfAndPower;
+    float4 uv0Uv1;
+    float4 uv2AndPadding;
+    float4 uvSet1_0_1;
+    float4 uvSet1_2AndPadding;
+    uint4 materialData;
+};
+
+struct GpuTextureMetadata
+{
+    float4 scaleAndOffset;
+    float4 rotationAndUvSet;
+};
+
 struct FramePushConstants
 {
     float4x4 viewProjection;
@@ -87,8 +115,12 @@ static const uint RENDER_FLAG_TRANSPARENT_PASS = 1u << 1;
 [[vk::binding(7, 0)]] Texture2D<float4> environmentTexture;
 [[vk::binding(8, 0)]] StructuredBuffer<GpuMaterial> sceneMaterials;
 [[vk::binding(9, 0)]] Texture2D<float4> materialTextures[1024];
-[[vk::binding(10, 0)]] SamplerState materialTextureSampler;
+[[vk::binding(10, 0)]] SamplerState materialTextureSamplers[1024];
 [[vk::binding(11, 0)]] SamplerState environmentSampler;
+[[vk::binding(12, 0)]] Texture2D<float4> iblTexture;
+[[vk::binding(13, 0)]] StructuredBuffer<GpuLight> sceneLights;
+[[vk::binding(14, 0)]] StructuredBuffer<GpuEmissiveTriangle> emissiveTriangles;
+[[vk::binding(15, 0)]] StructuredBuffer<GpuTextureMetadata> textureMetadata;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -96,7 +128,7 @@ struct MeshVertex
     float4 position : SV_Position;
     float3 worldNormal : NORMAL0;
     float3 worldPosition : POSITION0;
-    float2 uv : TEXCOORD0;
+    float4 uv : TEXCOORD0;
     float4 worldTangent : TANGENT0;
     nointerpolation uint materialId : TEXCOORD1;
     nointerpolation uint meshletIndex : TEXCOORD2;
@@ -189,11 +221,24 @@ GpuMaterial loadMaterial(uint materialId)
     return sceneMaterials[effectiveMaterialId(materialId)];
 }
 
-float4 sampleMaterialTexture(uint textureId, float2 uv, float4 fallback)
+float2 transformedTextureUv(uint textureId, float4 uvSets)
 {
-    return textureId == INVALID_TEXTURE_ID
-               ? fallback
-               : materialTextures[NonUniformResourceIndex(textureId)].Sample(materialTextureSampler, uv);
+    GpuTextureMetadata metadata = textureMetadata[textureId];
+    float2 uv = metadata.rotationAndUvSet.z >= 0.5 ? uvSets.zw : uvSets.xy;
+    uv = (uv - 0.5) * metadata.scaleAndOffset.xy;
+    float cosine = metadata.rotationAndUvSet.x;
+    float sine = metadata.rotationAndUvSet.y;
+    uv = float2(cosine * uv.x - sine * uv.y, sine * uv.x + cosine * uv.y);
+    return uv + 0.5 + metadata.scaleAndOffset.zw;
+}
+
+float4 sampleMaterialTexture(uint textureId, float4 uvSets, float4 fallback)
+{
+    if (textureId == INVALID_TEXTURE_ID)
+        return fallback;
+    uint resourceIndex = NonUniformResourceIndex(textureId);
+    return materialTextures[resourceIndex].Sample(materialTextureSamplers[resourceIndex],
+                                                   transformedTextureUv(textureId, uvSets));
 }
 
 float heightValue(float4 sampleValue)
@@ -201,7 +246,7 @@ float heightValue(float4 sampleValue)
     return dot(sampleValue.xyz, float3(0.2126, 0.7152, 0.0722));
 }
 
-float2 sampleHeightGradient(GpuMaterial material, float2 uv)
+float2 sampleHeightGradient(GpuMaterial material, float4 uvSets)
 {
     uint textureId = material.materialFlags.z;
     uint packedDimensions = material.materialFlags.w;
@@ -210,41 +255,45 @@ float2 sampleHeightGradient(GpuMaterial material, float2 uv)
     if (textureId == INVALID_TEXTURE_ID || width == 0u || height == 0u)
         return float2(0.0);
 
+    float2 uv = transformedTextureUv(textureId, uvSets);
     float2 texelSize = 1.0 / float2(width, height);
     float2 uvDx = ddx(uv);
     float2 uvDy = ddy(uv);
     uint resourceIndex = NonUniformResourceIndex(textureId);
     float left = heightValue(materialTextures[resourceIndex].SampleGrad(
-        materialTextureSampler, uv - float2(texelSize.x, 0.0), uvDx, uvDy));
+        materialTextureSamplers[resourceIndex], uv - float2(texelSize.x, 0.0), uvDx, uvDy));
     float right = heightValue(materialTextures[resourceIndex].SampleGrad(
-        materialTextureSampler, uv + float2(texelSize.x, 0.0), uvDx, uvDy));
+        materialTextureSamplers[resourceIndex], uv + float2(texelSize.x, 0.0), uvDx, uvDy));
     float up = heightValue(materialTextures[resourceIndex].SampleGrad(
-        materialTextureSampler, uv - float2(0.0, texelSize.y), uvDx, uvDy));
+        materialTextureSamplers[resourceIndex], uv - float2(0.0, texelSize.y), uvDx, uvDy));
     float down = heightValue(materialTextures[resourceIndex].SampleGrad(
-        materialTextureSampler, uv + float2(0.0, texelSize.y), uvDx, uvDy));
+        materialTextureSamplers[resourceIndex], uv + float2(0.0, texelSize.y), uvDx, uvDy));
     return float2(left - right, up - down);
 }
 
 SurfaceData resolveMaterialSurface(GpuMaterial material, float3 position, float3 geometricNormal,
-                                   float3 shadingNormal, float4 tangentAndSign, float2 uv)
+                                   float3 shadingNormal, float4 tangentAndSign, float4 uvSets)
 {
-    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign, uv);
+    SurfaceData surface = makeSurfaceData(material, position, geometricNormal, shadingNormal, tangentAndSign,
+                                          uvSets.xy);
     MaterialTextureSamples samples = defaultMaterialTextureSamples();
-    samples.baseColor = sampleMaterialTexture(material.textureIndices0.x, uv, samples.baseColor);
-    samples.opacity = sampleMaterialTexture(material.textureIndices3.x, uv, samples.opacity);
-    samples.metallicRoughness = sampleMaterialTexture(material.textureIndices0.y, uv, samples.metallicRoughness);
-    samples.normal = sampleMaterialTexture(material.textureIndices0.z, uv, samples.normal);
-    samples.heightGradient = sampleHeightGradient(material, uv);
-    samples.emissive = sampleMaterialTexture(material.textureIndices0.w, uv, samples.emissive);
-    samples.occlusion = sampleMaterialTexture(material.textureIndices1.x, uv, samples.occlusion);
-    samples.transmission = sampleMaterialTexture(material.textureIndices1.y, uv, samples.transmission);
-    samples.clearcoat = sampleMaterialTexture(material.textureIndices1.z, uv, samples.clearcoat);
-    samples.clearcoatRoughness = sampleMaterialTexture(material.textureIndices1.w, uv,
+    samples.baseColor = sampleMaterialTexture(material.textureIndices0.x, uvSets, samples.baseColor);
+    samples.opacity = sampleMaterialTexture(material.textureIndices3.x, uvSets, samples.opacity);
+    samples.metallicRoughness = sampleMaterialTexture(material.textureIndices0.y, uvSets,
+                                                      samples.metallicRoughness);
+    samples.normal = sampleMaterialTexture(material.textureIndices0.z, uvSets, samples.normal);
+    samples.heightGradient = sampleHeightGradient(material, uvSets);
+    samples.emissive = sampleMaterialTexture(material.textureIndices0.w, uvSets, samples.emissive);
+    samples.occlusion = sampleMaterialTexture(material.textureIndices1.x, uvSets, samples.occlusion);
+    samples.transmission = sampleMaterialTexture(material.textureIndices1.y, uvSets, samples.transmission);
+    samples.clearcoat = sampleMaterialTexture(material.textureIndices1.z, uvSets, samples.clearcoat);
+    samples.clearcoatRoughness = sampleMaterialTexture(material.textureIndices1.w, uvSets,
                                                        samples.clearcoatRoughness);
-    samples.clearcoatNormal = sampleMaterialTexture(material.textureIndices2.x, uv, samples.clearcoatNormal);
-    samples.anisotropy = sampleMaterialTexture(material.textureIndices2.w, uv, samples.anisotropy);
-    samples.sheenColor = sampleMaterialTexture(material.textureIndices2.y, uv, samples.sheenColor);
-    samples.sheenRoughness = sampleMaterialTexture(material.textureIndices2.z, uv, samples.sheenRoughness);
+    samples.clearcoatNormal = sampleMaterialTexture(material.textureIndices2.x, uvSets, samples.clearcoatNormal);
+    samples.anisotropy = sampleMaterialTexture(material.textureIndices2.w, uvSets, samples.anisotropy);
+    samples.sheenColor = sampleMaterialTexture(material.textureIndices2.y, uvSets, samples.sheenColor);
+    samples.sheenRoughness = sampleMaterialTexture(material.textureIndices2.z, uvSets,
+                                                   samples.sheenRoughness);
     return applyBaseMaterialTextures(material, surface, samples);
 }
 
@@ -265,17 +314,19 @@ CandidateMaterial resolveCandidateMaterial(uint instanceIndex, uint primitiveInd
     uint3 triangle = uint3(geometryIndices[triangleOffset], geometryIndices[triangleOffset + 1],
                            geometryIndices[triangleOffset + 2]);
     float barycentric0 = 1.0 - barycentrics.x - barycentrics.y;
-    float2 uv = sceneVertices[instance.geometry.x + triangle.x].uv.xy * barycentric0 +
-                sceneVertices[instance.geometry.x + triangle.y].uv.xy * barycentrics.x +
-                sceneVertices[instance.geometry.x + triangle.z].uv.xy * barycentrics.y;
+    float4 uvSets = sceneVertices[instance.geometry.x + triangle.x].uv * barycentric0 +
+                    sceneVertices[instance.geometry.x + triangle.y].uv * barycentrics.x +
+                    sceneVertices[instance.geometry.x + triangle.z].uv * barycentrics.y;
     float textureAlpha = material.textureIndices0.x == INVALID_TEXTURE_ID
                              ? 1.0
                              : materialTextures[NonUniformResourceIndex(material.textureIndices0.x)].SampleLevel(
-                                   materialTextureSampler, uv, 0.0).w;
+                                    materialTextureSamplers[NonUniformResourceIndex(material.textureIndices0.x)],
+                                    transformedTextureUv(material.textureIndices0.x, uvSets), 0.0).w;
     float opacityTexture = material.textureIndices3.x == INVALID_TEXTURE_ID
                                ? 1.0
                                : materialTextures[NonUniformResourceIndex(material.textureIndices3.x)].SampleLevel(
-                                     materialTextureSampler, uv, 0.0).x;
+                                      materialTextureSamplers[NonUniformResourceIndex(material.textureIndices3.x)],
+                                      transformedTextureUv(material.textureIndices3.x, uvSets), 0.0).x;
     result.opacity = saturate(material.baseColorFactor.w * textureAlpha * opacityTexture);
     result.alphaMode = material.materialFlags.y;
     result.accepted = result.alphaMode != ALPHA_MODE_MASK || result.opacity >= material.surfaceParameters.w;
@@ -342,6 +393,37 @@ float3 sampleHdrEnvironment(float3 direction)
     return sampleHdrEnvironmentLod(direction, 0.0);
 }
 
+float2 environmentUv(float3 direction)
+{
+    float3 rotatedDirection = rotateEnvironmentDirection(normalize(direction));
+    return float2(atan2(rotatedDirection.z, rotatedDirection.x) / (2.0 * PI) + 0.5,
+                  acos(clamp(rotatedDirection.y, -1.0, 1.0)) / PI);
+}
+
+float4 sampleIblAtlas(float2 uv, float2 offset, float2 dimensions)
+{
+    uv.x = frac(uv.x);
+    uv.y = saturate(uv.y);
+    float2 atlasUv = (offset + 0.5 + uv * max(dimensions - 1.0, 0.0)) / float2(512.0, 256.0);
+    return iblTexture.SampleLevel(environmentSampler, atlasUv, 0.0);
+}
+
+float3 sampleIblSpecularLevel(float3 direction, uint level)
+{
+    level = min(level, 8u);
+    uint width = max(256u >> level, 1u);
+    uint height = max(128u >> level, 1u);
+    uint offsetX = level == 0u ? 0u : 512u - (512u >> level);
+    return sampleIblAtlas(environmentUv(direction), float2(offsetX, 0u),
+                          float2(width, height)).xyz;
+}
+
+float2 sampleEnvironmentBrdf(float nDotView, float roughness)
+{
+    return sampleIblAtlas(float2(saturate(nDotView), saturate(roughness)),
+                          float2(256.0, 128.0), float2(128.0, 128.0)).xy;
+}
+
 float3 sampleGlobalEnvironment(float3 direction)
 {
     uint mode = uint(frame.lightDirectionAndMode.w + 0.5);
@@ -365,10 +447,8 @@ float3 sampleDiffuseEnvironment(float3 normal)
 {
     uint mode = uint(frame.lightDirectionAndMode.w + 0.5);
     if (mode == 1)
-    {
-        float diffuseLod = max(float(frame.environmentMipCount) - 5.0, 0.0);
-        return sampleHdrEnvironmentLod(normal, diffuseLod) * frame.environmentParameters.z;
-    }
+        return sampleIblAtlas(environmentUv(normal), float2(256.0, 64.0),
+                              float2(64.0, 32.0)).xyz * frame.environmentParameters.z;
     if (mode == 0)
         return float3(0.0);
     return sampleGlobalEnvironment(normal);
@@ -380,10 +460,151 @@ float3 samplePrefilteredEnvironment(float3 reflectionDirection, float roughness)
     roughness = saturate(roughness);
     if (uint(frame.lightDirectionAndMode.w + 0.5) == 1)
     {
-        float specularLod = roughness * float(max(frame.environmentMipCount, 1u) - 1u);
-        return sampleHdrEnvironmentLod(reflectionDirection, specularLod) * frame.environmentParameters.z;
+        float specularLevel = roughness * 8.0;
+        uint lowerLevel = uint(floor(specularLevel));
+        uint upperLevel = min(lowerLevel + 1u, 8u);
+        return lerp(sampleIblSpecularLevel(reflectionDirection, lowerLevel),
+                    sampleIblSpecularLevel(reflectionDirection, upperLevel), frac(specularLevel)) *
+               frame.environmentParameters.z;
     }
     return sampleGlobalEnvironment(reflectionDirection);
+}
+
+float randomFromHash(uint seed)
+{
+    return (float(meshletHash(seed)) + 0.5) / 4294967296.0;
+}
+
+struct DirectLightSample
+{
+    float3 direction;
+    float3 radiance;
+    float distance;
+};
+
+DirectLightSample sampleAnalyticLight(GpuLight light, float3 position, uint seed)
+{
+    DirectLightSample sample;
+    sample.direction = normalize(-light.directionAndRange.xyz);
+    sample.radiance = max(light.colorAndIntensity.xyz, 0.0) * max(light.colorAndIntensity.w, 0.0);
+    sample.distance = 10000.0;
+    uint type = uint(light.positionAndType.w + 0.5);
+    if (type == 0u)
+        return sample;
+
+    float3 lightPosition = light.positionAndType.xyz;
+    if (type == 3u)
+    {
+        float3 lightNormal = normalize(light.directionAndRange.xyz);
+        float3 helper = abs(lightNormal.y) < 0.999 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        float3 tangent = normalize(cross(helper, lightNormal));
+        float3 bitangent = cross(lightNormal, tangent);
+        float2 areaSample = float2(randomFromHash(seed), randomFromHash(seed ^ 0x9e3779b9u)) - 0.5;
+        lightPosition += tangent * areaSample.x * light.coneAndArea.z +
+                         bitangent * areaSample.y * light.coneAndArea.w;
+    }
+    float3 toLight = lightPosition - position;
+    float distanceSquared = max(dot(toLight, toLight), 1e-8);
+    sample.distance = sqrt(distanceSquared);
+    sample.direction = toLight / sample.distance;
+    float range = max(light.directionAndRange.w, 1e-4);
+    float rangeAttenuation = saturate(1.0 - pow(sample.distance / range, 4.0));
+    rangeAttenuation *= rangeAttenuation;
+    sample.radiance *= rangeAttenuation / distanceSquared;
+    if (type == 2u)
+    {
+        float coneCosine = dot(normalize(light.directionAndRange.xyz), -sample.direction);
+        sample.radiance *= smoothstep(light.coneAndArea.y, light.coneAndArea.x, coneCosine);
+    }
+    else if (type == 3u)
+    {
+        float cosineAtLight = max(dot(normalize(light.directionAndRange.xyz), -sample.direction), 0.0);
+        sample.radiance *= cosineAtLight * max(light.coneAndArea.z * light.coneAndArea.w, 1e-6);
+    }
+    return sample;
+}
+
+float traceDirectVisibility(float3 position, float3 normal, DirectLightSample lightSample)
+{
+    float coordinateScale = max(max(abs(position.x), abs(position.y)), abs(position.z));
+    float rayBias = max(0.0001, coordinateScale * 0.00001);
+    RayDesc shadowRay;
+    shadowRay.Origin = position + (dot(normal, lightSample.direction) >= 0.0 ? normal : -normal) * rayBias;
+    shadowRay.Direction = lightSample.direction;
+    shadowRay.TMin = rayBias * 0.5;
+    shadowRay.TMax = max(lightSample.distance - rayBias, rayBias);
+    RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+    query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, shadowRay);
+    float visibility = 1.0;
+    while (query.Proceed())
+    {
+        CandidateMaterial candidate = resolveCandidateMaterial(query.CandidateInstanceID(),
+                                                                query.CandidatePrimitiveIndex(),
+                                                                query.CandidateTriangleBarycentrics());
+        if (!candidate.accepted || (!candidate.doubleSided && !query.CandidateTriangleFrontFace()))
+            continue;
+        if (candidate.alphaMode == ALPHA_MODE_BLEND)
+        {
+            visibility *= 1.0 - candidate.opacity;
+            continue;
+        }
+        query.CommitNonOpaqueTriangleHit();
+    }
+    return query.CommittedStatus() == COMMITTED_NOTHING ? visibility : 0.0;
+}
+
+DirectLightSample sampleEmissiveLight(float3 position, uint seed)
+{
+    DirectLightSample sample;
+    sample.direction = float3(0.0, 1.0, 0.0);
+    sample.radiance = float3(0.0);
+    sample.distance = 0.0;
+    uint count;
+    uint stride;
+    emissiveTriangles.GetDimensions(count, stride);
+    if (count == 0u || emissiveTriangles[count - 1u].cdfAndPower.w <= 0.0)
+        return sample;
+    float selector = randomFromHash(seed);
+    uint low = 0u;
+    uint high = count;
+    while (low < high)
+    {
+        uint middle = (low + high) / 2u;
+        if (selector < emissiveTriangles[middle].cdfAndPower.y)
+            high = middle;
+        else
+            low = middle + 1u;
+    }
+    GpuEmissiveTriangle triangle = emissiveTriangles[min(low, count - 1u)];
+    float2 randomSample = float2(randomFromHash(seed ^ 0x85ebca6bu),
+                                 randomFromHash(seed ^ 0xc2b2ae35u));
+    float squareRoot = sqrt(randomSample.x);
+    float barycentric0 = 1.0 - squareRoot;
+    float barycentric1 = squareRoot * (1.0 - randomSample.y);
+    float barycentric2 = squareRoot * randomSample.y;
+    float3 lightPosition = triangle.position0.xyz * barycentric0 +
+                           triangle.position1.xyz * barycentric1 +
+                           triangle.position2.xyz * barycentric2;
+    float3 toLight = lightPosition - position;
+    float distanceSquared = max(dot(toLight, toLight), 1e-8);
+    sample.distance = sqrt(distanceSquared);
+    sample.direction = toLight / sample.distance;
+    float3 lightNormal = normalize(cross(triangle.position1.xyz - triangle.position0.xyz,
+                                         triangle.position2.xyz - triangle.position0.xyz));
+    float signedCosine = dot(lightNormal, -sample.direction);
+    float cosineAtLight = triangle.materialData.y != 0u ? abs(signedCosine) : max(signedCosine, 0.0);
+    float selectionPdf = triangle.cdfAndPower.z / max(triangle.cdfAndPower.w, 1e-8);
+    float solidAnglePdf = selectionPdf * distanceSquared /
+                          max(triangle.emissionAndArea.w * cosineAtLight, 1e-8);
+    float2 uv = triangle.uv0Uv1.xy * barycentric0 + triangle.uv0Uv1.zw * barycentric1 +
+                triangle.uv2AndPadding.xy * barycentric2;
+    float2 uv1 = triangle.uvSet1_0_1.xy * barycentric0 + triangle.uvSet1_0_1.zw * barycentric1 +
+                 triangle.uvSet1_2AndPadding.xy * barycentric2;
+    float3 emissiveTexture = sampleMaterialTexture(triangle.materialData.x, float4(uv, uv1), float4(1.0)).xyz;
+    sample.radiance = triangle.emissionAndArea.xyz * max(emissiveTexture, 0.0) /
+                      max(solidAnglePdf, 1e-8);
+    return sample;
 }
 
 [shader("vertex")]
@@ -517,7 +738,7 @@ void MeshMain(
         vertices[outputVertex].worldTangent = float4(
             normalize(mul((float3x3)instance.transform, source.tangent.xyz)),
             source.tangent.w * instance.scaleAndFlags.z);
-        vertices[outputVertex].uv = source.uv.xy;
+        vertices[outputVertex].uv = source.uv;
         vertices[outputVertex].materialId = meshlet.materialIndex;
         vertices[outputVertex].meshletIndex = meshletIndex;
         vertices[outputVertex].instanceIndex = meshlet.instanceIndex;
@@ -567,47 +788,40 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
         return output;
     }
     uint globalLightMode = uint(frame.lightDirectionAndMode.w + 0.5);
-    float lightDistance = 10000.0;
     float3 lightDirection = normalize(-frame.lightDirectionAndMode.xyz);
     float3 baseColor = surface.baseColor;
-    float visibility = 1.0;
-    if (frame.rayTracedShadows != 0 && globalLightMode != 1)
+    float3 directRadiance = float3(0.0);
+    float3 color = surface.emissive;
+    uint lightCount;
+    uint lightStride;
+    sceneLights.GetDimensions(lightCount, lightStride);
+    uint pixelSeed = uint(input.position.x) * 0x9e3779b9u ^ uint(input.position.y) * 0x85ebca6bu;
+    if (globalLightMode != 1)
     {
-        float coordinateScale = max(max(abs(input.worldPosition.x), abs(input.worldPosition.y)), abs(input.worldPosition.z));
-        float rayBias = max(0.0001, coordinateScale * 0.00001);
-        RayDesc shadowRay;
-        shadowRay.Origin = input.worldPosition + normal * rayBias;
-        shadowRay.Direction = lightDirection;
-        shadowRay.TMin = rayBias * 0.5;
-        shadowRay.TMax = max(lightDistance - rayBias, rayBias);
-        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                 RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
-        query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, shadowRay);
-        while (query.Proceed())
+        for (uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
         {
-            CandidateMaterial candidate = resolveCandidateMaterial(query.CandidateInstanceID(),
-                                                                    query.CandidatePrimitiveIndex(),
-                                                                    query.CandidateTriangleBarycentrics());
-            if (!candidate.accepted)
-                continue;
-            if (!candidate.doubleSided && !query.CandidateTriangleFrontFace())
-                continue;
-            if (candidate.alphaMode == ALPHA_MODE_BLEND)
+            DirectLightSample lightSample = sampleAnalyticLight(sceneLights[lightIndex], input.worldPosition,
+                                                                pixelSeed ^ (lightIndex * 0x27d4eb2fu));
+            float visibility = frame.rayTracedShadows != 0
+                                   ? traceDirectVisibility(input.worldPosition, normal, lightSample) : 1.0;
+            float nDotLight = saturate(dot(normal, lightSample.direction));
+            color += evaluateRealtimeSurfaceBsdf(surface, viewDirection, lightSample.direction) *
+                     nDotLight * lightSample.radiance * visibility;
+            if (lightIndex == 0u)
             {
-                visibility *= 1.0 - candidate.opacity;
-                continue;
+                lightDirection = lightSample.direction;
+                directRadiance = lightSample.radiance * visibility;
             }
-            query.CommitNonOpaqueTriangleHit();
         }
-        if (query.CommittedStatus() != COMMITTED_NOTHING)
-            visibility = 0.0;
     }
-    float3 directRadiance = globalLightMode == 1
-                                ? float3(0.0)
-                                : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * visibility;
-    float3 color = evaluateRealtimeSurfaceBsdf(surface, viewDirection, lightDirection) *
-                   saturate(dot(normal, lightDirection)) * directRadiance;
-    color += surface.emissive;
+    DirectLightSample emissiveLight = sampleEmissiveLight(input.worldPosition, pixelSeed ^ 0x165667b1u);
+    if (dot(emissiveLight.radiance, emissiveLight.radiance) > 0.0)
+    {
+        float visibility = frame.rayTracedShadows != 0
+                               ? traceDirectVisibility(input.worldPosition, normal, emissiveLight) : 1.0;
+        color += evaluateRealtimeSurfaceBsdf(surface, viewDirection, emissiveLight.direction) *
+                 saturate(dot(normal, emissiveLight.direction)) * emissiveLight.radiance * visibility;
+    }
     if (surface.subsurface > 0.0)
     {
         float coordinateScale = max(max(abs(input.worldPosition.x), abs(input.worldPosition.y)),
@@ -712,9 +926,9 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                 hitNormal = -hitNormal;
             float3 reflectedViewDirection = normalize(-reflectionRay.Direction);
             float3 hitPosition = reflectionRay.Origin + reflectionRay.Direction * reflectionQuery.CommittedRayT();
-            float2 hitUv = sceneVertices[hitInstance.geometry.x + triangle.x].uv.xy * barycentric0 +
-                           sceneVertices[hitInstance.geometry.x + triangle.y].uv.xy * barycentrics.x +
-                           sceneVertices[hitInstance.geometry.x + triangle.z].uv.xy * barycentrics.y;
+            float4 hitUv = sceneVertices[hitInstance.geometry.x + triangle.x].uv * barycentric0 +
+                           sceneVertices[hitInstance.geometry.x + triangle.y].uv * barycentrics.x +
+                           sceneVertices[hitInstance.geometry.x + triangle.z].uv * barycentrics.y;
             float4 hitTangent = sceneVertices[hitInstance.geometry.x + triangle.x].tangent * barycentric0 +
                                 sceneVertices[hitInstance.geometry.x + triangle.y].tangent * barycentrics.x +
                                 sceneVertices[hitInstance.geometry.x + triangle.z].tangent * barycentrics.y;
@@ -729,47 +943,32 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
                 hitSurface.shadingNormal = hitNormal;
                 hitSurface.clearcoatNormal = -hitSurface.clearcoatNormal;
             }
-            float hitLightDistance = 10000.0;
-            float3 hitLightDirection = normalize(-frame.lightDirectionAndMode.xyz);
-            float hitVisibility = 1.0;
-            if (frame.rayTracedShadows != 0 && globalLightMode != 1)
+            float3 localReflection = float3(0.0);
+            if (globalLightMode != 1)
             {
-                float hitCoordinateScale = max(max(abs(hitPosition.x), abs(hitPosition.y)), abs(hitPosition.z));
-                float hitRayBias = max(0.0001, hitCoordinateScale * 0.00001);
-                RayDesc reflectedShadowRay;
-                reflectedShadowRay.Origin = hitPosition + hitNormal * hitRayBias;
-                reflectedShadowRay.Direction = hitLightDirection;
-                reflectedShadowRay.TMin = hitRayBias * 0.5;
-                reflectedShadowRay.TMax = max(hitLightDistance - hitRayBias, hitRayBias);
-                RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                         RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> reflectedShadowQuery;
-                reflectedShadowQuery.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, reflectedShadowRay);
-                while (reflectedShadowQuery.Proceed())
+                for (uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
                 {
-                    CandidateMaterial candidate = resolveCandidateMaterial(
-                        reflectedShadowQuery.CandidateInstanceID(),
-                        reflectedShadowQuery.CandidatePrimitiveIndex(),
-                        reflectedShadowQuery.CandidateTriangleBarycentrics());
-                    if (!candidate.accepted)
-                        continue;
-                    if (!candidate.doubleSided && !reflectedShadowQuery.CandidateTriangleFrontFace())
-                        continue;
-                    if (candidate.alphaMode == ALPHA_MODE_BLEND)
-                    {
-                        hitVisibility *= 1.0 - candidate.opacity;
-                        continue;
-                    }
-                    reflectedShadowQuery.CommitNonOpaqueTriangleHit();
+                    DirectLightSample hitLight = sampleAnalyticLight(
+                        sceneLights[lightIndex], hitPosition,
+                        pixelSeed ^ (lightIndex * 0x27d4eb2fu) ^ 0xb5297a4du);
+                    float hitVisibility = frame.rayTracedShadows != 0
+                                              ? traceDirectVisibility(hitPosition, hitNormal, hitLight) : 1.0;
+                    localReflection += evaluateRealtimeSurfaceBsdf(hitSurface, reflectedViewDirection,
+                                                                   hitLight.direction) *
+                                       saturate(dot(hitNormal, hitLight.direction)) *
+                                       hitLight.radiance * hitVisibility;
                 }
-                if (reflectedShadowQuery.CommittedStatus() != COMMITTED_NOTHING)
-                    hitVisibility = 0.0;
             }
-            float3 hitDirectRadiance = globalLightMode == 1
-                                           ? float3(0.0)
-                                           : frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w * hitVisibility;
-            float3 localReflection = evaluateRealtimeSurfaceBsdf(hitSurface, reflectedViewDirection,
-                                                                 hitLightDirection) *
-                                     saturate(dot(hitNormal, hitLightDirection)) * hitDirectRadiance;
+            DirectLightSample hitEmissiveLight = sampleEmissiveLight(hitPosition, pixelSeed ^ 0x68e31da4u);
+            if (dot(hitEmissiveLight.radiance, hitEmissiveLight.radiance) > 0.0)
+            {
+                float hitVisibility = frame.rayTracedShadows != 0
+                                          ? traceDirectVisibility(hitPosition, hitNormal, hitEmissiveLight) : 1.0;
+                localReflection += evaluateRealtimeSurfaceBsdf(hitSurface, reflectedViewDirection,
+                                                               hitEmissiveLight.direction) *
+                                   saturate(dot(hitNormal, hitEmissiveLight.direction)) *
+                                   hitEmissiveLight.radiance * hitVisibility;
+            }
             if (frame.skyHorizonAndIndirect.w != 0.0)
                 localReflection += sampleDiffuseEnvironment(hitNormal) * hitSurface.baseColor *
                                    (1.0 - hitSurface.metallic) * (1.0 - hitSurface.transmission) *
@@ -781,8 +980,15 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
             reflectedRadiance = lerp(environmentReflection, localReflection, localReflectionWeight);
         }
         float3 reflectionF0 = lerp(float3(dielectricF0(surface.ior)), baseColor, surface.metallic);
-        float3 reflectionWeight = fresnelSchlickRoughness(saturate(dot(normal, viewDirection)),
-                                                           reflectionF0, environmentRoughness);
+        float nDotView = saturate(dot(normal, viewDirection));
+        float3 reflectionWeight;
+        if (globalLightMode == 1)
+        {
+            float2 environmentBrdf = sampleEnvironmentBrdf(nDotView, environmentRoughness);
+            reflectionWeight = reflectionF0 * environmentBrdf.x + environmentBrdf.y;
+        }
+        else
+            reflectionWeight = fresnelSchlickRoughness(nDotView, reflectionF0, environmentRoughness);
         float clearcoatBaseAttenuation = 1.0 - surface.clearcoat *
             fresnelSchlick(saturate(dot(surface.clearcoatNormal, viewDirection)), float3(0.04)).x;
         color += reflectedRadiance * reflectionWeight * clearcoatBaseAttenuation *

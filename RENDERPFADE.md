@@ -7,17 +7,19 @@ Diese Übersicht zeigt, welche Daten beide Backends teilen und wo sich Vulkan un
 ```mermaid
 flowchart LR
     Model["Modell über IFileOpenDialog"] --> Assimp["Assimp-Import"]
-    Assimp --> Scene["Gemeinsame CPU-Szene<br/>Meshes, Instanzen, GpuMaterial"]
-    Assimp --> Textures["Inhalts- und farbraumbewusster<br/>CPU-Texturcache mit Mips"]
+    Assimp --> Scene["Gemeinsame CPU-Szene<br/>Meshes, Instanzen, Lichter, GpuMaterial"]
+    Assimp --> Textures["CPU-Texturcache mit Mips,<br/>UV0/UV1, UV-Transform und Sampler"]
     Scene --> Meshopt["meshoptimizer<br/>Remap, Cache, Meshlets, Bounds, LODs"]
     HDR["Radiance HDR über IFileOpenDialog"] --> STB["stb_image<br/>Float-Decodierung"]
-    STB --> Mips["HDR-Mip-Pyramide<br/>Diffuse und spiegelnde IBL"]
+    STB --> Mips["HDR-Mips und Importance-CDF"]
+    Mips --> IBL["Vulkan-IBL-Atlas<br/>Irradiance, GGX-Mips, BRDF-LUT"]
     Meshopt --> VulkanData["Vulkan-Ressourcen"]
     Meshopt --> OptixData["CUDA-/OptiX-Ressourcen"]
     Textures --> VulkanData
     Textures --> OptixData
     Mips --> VulkanData
     Mips --> OptixData
+    IBL --> VulkanData
 ```
 
 Die optionale meshoptimizer-Einstellung schaltet zusätzliche Remap-, Cache-, Overdraw-, Vertex-Fetch-, Bounds- und LOD-Verarbeitung. Die Meshlet-Partitionierung bleibt für den Vulkan-Mesh-Shader-Pfad immer aktiv.
@@ -38,7 +40,7 @@ flowchart TD
 
     Mesh --> Fragment["Fragment-Shader<br/>gemeinsame modulare PBR-Auswertung"]
     TLAS --> Queries["Inline Ray Queries<br/>Schatten und optionale Reflexionen"]
-    Light["Richtungslicht,<br/>prozeduraler Himmel oder HDR"] --> Fragment
+    Light["Richtungs-/Punkt-/Spot-/Flächenlicht,<br/>emissive Meshes, Sky oder HDR-IBL"] --> Fragment
     Queries --> Fragment
     Fragment --> Approx["Begrenzte Echtzeitapproximationen<br/>Transmission, SSS, Volumen"]
     Approx --> Denoise{"Vulkan-Denoiser aktiv?"}
@@ -46,7 +48,7 @@ flowchart TD
     Denoise -->|Ja| HDRImage["Lineares Vulkan-Offscreenbild<br/>RGBA16F"]
     HDRImage --> ExtHalf["Vulkan Image → exportierter<br/>persistenter HALF4-Buffer"]
     ExtHalf --> WaitCuda["External Semaphore<br/>Vulkan signalisiert CUDA"]
-    WaitCuda --> OptixDenoiser["OptiX AI Denoiser<br/>HALF4 → HALF4"]
+    WaitCuda --> OptixDenoiser["Temporaler OptiX AI Denoiser<br/>HALF4 + GPU-History → HALF4"]
     OptixDenoiser --> CudaTone["CUDA/OptiX Tone Mapping<br/>gepacktes RGBA8"]
     CudaTone --> WaitVk["External Semaphore<br/>CUDA signalisiert Vulkan"]
     WaitVk --> CopyVk["Vulkan Buffer → Swapchain"]
@@ -60,11 +62,12 @@ Wichtige Eigenschaften:
 
 - Der Pfad erzeugt jeden Frame direkt und akkumuliert nicht progressiv.
 - `Samples per frame` und `Max bounces` haben deshalb im Vulkan-Pfad keine Wirkung.
-- HDR-Roughness wird über die Mip-Pyramide gefiltert; das Environment überschreibt den Materialwert nicht.
+- HDR-Roughness wählt die GGX-vorgefilterte Atlasstufe und die Split-Sum-BRDF-LUT; das Environment überschreibt den Materialwert nicht.
 - Ohne Denoiser rendert und tonemappt der Fragmentshader direkt ins Swapchain-Image.
 - Mit Denoiser bleiben Denoising, Tone Mapping und Bildübergabe vollständig auf der GPU.
+- Der temporale Modus verwendet vorherige Beauty- und interne Guide-Layer; Änderungen an Kamera, Szene, Licht, Material oder Auflösung invalidieren die History.
 - Persistente External-Memory-Zuordnung und Semaphoren vermeiden CPU-Wartepunkte und Map/Unmap pro Frame.
-- Materialfaktoren werden bei UI-Änderungen als einzelner 224-Byte-Bereich in den device-local Materialbuffer übertragen.
+- Materialfaktoren werden bei UI-Änderungen als einzelner 240-Byte-Bereich in den device-local Materialbuffer übertragen.
 - Debugansichten greifen vor der Beleuchtung auf dieselben aufgelösten `SurfaceData` wie das Beauty-Rendering zu.
 
 ## OptiX: progressiver Pathtracer

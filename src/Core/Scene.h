@@ -20,6 +20,7 @@ struct Vertex
     Vec3 normal{0.0f, 1.0f, 0.0f};
     Vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f};
     Vec2 uv{};
+    Vec2 uv1{};
 };
 
 struct Meshlet
@@ -57,6 +58,13 @@ enum class AlphaMode : std::uint32_t
     Blend,
 };
 
+enum class TextureAddressMode : std::uint32_t
+{
+    Repeat,
+    Clamp,
+    Mirror,
+};
+
 struct TextureReference
 {
     std::filesystem::path path;
@@ -66,12 +74,21 @@ struct TextureReference
     std::uint32_t mipCount{};
     std::vector<std::uint32_t> mipOffsets;
     std::vector<std::uint8_t> rgba8Pixels;
+    std::uint32_t uvSet{};
+    Vec2 uvScale{1.0f, 1.0f};
+    Vec2 uvOffset{};
+    float uvRotation{};
+    TextureAddressMode addressU{TextureAddressMode::Repeat};
+    TextureAddressMode addressV{TextureAddressMode::Repeat};
 
     [[nodiscard]] bool valid() const
     {
         return width > 0 && height > 0 && mipCount > 0 && mipOffsets.size() == mipCount &&
                !rgba8Pixels.empty();
     }
+
+
+    [[nodiscard]] GpuTextureMetadata toGpuMetadata() const;
 };
 
 struct Material
@@ -152,6 +169,9 @@ struct Light
     Vec3 direction{0.45f, -0.85f, -0.3f};
     float innerCone{0.5f};
     float outerCone{0.7f};
+    Vec2 areaSize{1.0f, 1.0f};
+
+    [[nodiscard]] GpuLight toGpu() const;
 };
 
 enum class GlobalLightMode : std::uint32_t
@@ -163,9 +183,14 @@ enum class GlobalLightMode : std::uint32_t
 
 struct Environment
 {
+    static constexpr std::uint32_t kIblAtlasWidth = 512;
+    static constexpr std::uint32_t kIblAtlasHeight = 256;
+
     GlobalLightMode mode{GlobalLightMode::Directional};
     std::filesystem::path hdrPath;
     std::vector<Vec4> hdrPixels;
+    // Vulkan-ready IBL atlas: GGX specular levels, cosine irradiance, and split-sum BRDF LUT.
+    std::vector<Vec4> iblPixels;
     std::vector<float> hdrConditionalCdf;
     std::vector<float> hdrMarginalCdf;
     float hdrImportanceTotal{};
@@ -193,6 +218,11 @@ struct Environment
             height = std::max(height / 2, 1u);
         }
         return hdrPixels.size() == expectedPixels;
+    }
+
+    [[nodiscard]] bool hasIbl() const
+    {
+        return iblPixels.size() == static_cast<std::size_t>(kIblAtlasWidth) * kIblAtlasHeight;
     }
 };
 

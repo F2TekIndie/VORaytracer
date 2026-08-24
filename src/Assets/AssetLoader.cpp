@@ -19,6 +19,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <span>
 #include <unordered_map>
 
 namespace vor
@@ -33,6 +34,20 @@ Mat4 toMat4(const aiMatrix4x4& source)
                 source.a3, source.b3, source.c3, source.d3,
                 source.a4, source.b4, source.c4, source.d4};
     return result;
+}
+
+Vec3 transformPoint(const Mat4& transform, Vec3 point)
+{
+    return {transform.m[0] * point.x + transform.m[4] * point.y + transform.m[8] * point.z + transform.m[12],
+            transform.m[1] * point.x + transform.m[5] * point.y + transform.m[9] * point.z + transform.m[13],
+            transform.m[2] * point.x + transform.m[6] * point.y + transform.m[10] * point.z + transform.m[14]};
+}
+
+Vec3 transformVector(const Mat4& transform, Vec3 vector)
+{
+    return normalize({transform.m[0] * vector.x + transform.m[4] * vector.y + transform.m[8] * vector.z,
+                      transform.m[1] * vector.x + transform.m[5] * vector.y + transform.m[9] * vector.z,
+                      transform.m[2] * vector.x + transform.m[6] * vector.y + transform.m[10] * vector.z});
 }
 
 Vec4 toColor(const aiColor4D& color)
@@ -91,6 +106,197 @@ float linearToSrgb(float value)
 std::uint8_t toByte(float value)
 {
     return static_cast<std::uint8_t>(std::clamp(value * 255.0f + 0.5f, 0.0f, 255.0f));
+}
+
+float radicalInverse(std::uint32_t bits)
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xaaaaaaaau) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xccccccccu) >> 2u);
+    bits = ((bits & 0x0f0f0f0fu) << 4u) | ((bits & 0xf0f0f0f0u) >> 4u);
+    bits = ((bits & 0x00ff00ffu) << 8u) | ((bits & 0xff00ff00u) >> 8u);
+    return static_cast<float>(bits) * 2.3283064365386963e-10f;
+}
+
+Vec2 hammersley(std::uint32_t index, std::uint32_t count)
+{
+    return {static_cast<float>(index) / static_cast<float>(count), radicalInverse(index)};
+}
+
+Vec3 equirectDirection(float u, float v)
+{
+    const float phi = (u - 0.5f) * 2.0f * kPi;
+    const float theta = v * kPi;
+    const float sineTheta = std::sin(theta);
+    return {std::cos(phi) * sineTheta, std::cos(theta), std::sin(phi) * sineTheta};
+}
+
+Vec3 sampleHdrBilinear(std::span<const Vec4> pixels, std::uint32_t width, std::uint32_t height, Vec3 direction)
+{
+    direction = normalize(direction);
+    float u = std::atan2(direction.z, direction.x) / (2.0f * kPi) + 0.5f;
+    u -= std::floor(u);
+    const float v = std::acos(std::clamp(direction.y, -1.0f, 1.0f)) / kPi;
+    const float x = u * static_cast<float>(width) - 0.5f;
+    const float y = v * static_cast<float>(height) - 0.5f;
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0, static_cast<int>(height) - 1);
+    const int y1 = std::min(y0 + 1, static_cast<int>(height) - 1);
+    const float tx = x - std::floor(x);
+    const float ty = y - std::floor(y);
+    const auto at = [&](int sourceX, int sourceY) {
+        sourceX %= static_cast<int>(width);
+        if (sourceX < 0)
+            sourceX += static_cast<int>(width);
+        const Vec4& value = pixels[static_cast<std::size_t>(sourceY) * width + sourceX];
+        return Vec3{value.x, value.y, value.z};
+    };
+    const Vec3 top = at(x0, y0) * (1.0f - tx) + at(x0 + 1, y0) * tx;
+    const Vec3 bottom = at(x0, y1) * (1.0f - tx) + at(x0 + 1, y1) * tx;
+    return top * (1.0f - ty) + bottom * ty;
+}
+
+Vec3 toWorld(Vec3 local, Vec3 normal)
+{
+    const Vec3 helper = std::abs(normal.y) < 0.999f ? Vec3{0.0f, 1.0f, 0.0f}
+                                                     : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(helper, normal));
+    const Vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * local.x + normal * local.y + bitangent * local.z);
+}
+
+Vec3 importanceSampleGgx(Vec2 sample, float roughness, Vec3 normal)
+{
+    const float alpha = std::max(roughness * roughness, 1.0e-4f);
+    const float alphaSquared = alpha * alpha;
+    const float phi = 2.0f * kPi * sample.x;
+    const float cosineTheta = std::sqrt((1.0f - sample.y) /
+                                        (1.0f + (alphaSquared - 1.0f) * sample.y));
+    const float sineTheta = std::sqrt(std::max(1.0f - cosineTheta * cosineTheta, 0.0f));
+    return toWorld({std::cos(phi) * sineTheta, cosineTheta, std::sin(phi) * sineTheta}, normal);
+}
+
+float geometrySchlickGgxIbl(float nDotDirection, float roughness)
+{
+    const float k = roughness * roughness * 0.5f;
+    return nDotDirection / std::max(nDotDirection * (1.0f - k) + k, 1.0e-6f);
+}
+
+void generateIblAtlas(Environment& environment)
+{
+    constexpr std::uint32_t atlasWidth = Environment::kIblAtlasWidth;
+    constexpr std::uint32_t atlasHeight = Environment::kIblAtlasHeight;
+    constexpr std::uint32_t specularWidth = 256;
+    constexpr std::uint32_t specularHeight = 128;
+    constexpr std::uint32_t specularMipCount = 9;
+    constexpr std::uint32_t irradianceWidth = 64;
+    constexpr std::uint32_t irradianceHeight = 32;
+    constexpr std::uint32_t brdfSize = 128;
+    constexpr std::uint32_t diffuseSamples = 128;
+    constexpr std::uint32_t specularSamples = 96;
+    constexpr std::uint32_t brdfSamples = 128;
+
+    const std::span<const Vec4> source(environment.hdrPixels.data(),
+                                       static_cast<std::size_t>(environment.hdrWidth) * environment.hdrHeight);
+    environment.iblPixels.assign(static_cast<std::size_t>(atlasWidth) * atlasHeight, Vec4{});
+    const auto store = [&](std::uint32_t x, std::uint32_t y, Vec3 value) {
+        environment.iblPixels[static_cast<std::size_t>(y) * atlasWidth + x] =
+            {std::max(value.x, 0.0f), std::max(value.y, 0.0f), std::max(value.z, 0.0f), 1.0f};
+    };
+
+    // Cosine-weighted samples directly estimate irradiance divided by PI, matching Lambert albedo below.
+    for (std::uint32_t y = 0; y < irradianceHeight; ++y)
+    {
+        for (std::uint32_t x = 0; x < irradianceWidth; ++x)
+        {
+            const Vec3 normal = equirectDirection((static_cast<float>(x) + 0.5f) / irradianceWidth,
+                                                   (static_cast<float>(y) + 0.5f) / irradianceHeight);
+            Vec3 irradiance{};
+            for (std::uint32_t sampleIndex = 0; sampleIndex < diffuseSamples; ++sampleIndex)
+            {
+                const Vec2 sample = hammersley(sampleIndex, diffuseSamples);
+                const float radius = std::sqrt(sample.y);
+                const float phi = 2.0f * kPi * sample.x;
+                const Vec3 direction = toWorld({radius * std::cos(phi), std::sqrt(1.0f - sample.y),
+                                                radius * std::sin(phi)}, normal);
+                irradiance = irradiance + sampleHdrBilinear(source, environment.hdrWidth,
+                                                            environment.hdrHeight, direction);
+            }
+            store(256 + x, 64 + y, irradiance / static_cast<float>(diffuseSamples));
+        }
+    }
+
+    // GGX-prefiltered specular levels are packed left-to-right across the atlas top.
+    for (std::uint32_t mip = 0; mip < specularMipCount; ++mip)
+    {
+        const std::uint32_t width = std::max(specularWidth >> mip, 1u);
+        const std::uint32_t height = std::max(specularHeight >> mip, 1u);
+        const std::uint32_t offsetX = mip == 0 ? 0u : atlasWidth - (atlasWidth >> mip);
+        const float roughness = static_cast<float>(mip) / static_cast<float>(specularMipCount - 1);
+        for (std::uint32_t y = 0; y < height; ++y)
+        {
+            for (std::uint32_t x = 0; x < width; ++x)
+            {
+                const Vec3 reflection = equirectDirection((static_cast<float>(x) + 0.5f) / width,
+                                                           (static_cast<float>(y) + 0.5f) / height);
+                if (mip == 0)
+                {
+                    store(offsetX + x, y, sampleHdrBilinear(source, environment.hdrWidth,
+                                                            environment.hdrHeight, reflection));
+                    continue;
+                }
+                Vec3 radiance{};
+                float totalWeight = 0.0f;
+                for (std::uint32_t sampleIndex = 0; sampleIndex < specularSamples; ++sampleIndex)
+                {
+                    const Vec3 halfVector = importanceSampleGgx(hammersley(sampleIndex, specularSamples),
+                                                               roughness, reflection);
+                    const Vec3 light = normalize(halfVector * (2.0f * dot(reflection, halfVector)) - reflection);
+                    const float nDotLight = std::max(dot(reflection, light), 0.0f);
+                    if (nDotLight > 0.0f)
+                    {
+                        radiance = radiance + sampleHdrBilinear(source, environment.hdrWidth,
+                                                                environment.hdrHeight, light) * nDotLight;
+                        totalWeight += nDotLight;
+                    }
+                }
+                store(offsetX + x, y, radiance / std::max(totalWeight, 1.0e-6f));
+            }
+        }
+    }
+
+    // Split-sum environment BRDF integration (R=scale, G=bias).
+    for (std::uint32_t y = 0; y < brdfSize; ++y)
+    {
+        const float roughness = (static_cast<float>(y) + 0.5f) / brdfSize;
+        for (std::uint32_t x = 0; x < brdfSize; ++x)
+        {
+            const float nDotView = (static_cast<float>(x) + 0.5f) / brdfSize;
+            const Vec3 view{std::sqrt(std::max(1.0f - nDotView * nDotView, 0.0f)), nDotView, 0.0f};
+            float scale = 0.0f;
+            float bias = 0.0f;
+            for (std::uint32_t sampleIndex = 0; sampleIndex < brdfSamples; ++sampleIndex)
+            {
+                const Vec3 halfVector = importanceSampleGgx(hammersley(sampleIndex, brdfSamples), roughness,
+                                                            {0.0f, 1.0f, 0.0f});
+                const Vec3 light = normalize(halfVector * (2.0f * dot(view, halfVector)) - view);
+                const float nDotLight = std::max(light.y, 0.0f);
+                const float nDotHalf = std::max(halfVector.y, 0.0f);
+                const float viewDotHalf = std::max(dot(view, halfVector), 0.0f);
+                if (nDotLight <= 0.0f)
+                    continue;
+                const float geometry = geometrySchlickGgxIbl(nDotView, roughness) *
+                                       geometrySchlickGgxIbl(nDotLight, roughness);
+                const float visibility = geometry * viewDotHalf /
+                                         std::max(nDotHalf * nDotView, 1.0e-6f);
+                const float fresnel = std::pow(1.0f - viewDotHalf, 5.0f);
+                scale += (1.0f - fresnel) * visibility;
+                bias += fresnel * visibility;
+            }
+            environment.iblPixels[static_cast<std::size_t>(128 + y) * atlasWidth + 256 + x] =
+                {scale / brdfSamples, bias / brdfSamples, 0.0f, 1.0f};
+        }
+    }
 }
 
 void generateTextureMips(TextureReference& texture, std::vector<std::uint8_t> basePixels)
@@ -213,9 +419,23 @@ std::int32_t addTexture(Scene& scene, const aiScene* imported, const std::filesy
                         aiMaterial* material, aiTextureType type, bool srgb, unsigned textureIndex = 0)
 {
     aiString texturePath;
+    aiTextureMapping mapping = aiTextureMapping_UV;
+    unsigned uvIndex = 0;
+    aiTextureMapMode mapModes[3]{aiTextureMapMode_Wrap, aiTextureMapMode_Wrap, aiTextureMapMode_Wrap};
     if (material->GetTextureCount(type) <= textureIndex ||
-        material->GetTexture(type, textureIndex, &texturePath) != AI_SUCCESS)
+        material->GetTexture(type, textureIndex, &texturePath, &mapping, &uvIndex, nullptr, nullptr, mapModes) !=
+            AI_SUCCESS)
         return -1;
+    if (mapping != aiTextureMapping_UV)
+        uvIndex = 0;
+    aiUVTransform uvTransform{};
+    material->Get(AI_MATKEY_UVTRANSFORM(type, textureIndex), uvTransform);
+    const auto addressMode = [](aiTextureMapMode mode) {
+        return mode == aiTextureMapMode_Clamp || mode == aiTextureMapMode_Decal
+                   ? TextureAddressMode::Clamp
+               : mode == aiTextureMapMode_Mirror ? TextureAddressMode::Mirror
+                                                  : TextureAddressMode::Repeat;
+    };
 
     const std::string assimpPath = texturePath.C_Str();
     std::filesystem::path resolved = std::filesystem::path(assimpPath);
@@ -223,8 +443,15 @@ std::int32_t addTexture(Scene& scene, const aiScene* imported, const std::filesy
         resolved = basePath / resolved;
     resolved = resolved.lexically_normal();
 
+    const auto bindingMatches = [&](const TextureReference& value) {
+        return value.srgb == srgb && value.uvSet == std::min(uvIndex, 1u) &&
+               value.uvScale.x == uvTransform.mScaling.x && value.uvScale.y == uvTransform.mScaling.y &&
+               value.uvOffset.x == uvTransform.mTranslation.x && value.uvOffset.y == uvTransform.mTranslation.y &&
+               value.uvRotation == uvTransform.mRotation && value.addressU == addressMode(mapModes[0]) &&
+               value.addressV == addressMode(mapModes[1]);
+    };
     const auto found = std::find_if(scene.textures.begin(), scene.textures.end(), [&](const TextureReference& value) {
-        return value.path == resolved && value.srgb == srgb;
+        return value.path == resolved && bindingMatches(value);
     });
     if (found != scene.textures.end())
         return static_cast<std::int32_t>(std::distance(scene.textures.begin(), found));
@@ -232,6 +459,12 @@ std::int32_t addTexture(Scene& scene, const aiScene* imported, const std::filesy
     TextureReference texture{};
     texture.path = resolved;
     texture.srgb = srgb;
+    texture.uvSet = std::min(uvIndex, 1u);
+    texture.uvScale = {uvTransform.mScaling.x, uvTransform.mScaling.y};
+    texture.uvOffset = {uvTransform.mTranslation.x, uvTransform.mTranslation.y};
+    texture.uvRotation = uvTransform.mRotation;
+    texture.addressU = addressMode(mapModes[0]);
+    texture.addressV = addressMode(mapModes[1]);
     if (!decodeTexture(imported, resolved, assimpPath, texture))
     {
         log(LogLevel::Warning, "Could not decode material texture '" + resolved.string() + "'");
@@ -239,7 +472,7 @@ std::int32_t addTexture(Scene& scene, const aiScene* imported, const std::filesy
     }
     const auto duplicateContent = std::find_if(scene.textures.begin(), scene.textures.end(),
                                                [&](const TextureReference& value) {
-        return value.srgb == texture.srgb && value.width == texture.width &&
+        return bindingMatches(value) && value.width == texture.width &&
                value.height == texture.height && value.mipCount == texture.mipCount &&
                value.rgba8Pixels == texture.rgba8Pixels;
     });
@@ -399,6 +632,13 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
                 const aiVector3D& uv = source->mTextureCoords[0][vertexIndex];
                 vertex.uv = {uv.x, uv.y};
             }
+            if (source->HasTextureCoords(1))
+            {
+                const aiVector3D& uv = source->mTextureCoords[1][vertexIndex];
+                vertex.uv1 = {uv.x, uv.y};
+            }
+            else
+                vertex.uv1 = vertex.uv;
         }
 
         MeshLod baseLod{};
@@ -414,9 +654,11 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
         scene.meshes.push_back(std::move(mesh));
     }
 
+    std::unordered_map<std::string, Mat4> nodeTransforms;
     std::function<void(const aiNode*, const Mat4&)> visitNode;
     visitNode = [&](const aiNode* node, const Mat4& parentTransform) {
         const Mat4 transform = parentTransform * toMat4(node->mTransformation);
+        nodeTransforms.insert_or_assign(node->mName.C_Str(), transform);
         for (unsigned index = 0; index < node->mNumMeshes; ++index)
         {
             scene.instances.push_back({node->mName.C_Str(), node->mMeshes[index], transform, transform});
@@ -425,6 +667,32 @@ AssetLoadResult AssetLoader::load(const std::filesystem::path& path, AssetLoadOp
             visitNode(node->mChildren[child], transform);
     };
     visitNode(imported->mRootNode, Mat4::identity());
+
+    scene.lights.reserve(imported->mNumLights);
+    for (unsigned lightIndex = 0; lightIndex < imported->mNumLights; ++lightIndex)
+    {
+        const aiLight& source = *imported->mLights[lightIndex];
+        if (source.mType == aiLightSource_AMBIENT || source.mType == aiLightSource_UNDEFINED)
+            continue;
+        const auto transformIt = nodeTransforms.find(source.mName.C_Str());
+        const Mat4 transform = transformIt != nodeTransforms.end() ? transformIt->second : Mat4::identity();
+        Light light{};
+        light.name = source.mName.C_Str();
+        light.type = source.mType == aiLightSource_DIRECTIONAL ? LightType::Directional
+                   : source.mType == aiLightSource_SPOT ? LightType::Spot
+                   : source.mType == aiLightSource_AREA ? LightType::Area
+                                                        : LightType::Point;
+        light.position = transformPoint(transform, {source.mPosition.x, source.mPosition.y, source.mPosition.z});
+        light.direction = transformVector(transform, {source.mDirection.x, source.mDirection.y,
+                                                       source.mDirection.z});
+        light.color = {std::max(source.mColorDiffuse.r, 0.0f), std::max(source.mColorDiffuse.g, 0.0f),
+                       std::max(source.mColorDiffuse.b, 0.0f)};
+        light.intensity = 1.0f;
+        light.innerCone = std::max(source.mAngleInnerCone, 0.0f);
+        light.outerCone = std::max(source.mAngleOuterCone, light.innerCone);
+        light.areaSize = {std::max(source.mSize.x, 0.001f), std::max(source.mSize.y, 0.001f)};
+        scene.lights.push_back(light);
+    }
 
     if (scene.lights.empty())
         scene.lights.push_back(Light{.name = "Sun", .type = LightType::Directional});
@@ -546,6 +814,7 @@ bool AssetLoader::loadHdrEnvironment(const std::filesystem::path& path,
     environment.hdrConditionalCdf = std::move(conditionalCdf);
     environment.hdrMarginalCdf = std::move(marginalCdf);
     environment.hdrImportanceTotal = importanceTotal;
+    generateIblAtlas(environment);
     environment.mode = GlobalLightMode::HdrEnvironment;
     error.clear();
     return true;
@@ -833,10 +1102,11 @@ void AssetLoader::processMesh(Mesh& mesh, bool enableOptionalPasses)
         return;
 
     constexpr std::array<float, 2> lodRatios{0.5f, 0.25f};
-    constexpr std::array<float, 9> attributeWeights{
+    constexpr std::array<float, 11> attributeWeights{
         1.0f, 1.0f, 1.0f,       // normal
         0.25f, 0.25f, 0.25f, 0.1f, // tangent and handedness
-        1.0f, 1.0f,              // UV
+        1.0f, 1.0f,              // UV0
+        1.0f, 1.0f,              // UV1
     };
     const std::vector<std::uint32_t> sourceIndices = base.indices;
     for (const float ratio : lodRatios)
