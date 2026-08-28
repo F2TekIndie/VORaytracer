@@ -233,8 +233,7 @@ int Application::run()
 
         if (settings_.backend != previousBackend_)
         {
-            vulkanRenderer_.resetAccumulation();
-            optixRenderer_.resetAccumulation();
+            resetRenderHistory();
             previousBackend_ = settings_.backend;
         }
 
@@ -332,6 +331,8 @@ bool Application::initialize()
         settings_.denoiser = true;
     if (const char* requestedTemporal = std::getenv("VOR_TEMPORAL_RENDERING"); requestedTemporal)
         settings_.temporalRendering = std::strcmp(requestedTemporal, "0") != 0;
+    if (const char* requestedAdaptive = std::getenv("VOR_ADAPTIVE_SAMPLING"); requestedAdaptive)
+        settings_.adaptiveSampling = std::strcmp(requestedAdaptive, "0") != 0;
     if (const char* requestedMeshletDebug = std::getenv("VOR_MESHLET_DEBUG");
         requestedMeshletDebug && std::strcmp(requestedMeshletDebug, "1") == 0)
         settings_.showMeshlets = true;
@@ -583,8 +584,7 @@ void Application::drawScenePanel()
     {
         defaultPlasticEnabled_ = !defaultPlasticEnabled_;
         AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
-        vulkanRenderer_.resetAccumulation();
-        optixRenderer_.resetAccumulation();
+        resetRenderHistory();
         statusMessage_ = std::string("Material override: Default Plastic ") +
                          (defaultPlasticEnabled_ ? "ON" : "OFF");
     }
@@ -755,8 +755,7 @@ void Application::drawMaterialEditor()
         }
         else
         {
-            vulkanRenderer_.resetAccumulation();
-            optixRenderer_.resetAccumulation();
+            resetRenderHistory();
         }
         statusMessage_ = "Updated material GPU data: " + material.name;
     }
@@ -782,7 +781,21 @@ void Application::drawRenderPanel()
     ImGui::SeparatorText("PBR / Ray tracing");
     if (settings_.backend != BackendKind::Optix)
         ImGui::BeginDisabled();
-    ImGui::SliderInt("Samples/frame", reinterpret_cast<int*>(&settings_.samplesPerFrame), 1, 16);
+    if (ImGui::SliderInt("Samples/frame", reinterpret_cast<int*>(&settings_.samplesPerFrame), 1, 16))
+        optixRenderer_.resetAccumulation();
+    if (ImGui::Checkbox("Adaptive sampling", &settings_.adaptiveSampling))
+        optixRenderer_.resetAccumulation();
+    if (!settings_.adaptiveSampling)
+        ImGui::BeginDisabled();
+    bool adaptiveChanged = ImGui::SliderInt("Adaptive minimum samples",
+                                            reinterpret_cast<int*>(&settings_.adaptiveMinSamples), 2, 256);
+    adaptiveChanged |= ImGui::SliderFloat("Adaptive noise threshold",
+                                          &settings_.adaptiveNoiseThreshold, 0.002f, 0.10f, "%.3f",
+                                          ImGuiSliderFlags_Logarithmic);
+    if (!settings_.adaptiveSampling)
+        ImGui::EndDisabled();
+    if (adaptiveChanged)
+        optixRenderer_.resetAccumulation();
     if (ImGui::SliderInt("Max bounces", reinterpret_cast<int*>(&settings_.maxBounces), 1, 16))
         optixRenderer_.resetAccumulation();
     if (settings_.backend != BackendKind::Optix)
@@ -790,24 +803,22 @@ void Application::drawRenderPanel()
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("OptiX path-tracing setting. Vulkan uses a fixed real-time Ray Query budget.");
     ImGui::SliderFloat("Exposure", &settings_.exposure, -8.0f, 8.0f);
-    ImGui::Checkbox("Ray-traced shadows", &settings_.rayTracedShadows);
+    if (ImGui::Checkbox("Ray-traced shadows", &settings_.rayTracedShadows))
+        resetRenderHistory();
     if (ImGui::Checkbox("Ray-traced reflections", &settings_.rayTracedReflections))
-    {
-        vulkanRenderer_.resetAccumulation();
-        optixRenderer_.resetAccumulation();
-    }
+        resetRenderHistory();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Vulkan: one inline Ray Query reflection.\nOptiX: rough PBR reflection paths up to Max bounces.");
     if (ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting))
-        resetCameraAccumulation();
+        resetRenderHistory();
     if (settings_.backend != BackendKind::VulkanHybrid || !optixRenderer_.available())
         ImGui::BeginDisabled();
     if (ImGui::Checkbox("Vulkan post-render denoiser", &settings_.denoiser))
-        resetCameraAccumulation();
+        resetRenderHistory();
     if (!settings_.denoiser)
         ImGui::BeginDisabled();
     if (ImGui::Checkbox("Temporal stabilization", &settings_.temporalRendering))
-        resetCameraAccumulation();
+        resetRenderHistory();
     if (!settings_.denoiser)
         ImGui::EndDisabled();
     if (settings_.backend != BackendKind::VulkanHybrid || !optixRenderer_.available())
@@ -831,7 +842,7 @@ void Application::drawRenderPanel()
                      static_cast<int>(std::size(debugViewNames))))
     {
         settings_.debugView = static_cast<DebugView>(debugView);
-        resetCameraAccumulation();
+        resetRenderHistory();
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Shared material diagnostics. Vulkan transmission, subsurface and volume views show the documented real-time approximations.");
@@ -850,7 +861,7 @@ void Application::drawRenderPanel()
     if (environmentChanged)
     {
         scene_.environment.mode = static_cast<GlobalLightMode>(globalLightMode);
-        resetCameraAccumulation();
+        resetRenderHistory();
     }
     if (scene_.environment.mode == GlobalLightMode::HdrEnvironment)
     {
@@ -879,7 +890,7 @@ void Application::drawRenderPanel()
     if (lightingChanged)
     {
         scene_.environment.intensity = std::max(scene_.environment.intensity, 0.0f);
-        resetCameraAccumulation();
+        resetRenderHistory();
     }
 
     ImGui::SeparatorText("Shared light transform");
@@ -894,7 +905,7 @@ void Application::drawRenderPanel()
         {
             light.intensity = std::max(light.intensity, 0.0f);
             syncGlobalLightTransform();
-            resetCameraAccumulation();
+            resetRenderHistory();
         }
     }
     ImGui::TextDisabled("Shift+LMB: rotate all light modes | Shift+MMB: pan | Shift+wheel: zoom");
@@ -982,7 +993,7 @@ void Application::loadEnvironmentFromUi()
     }
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
-    resetCameraAccumulation();
+    resetRenderHistory();
     statusMessage_ = "Loaded HDR environment " + pathToUtf8(path);
 }
 
@@ -1148,7 +1159,7 @@ void Application::frameCameraToScene()
     light.direction = normalize(lightTarget_ - light.position);
     syncGlobalLightTransform();
     light.range = radius * 10.0f;
-    resetCameraAccumulation();
+    resetRenderHistory();
 }
 
 void Application::handleCameraNavigation()
@@ -1222,7 +1233,10 @@ void Application::handleCameraNavigation()
             syncGlobalLightTransform();
             light->range = std::max(length(lightTarget_ - light->position) * 4.0f, 1.0f);
         }
-        resetCameraAccumulation();
+        if (light)
+            resetRenderHistory();
+        else
+            resetCameraAccumulation();
     }
 }
 
@@ -1243,5 +1257,12 @@ void Application::resetCameraAccumulation()
 {
     vulkanRenderer_.resetAccumulation();
     optixRenderer_.resetAccumulation();
+}
+
+void Application::resetRenderHistory()
+{
+    resetCameraAccumulation();
+    vulkanRenderer_.invalidateTemporalHistory();
+    optixRenderer_.invalidateTemporalHistory();
 }
 } // namespace vor

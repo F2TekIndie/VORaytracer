@@ -55,6 +55,14 @@ struct GpuLight
     float4 coneAndArea;
 };
 
+struct GpuLightAlias
+{
+    float probability;
+    uint alias;
+    float selectionPdf;
+    float padding;
+};
+
 struct GpuOptixInstance
 {
     float4x4 transform;
@@ -68,6 +76,8 @@ struct GpuOptixInstance
 struct LaunchParameters
 {
     RWStructuredBuffer<float4> output;
+    RWStructuredBuffer<uint> sampleCounts;
+    RWStructuredBuffer<float2> luminanceMoments;
     RWStructuredBuffer<half4> denoisedOutput;
     RWStructuredBuffer<float4> albedoGuide;
     RWStructuredBuffer<float4> normalGuide;
@@ -81,6 +91,7 @@ struct LaunchParameters
     StructuredBuffer<GpuMaterial> materials;
     StructuredBuffer<GpuEmissiveTriangle> emissiveTriangles;
     StructuredBuffer<GpuLight> lights;
+    StructuredBuffer<GpuLightAlias> lightAliases;
     StructuredBuffer<GpuTextureMetadata> textureMetadata;
     StructuredBuffer<float4> environmentPixels;
     StructuredBuffer<float> environmentConditionalCdf;
@@ -92,6 +103,10 @@ struct LaunchParameters
     uint maxBounces;
     uint samplesPerFrame;
     uint accumulatedSamples;
+    uint adaptiveSampling;
+    uint adaptiveMinSamples;
+    float adaptiveNoiseThreshold;
+    float analyticLightPowerValue;
     uint rayTracedShadows;
     uint rayTracedReflections;
     uint displayBgra;
@@ -565,19 +580,7 @@ float analyticLightPower(LaunchParameters parameters)
 {
     if (parameters.globalLightMode == 1)
         return 0.0;
-    uint count;
-    uint stride;
-    parameters.lights.GetDimensions(count, stride);
-    float power = 0.0;
-    for (uint index = 0u; index < count; ++index)
-    {
-        GpuLight light = parameters.lights[index];
-        float contribution = max(luminance(light.colorAndIntensity.xyz) * light.colorAndIntensity.w, 0.0);
-        if (uint(light.positionAndType.w + 0.5) == 3u)
-            contribution *= max(light.coneAndArea.z * light.coneAndArea.w, 1e-6);
-        power += contribution;
-    }
-    return power;
+    return max(parameters.analyticLightPowerValue, 0.0);
 }
 
 float allLightPower(LaunchParameters parameters)
@@ -694,25 +697,18 @@ AnalyticLightSample sampleAnalyticLight(LaunchParameters parameters, float3 posi
     uint count;
     uint stride;
     parameters.lights.GetDimensions(count, stride);
-    float target = randomSample.x * totalPower;
-    float accumulated = 0.0;
-    GpuLight light = parameters.lights[0];
-    float selectedPower = 0.0;
-    for (uint index = 0u; index < count; ++index)
-    {
-        GpuLight candidate = parameters.lights[index];
-        float power = max(luminance(candidate.colorAndIntensity.xyz) * candidate.colorAndIntensity.w, 0.0);
-        if (uint(candidate.positionAndType.w + 0.5) == 3u)
-            power *= max(candidate.coneAndArea.z * candidate.coneAndArea.w, 1e-6);
-        accumulated += power;
-        if (target <= accumulated || index + 1u == count)
-        {
-            light = candidate;
-            selectedPower = power;
-            break;
-        }
-    }
-    sample.selectionPdf = selectedPower / max(totalPower, 1e-8);
+    uint aliasCount;
+    uint aliasStride;
+    parameters.lightAliases.GetDimensions(aliasCount, aliasStride);
+    if (count == 0u || aliasCount == 0u)
+        return sample;
+    float scaled = min(randomSample.x, 0.99999994) * float(aliasCount);
+    uint column = min(uint(scaled), aliasCount - 1u);
+    GpuLightAlias aliasEntry = parameters.lightAliases[column];
+    uint selectedIndex = frac(scaled) < aliasEntry.probability ? column : aliasEntry.alias;
+    selectedIndex = min(selectedIndex, count - 1u);
+    GpuLight light = parameters.lights[selectedIndex];
+    sample.selectionPdf = parameters.lightAliases[selectedIndex].selectionPdf;
     uint type = uint(light.positionAndType.w + 0.5);
     sample.radiance = max(light.colorAndIntensity.xyz, 0.0) * max(light.colorAndIntensity.w, 0.0);
     if (type == 0u)
@@ -785,8 +781,18 @@ void RayGen(LaunchParameters parameters)
     float tanHalfFov = tan(parameters.cameraPositionAndFov.w * 0.5);
 
     uint linearIndex = launchIndex.y * parameters.outputSize.x + launchIndex.x;
-    uint sampleCount = max(parameters.samplesPerFrame, 1u);
-    float3 sampleSum = float3(0.0);
+    uint accumulatedPixelSamples = parameters.sampleCounts[linearIndex];
+    float2 moments = parameters.luminanceMoments[linearIndex];
+    bool converged = false;
+    if (parameters.adaptiveSampling != 0u && accumulatedPixelSamples >= max(parameters.adaptiveMinSamples, 2u))
+    {
+        float variance = moments.y / float(max(accumulatedPixelSamples - 1u, 1u));
+        float relativeStandardError = sqrt(max(variance, 0.0) / float(accumulatedPixelSamples)) /
+                                      max(abs(moments.x), 0.05);
+        converged = relativeStandardError <= max(parameters.adaptiveNoiseThreshold, 1e-5);
+    }
+    uint sampleCount = converged ? 0u : max(parameters.samplesPerFrame, 1u);
+    float3 current = accumulatedPixelSamples > 0u ? parameters.output[linearIndex].xyz : float3(0.0);
     float3 guideAlbedo = float3(0.0);
     float3 guideNormal = float3(0.0);
     for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
@@ -1238,16 +1244,15 @@ void RayGen(LaunchParameters parameters)
             float depth = float(diagnosticPathDepth) / float(max(bounceLimit, 1u));
             sampleRadiance = float3(depth, depth * depth, 1.0 - depth);
         }
-        sampleSum += sampleRadiance;
+        ++accumulatedPixelSamples;
+        current += (sampleRadiance - current) / float(accumulatedPixelSamples);
+        float sampleLuminance = luminance(sampleRadiance);
+        float luminanceDelta = sampleLuminance - moments.x;
+        moments.x += luminanceDelta / float(accumulatedPixelSamples);
+        moments.y += luminanceDelta * (sampleLuminance - moments.x);
     }
-
-    float3 current = sampleSum / float(sampleCount);
-    if (parameters.accumulatedSamples > 0)
-    {
-        float3 previous = parameters.output[linearIndex].xyz;
-        float weight = float(sampleCount) / float(parameters.accumulatedSamples + sampleCount);
-        current = lerp(previous, current, weight);
-    }
+    parameters.sampleCounts[linearIndex] = accumulatedPixelSamples;
+    parameters.luminanceMoments[linearIndex] = moments;
     parameters.output[linearIndex] = float4(current, 1.0);
     if (parameters.writeDisplay == 0)
     {

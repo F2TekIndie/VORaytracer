@@ -38,9 +38,10 @@ VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](
 - Richtungslicht, prozeduraler Himmel oder HDR-Environment als globale Beleuchtung
 - vorverarbeitetes, roughnessabhängiges Vulkan-HDR-IBL mit Cosine-Irradiance, GGX-Prefilterung und Split-Sum-BRDF-LUT
 - gemeinsame direkte Beleuchtung durch Richtungs-, Punkt-, Spot-, Flächen- und emissive Dreieckslichter in Vulkan und OptiX
-- optionaler temporaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Ein- und Ausgabe
+- optionaler temporaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Beauty, echten Bewegungsvektoren sowie Albedo-, Normal- und Tiefen-Guides aus einem MRT-Pass
 - CUDA/Vulkan-External-Memory- und Semaphore-Interop ohne Bildkopie zur CPU
-- progressiver OptiX-Pathtracer mit GGX-VNDF, NEE/MIS für HDR, Richtungs- und Mesh-Lichter, Medium-Stack, Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
+- progressiver OptiX-Pathtracer mit per-Pixel-adaptivem Sampling, GGX-VNDF, NEE/MIS für HDR, Richtungs- und Mesh-Lichter, Medium-Stack, Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
+- leistungsgewichtete Walker-Alias-Tabellen wählen analytische Lichter in Vulkan und OptiX in O(1); emissive Dreiecke verwenden weiterhin ihre logarithmische CDF-Auswahl
 - wiederverwendbare OptiX-GAS pro Mesh und IAS-Szeneninstanzen ohne Geometrie-Flattening
 - standardisiertes hellgraues Kunststoffmaterial als nichtdestruktive Laufzeitüberschreibung
 - ein- und ausblendbare Bodenebene mit Standardkunststoffmaterial
@@ -120,7 +121,8 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 - `Meshlet debug colors`: Zeigt im Vulkan-Pfad eine stabile Zufallsfarbe pro Meshlet.
 - `Ray-traced reflections`: Aktiviert Vulkan-Reflexions-Ray-Queries; im OptiX-Pfad steuert die Option die reflektierenden Sekundärpfade.
 - `Indirect lighting`: Schaltet die globale Beleuchtung durch HDR, prozeduralen Himmel oder Richtungslicht entsprechend der aktiven Konfiguration.
-- `Temporal stabilization`: Verwendet im Vulkan-Postrender-Denoiser das vorherige denoisierte Bild und die internen OptiX-History-Layer. Kamera-, Material-, Licht-, Szenen- und Größenänderungen beginnen eine neue Sequenz.
+- `Temporal stabilization`: Reprojiziert die Vulkan-Denoiser-History mit echten Pixel-Bewegungsvektoren. Szenen-, Material- und Größenänderungen beginnen eine neue Sequenz.
+- `Adaptive sampling`: Beendet im OptiX-Pfad die Abtastung konvergierter Pixel anhand ihres relativen Standardfehlers; Mindest-Samplezahl und Rauschschwelle sind einstellbar.
 - `Material editor`: Wählt Mesh und Material, zeigt Texturzuweisungen und bearbeitet sämtliche PBR-Faktoren. Faktoränderungen übertragen nur den betroffenen GPU-Materialeintrag; Emissionsänderungen bauen zusätzlich die Mesh-Licht-CDF neu auf.
 - `Debug view`: Zeigt Base Color, Metallic, Roughness, Normalen, Tangenten, AO, Emission, einzelne Loben, PDF, IDs, Medium und OptiX-Pfadtiefe.
 
@@ -130,11 +132,11 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 
 Vulkan ist kein progressiver Pathtracer. Jeder Frame wird direkt über Task-/Mesh-Shader, PBR-Fragmentauswertung und optionale Inline Ray Queries erzeugt. Deshalb gelten `Samples per frame` und `Max bounces` nicht für diesen Pfad. Der optionale Denoiser wird ausschließlich nach dem Vulkan-Rendering ausgeführt.
 
-Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Beim Laden entstehen ein Cosine-Irradiance-Atlas, GGX-vorgefilterte Roughness-Stufen und eine Split-Sum-BRDF-LUT; der Fragmentshader führt dadurch keine teure Environment-Faltung pro Pixel aus. Roughness wählt die GGX-Stufe und wird nicht vom HDR überschrieben. Alpha-Blend-Materialien verwenden sortierunabhängige dithered Coverage mit regulärem Depth-Write. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Nur der Denoiser-Pfad verwendet vorher ein lineares `RGBA16F`-Offscreenbild und `HALF4`-Interop. Die optionale temporale Stabilisierung hält vorherige Beauty- und interne Guide-Layer vollständig auf der GPU; während Kamerabewegungen wird die History bewusst verworfen, sodass keine veralteten Bildbereiche nachgezogen werden.
+Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Beim Laden entstehen ein Cosine-Irradiance-Atlas, GGX-vorgefilterte Roughness-Stufen und eine Split-Sum-BRDF-LUT; der Fragmentshader führt dadurch keine teure Environment-Faltung pro Pixel aus. Roughness wählt die GGX-Stufe und wird nicht vom HDR überschrieben. Alpha-Blend-Materialien verwenden sortierunabhängige dithered Coverage mit regulärem Depth-Write. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Der Denoiser-Pfad erzeugt Beauty, Pixel-Flow, Diffuse-Albedo und Welt-Normale plus Tiefe in einem MRT-Pass und schreibt alle Ebenen direkt in den CUDA/Vulkan-Interop-Speicher. Die temporale History bleibt dadurch auch während Kamerabewegungen reprojizierbar.
 
 ### OptiX
 
-OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Ray-Cone-Footprints wählen die Mip-Level der CUDA-Texturen. Reflexions- und indirekte Transportloben werden entsprechend ihrer UI-Schalter mit jeweils konsistenter Evaluation und PDF gesampelt. Subsurface verwendet einen instanzgebundenen, begrenzten Random Walk. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
+OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Per-Pixel-Samplezähler und Welford-Luminanzmomente überspringen konvergierte Pixel ohne CPU-Rücklesung oder globale Synchronisation. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Ray-Cone-Footprints wählen die Mip-Level der CUDA-Texturen. Reflexions- und indirekte Transportloben werden entsprechend ihrer UI-Schalter mit jeweils konsistenter Evaluation und PDF gesampelt. Subsurface verwendet einen instanzgebundenen, begrenzten Random Walk. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
 Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enthält die Szeneninstanzen und ihre Transformationen.
 
 ## Umgebungsvariablen für Smoke-Tests
@@ -144,6 +146,7 @@ Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enth�
 | `VOR_BACKEND=optix` | startet mit OptiX statt Vulkan |
 | `VOR_DENOISER=1` | aktiviert den Vulkan-Postrender-Denoiser |
 | `VOR_TEMPORAL_RENDERING=0` | deaktiviert dessen zeitliche History und verwendet nur den aktuellen Frame |
+| `VOR_ADAPTIVE_SAMPLING=0` | deaktiviert die per-Pixel-Konvergenzprüfung des OptiX-Pathtracers |
 | `VOR_SCENE=<absoluter Pfad>` | lädt beim Start ein Modell |
 | `VOR_MESHLET_DEBUG=1` | aktiviert die Meshlet-Debugfarben |
 | `VOR_REFLECTIONS=0` | deaktiviert reflektierende Sekundärpfade für automatisierte Tests |

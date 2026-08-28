@@ -42,6 +42,7 @@ public:
     bool createGpuInteropSurface(std::uint32_t width, std::uint32_t height);
     void destroyGpuInteropSurface();
     [[nodiscard]] const GpuInteropSurface& gpuInteropSurface() const { return gpuInteropSurfaceInfo_; }
+    void invalidateTemporalHistory() { temporalHistoryValid_ = false; }
     void setGpuInteropFrameReady(bool ready) { gpuInteropFrameReady_ = ready; }
     [[nodiscard]] bool rayQueryAvailable() const { return rayQueryAvailable_; }
     [[nodiscard]] bool taskShaderAvailable() const { return taskShaderAvailable_; }
@@ -131,6 +132,16 @@ private:
     };
     static_assert(sizeof(FramePushConstants) == 256);
 
+    struct TemporalFrameData
+    {
+        Mat4 previousViewProjection{Mat4::identity()};
+        std::uint32_t historyValid{};
+        float outputWidth{1.0f};
+        float outputHeight{1.0f};
+        std::uint32_t padding{};
+    };
+    static_assert(sizeof(TemporalFrameData) == 80);
+
     bool createInstance();
     bool createSurface();
     bool selectPhysicalDevice();
@@ -213,6 +224,8 @@ private:
     GpuBuffer sceneInstanceBuffer_{};
     GpuBuffer materialBuffer_{};
     GpuBuffer lightBuffer_{};
+    GpuBuffer lightAliasBuffer_{};
+    GpuBuffer temporalFrameBuffer_{};
     GpuBuffer emissiveTriangleBuffer_{};
     GpuBuffer textureMetadataBuffer_{};
     std::vector<GpuTexture> materialTextures_;
@@ -239,11 +252,16 @@ private:
     std::uint32_t uploadedVertexCount_{};
     std::uint32_t uploadedTriangleCount_{};
     FramePushConstants framePushConstants_{};
+    Mat4 previousViewProjection_{Mat4::identity()};
+    bool temporalHistoryValid_{};
     GpuBuffer gpuInteropBuffer_{};
     GpuBuffer captureBuffer_{};
     VkImage denoiserInputImage_{VK_NULL_HANDLE};
     VkDeviceMemory denoiserInputImageMemory_{VK_NULL_HANDLE};
     VkImageView denoiserInputImageView_{VK_NULL_HANDLE};
+    std::array<VkImage, 3> denoiserGuideImages_{};
+    std::array<VkDeviceMemory, 3> denoiserGuideImageMemories_{};
+    std::array<VkImageView, 3> denoiserGuideImageViews_{};
     VkSemaphore cudaReadySemaphore_{VK_NULL_HANDLE};
     VkSemaphore vulkanCompleteSemaphore_{VK_NULL_HANDLE};
     GpuInteropSurface gpuInteropSurfaceInfo_{};

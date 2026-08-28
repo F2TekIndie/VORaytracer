@@ -1,5 +1,6 @@
 #include "Core/Math.h"
 #include "Core/Scene.h"
+#include "Core/LightSampling.h"
 #include "Assets/AssetLoader.h"
 
 #include <meshoptimizer.h>
@@ -51,6 +52,25 @@ int main()
                 std::abs(spotGpu.coneAndArea.x - std::cos(0.25f)) < 1.0e-6f &&
                 std::abs(spotGpu.coneAndArea.y - std::cos(0.5f)) < 1.0e-6f,
             "analytic light GPU conversion");
+    const std::vector<Light> aliasLights{
+        Light{.color = {1.0f, 1.0f, 1.0f}, .intensity = 1.0f},
+        Light{.color = {1.0f, 1.0f, 1.0f}, .intensity = 3.0f},
+        Light{.type = LightType::Area, .color = {1.0f, 1.0f, 1.0f}, .intensity = 2.0f,
+              .areaSize = {2.0f, 2.0f}},
+    };
+    const LightAliasTable aliasTable = buildLightAliasTable(aliasLights);
+    require(aliasTable.entries.size() == aliasLights.size() && aliasTable.totalPower > 0.0f,
+            "analytic light alias table dimensions");
+    float selectionPdfSum = 0.0f;
+    bool validAliasEntries = true;
+    for (const GpuLightAlias& entry : aliasTable.entries)
+    {
+        selectionPdfSum += entry.selectionPdf;
+        validAliasEntries &= entry.probability >= 0.0f && entry.probability <= 1.0f &&
+                             entry.alias < aliasTable.entries.size();
+    }
+    require(validAliasEntries && std::abs(selectionPdfSum - 1.0f) < 1.0e-6f,
+            "analytic light alias probabilities");
     TextureReference transformedTexture{};
     transformedTexture.uvSet = 1;
     transformedTexture.uvScale = {2.0f, 3.0f};

@@ -36,6 +36,7 @@ private:
     void handleCameraNavigation();
     void syncGlobalLightTransform();
     void resetCameraAccumulation();
+    void resetRenderHistory();
 
     GLFWwindow* window_{};
     AssetLoader assetLoader_;

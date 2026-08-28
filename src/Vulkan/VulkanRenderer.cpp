@@ -1,5 +1,7 @@
 #include "Vulkan/VulkanRenderer.h"
 
+#include "Core/LightSampling.h"
+
 #include "Core/Log.h"
 
 #include <Windows.h>
@@ -326,6 +328,7 @@ void VulkanRenderer::shutdown()
 
 void VulkanRenderer::setScene(const Scene* scene)
 {
+    temporalHistoryValid_ = false;
     scene_ = scene;
     stats_.totalMeshlets = scene ? static_cast<std::uint32_t>(scene->meshletCount()) : 0;
     if (device_)
@@ -335,6 +338,7 @@ void VulkanRenderer::setScene(const Scene* scene)
 
 bool VulkanRenderer::updateMaterial(std::uint32_t materialIndex)
 {
+    temporalHistoryValid_ = false;
     if (!device_ || !scene_ || !materialBuffer_.buffer || materialIndex >= scene_->materials.size())
         return false;
     const GpuMaterial material = scene_->materials[materialIndex].toGpu();
@@ -355,6 +359,7 @@ void VulkanRenderer::resize(std::uint32_t width, std::uint32_t height)
     requestedWidth_ = width;
     requestedHeight_ = height;
     resizePending_ = true;
+    temporalHistoryValid_ = false;
 }
 
 void VulkanRenderer::resetAccumulation()
@@ -479,7 +484,9 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
         const VkDeviceSize pixelByteSize = static_cast<VkDeviceSize>(width) * height * sizeof(std::uint32_t);
         constexpr VkDeviceSize kHalf4PixelByteSize = sizeof(std::uint16_t) * 4;
         const VkDeviceSize halfImageByteSize = static_cast<VkDeviceSize>(width) * height * kHalf4PixelByteSize;
-        const VkDeviceSize bufferByteSize = halfImageByteSize * 2 + pixelByteSize;
+        constexpr VkDeviceSize kHalf2PixelByteSize = sizeof(std::uint16_t) * 2;
+        const VkDeviceSize flowImageByteSize = static_cast<VkDeviceSize>(width) * height * kHalf2PixelByteSize;
+        const VkDeviceSize bufferByteSize = halfImageByteSize * 4 + flowImageByteSize + pixelByteSize;
         VkDeviceSize allocationSize = 0;
         HANDLE memoryHandle = nullptr;
         gpuInteropBuffer_ = createExternalBuffer(bufferByteSize, allocationSize, memoryHandle);
@@ -535,6 +542,9 @@ bool VulkanRenderer::createGpuInteropSurface(std::uint32_t width, std::uint32_t 
         gpuInteropSurfaceInfo_.inputOffset = 0;
         gpuInteropSurfaceInfo_.denoisedOffset = halfImageByteSize;
         gpuInteropSurfaceInfo_.displayOffset = halfImageByteSize * 2;
+        gpuInteropSurfaceInfo_.flowOffset = gpuInteropSurfaceInfo_.displayOffset + pixelByteSize;
+        gpuInteropSurfaceInfo_.albedoOffset = gpuInteropSurfaceInfo_.flowOffset + flowImageByteSize;
+        gpuInteropSurfaceInfo_.normalDepthOffset = gpuInteropSurfaceInfo_.albedoOffset + halfImageByteSize;
         gpuInteropSurfaceInfo_.generation = ++gpuInteropGeneration_;
         gpuInteropSurfaceInfo_.width = width;
         gpuInteropSurfaceInfo_.height = height;
@@ -614,6 +624,28 @@ bool VulkanRenderer::createDenoiserInputImage(std::uint32_t width, std::uint32_t
         viewInfo.subresourceRange.layerCount = 1;
         check(vkCreateImageView(device_, &viewInfo, nullptr, &denoiserInputImageView_),
               "vkCreateImageView(Vulkan denoiser input)");
+        constexpr std::array guideFormats{VK_FORMAT_R16G16_SFLOAT,
+                                          VK_FORMAT_R16G16B16A16_SFLOAT,
+                                          VK_FORMAT_R16G16B16A16_SFLOAT};
+        for (std::size_t index = 0; index < guideFormats.size(); ++index)
+        {
+            imageInfo.format = guideFormats[index];
+            check(vkCreateImage(device_, &imageInfo, nullptr, &denoiserGuideImages_[index]),
+                  "vkCreateImage(Vulkan denoiser guide)");
+            vkGetImageMemoryRequirements(device_, denoiserGuideImages_[index], &requirements);
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits,
+                                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            check(vkAllocateMemory(device_, &allocation, nullptr, &denoiserGuideImageMemories_[index]),
+                  "vkAllocateMemory(Vulkan denoiser guide)");
+            check(vkBindImageMemory(device_, denoiserGuideImages_[index],
+                                    denoiserGuideImageMemories_[index], 0),
+                  "vkBindImageMemory(Vulkan denoiser guide)");
+            viewInfo.image = denoiserGuideImages_[index];
+            viewInfo.format = guideFormats[index];
+            check(vkCreateImageView(device_, &viewInfo, nullptr, &denoiserGuideImageViews_[index]),
+                  "vkCreateImageView(Vulkan denoiser guide)");
+        }
         denoiserInputImageInitialized_ = false;
         return true;
     }
@@ -635,9 +667,21 @@ void VulkanRenderer::destroyDenoiserInputImage()
         vkDestroyImage(device_, denoiserInputImage_, nullptr);
     if (denoiserInputImageMemory_)
         vkFreeMemory(device_, denoiserInputImageMemory_, nullptr);
+    for (std::size_t index = 0; index < denoiserGuideImages_.size(); ++index)
+    {
+        if (denoiserGuideImageViews_[index])
+            vkDestroyImageView(device_, denoiserGuideImageViews_[index], nullptr);
+        if (denoiserGuideImages_[index])
+            vkDestroyImage(device_, denoiserGuideImages_[index], nullptr);
+        if (denoiserGuideImageMemories_[index])
+            vkFreeMemory(device_, denoiserGuideImageMemories_[index], nullptr);
+    }
     denoiserInputImageView_ = VK_NULL_HANDLE;
     denoiserInputImage_ = VK_NULL_HANDLE;
     denoiserInputImageMemory_ = VK_NULL_HANDLE;
+    denoiserGuideImages_.fill(VK_NULL_HANDLE);
+    denoiserGuideImageMemories_.fill(VK_NULL_HANDLE);
+    denoiserGuideImageViews_.fill(VK_NULL_HANDLE);
     denoiserInputImageInitialized_ = false;
 }
 
@@ -723,6 +767,8 @@ bool VulkanRenderer::renderDenoiserInput(const Camera& camera, const RenderSetti
         submit.pSignalSemaphores = &vulkanCompleteSemaphore_;
         check(vkQueueSubmit(graphicsQueue_, 1, &submit, frame.postInFlight),
               "vkQueueSubmit(Vulkan denoiser input)");
+        previousViewProjection_ = framePushConstants_.viewProjection;
+        temporalHistoryValid_ = true;
         firstDenoiserInput_ = false;
         return true;
     }
@@ -746,18 +792,43 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
         for (const Light& light : scene_->lights)
             lights.push_back(light.toGpu());
         vkCmdUpdateBuffer(commandBuffer, lightBuffer_.buffer, 0, lights.size() * sizeof(GpuLight), lights.data());
-        VkBufferMemoryBarrier2 lightBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
-        lightBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        lightBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        lightBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        lightBarrier.buffer = lightBuffer_.buffer;
-        lightBarrier.size = lightBuffer_.size;
+        const LightAliasTable aliases = buildLightAliasTable(scene_->lights);
+        vkCmdUpdateBuffer(commandBuffer, lightAliasBuffer_.buffer, 0,
+                          aliases.entries.size() * sizeof(GpuLightAlias), aliases.entries.data());
+        std::array<VkBufferMemoryBarrier2, 2> lightBarriers{};
+        for (VkBufferMemoryBarrier2& barrier : lightBarriers)
+        {
+            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        }
+        lightBarriers[0].buffer = lightBuffer_.buffer;
+        lightBarriers[0].size = lightBuffer_.size;
+        lightBarriers[1].buffer = lightAliasBuffer_.buffer;
+        lightBarriers[1].size = lightAliasBuffer_.size;
         VkDependencyInfo lightDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        lightDependency.bufferMemoryBarrierCount = 1;
-        lightDependency.pBufferMemoryBarriers = &lightBarrier;
+        lightDependency.bufferMemoryBarrierCount = static_cast<std::uint32_t>(lightBarriers.size());
+        lightDependency.pBufferMemoryBarriers = lightBarriers.data();
         vkCmdPipelineBarrier2(commandBuffer, &lightDependency);
     }
+    const TemporalFrameData temporalFrame{previousViewProjection_, temporalHistoryValid_ ? 1u : 0u,
+                                          static_cast<float>(swapchainExtent_.width),
+                                          static_cast<float>(swapchainExtent_.height), 0u};
+    vkCmdUpdateBuffer(commandBuffer, temporalFrameBuffer_.buffer, 0, sizeof(temporalFrame), &temporalFrame);
+    VkBufferMemoryBarrier2 temporalBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    temporalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    temporalBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    temporalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT |
+                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    temporalBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    temporalBarrier.buffer = temporalFrameBuffer_.buffer;
+    temporalBarrier.size = temporalFrameBuffer_.size;
+    VkDependencyInfo temporalDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    temporalDependency.bufferMemoryBarrierCount = 1;
+    temporalDependency.pBufferMemoryBarriers = &temporalBarrier;
+    vkCmdPipelineBarrier2(commandBuffer, &temporalDependency);
 
     VkBufferMemoryBarrier2 acquireBuffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
     acquireBuffer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
@@ -794,7 +865,14 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     depthBarrier.subresourceRange.levelCount = 1;
     depthBarrier.subresourceRange.layerCount = 1;
-    const std::array imageBarriers{colorBarrier, depthBarrier};
+    std::array<VkImageMemoryBarrier2, 3> guideBarriers{};
+    for (std::size_t index = 0; index < guideBarriers.size(); ++index)
+    {
+        guideBarriers[index] = colorBarrier;
+        guideBarriers[index].image = denoiserGuideImages_[index];
+    }
+    const std::array imageBarriers{colorBarrier, guideBarriers[0], guideBarriers[1],
+                                   guideBarriers[2], depthBarrier};
     VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dependency.bufferMemoryBarrierCount = 1;
     dependency.pBufferMemoryBarriers = &acquireBuffer;
@@ -803,12 +881,18 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
     depthImageInitialized_ = true;
 
-    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    colorAttachment.imageView = denoiserInputImageView_;
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = {{0.008f, 0.012f, 0.022f, 1.0f}};
+    std::array<VkRenderingAttachmentInfo, 4> colorAttachments{};
+    const std::array guideViews{denoiserInputImageView_, denoiserGuideImageViews_[0],
+                                denoiserGuideImageViews_[1], denoiserGuideImageViews_[2]};
+    for (std::size_t index = 0; index < colorAttachments.size(); ++index)
+    {
+        colorAttachments[index].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachments[index].imageView = guideViews[index];
+        colorAttachments[index].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachments[index].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachments[index].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    colorAttachments[0].clearValue.color = {{0.008f, 0.012f, 0.022f, 1.0f}};
     VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     depthAttachment.imageView = depthImageView_;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
@@ -818,8 +902,8 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering.renderArea.extent = swapchainExtent_;
     rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &colorAttachment;
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(colorAttachments.size());
+    rendering.pColorAttachments = colorAttachments.data();
     rendering.pDepthAttachment = &depthAttachment;
     vkCmdBeginRendering(commandBuffer, &rendering);
     VkViewport viewport{};
@@ -859,19 +943,25 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     }
     vkCmdEndRendering(commandBuffer);
 
-    VkImageMemoryBarrier2 toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toTransfer.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toTransfer.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toTransfer.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    toTransfer.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toTransfer.image = denoiserInputImage_;
-    toTransfer.subresourceRange = colorBarrier.subresourceRange;
+    std::array<VkImageMemoryBarrier2, 4> toTransfer{};
+    const std::array guideImages{denoiserInputImage_, denoiserGuideImages_[0],
+                                 denoiserGuideImages_[1], denoiserGuideImages_[2]};
+    for (std::size_t index = 0; index < toTransfer.size(); ++index)
+    {
+        toTransfer[index].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        toTransfer[index].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        toTransfer[index].srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        toTransfer[index].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toTransfer[index].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        toTransfer[index].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        toTransfer[index].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toTransfer[index].image = guideImages[index];
+        toTransfer[index].subresourceRange = colorBarrier.subresourceRange;
+    }
     dependency.bufferMemoryBarrierCount = 0;
     dependency.pBufferMemoryBarriers = nullptr;
-    dependency.imageMemoryBarrierCount = 1;
-    dependency.pImageMemoryBarriers = &toTransfer;
+    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(toTransfer.size());
+    dependency.pImageMemoryBarriers = toTransfer.data();
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
     VkBufferImageCopy copy{};
     copy.bufferOffset = gpuInteropSurfaceInfo_.inputOffset;
@@ -880,6 +970,15 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     copy.imageExtent = {swapchainExtent_.width, swapchainExtent_.height, 1};
     vkCmdCopyImageToBuffer(commandBuffer, denoiserInputImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            gpuInteropBuffer_.buffer, 1, &copy);
+    const std::array<VkDeviceSize, 3> guideOffsets{gpuInteropSurfaceInfo_.flowOffset,
+                                                   gpuInteropSurfaceInfo_.albedoOffset,
+                                                   gpuInteropSurfaceInfo_.normalDepthOffset};
+    for (std::size_t index = 0; index < denoiserGuideImages_.size(); ++index)
+    {
+        copy.bufferOffset = guideOffsets[index];
+        vkCmdCopyImageToBuffer(commandBuffer, denoiserGuideImages_[index],
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gpuInteropBuffer_.buffer, 1, &copy);
+    }
 
     VkBufferMemoryBarrier2 releaseBuffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
     releaseBuffer.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -1172,6 +1271,7 @@ bool VulkanRenderer::createDevice()
     if (!available13.dynamicRendering || !available13.synchronization2 ||
         !available13.shaderDemoteToHelperInvocation || !availableMesh.meshShader ||
         !availableMesh.taskShader || !available11.shaderDrawParameters ||
+        !available.features.independentBlend ||
         !available.features.shaderSampledImageArrayDynamicIndexing ||
         !available12.shaderSampledImageArrayNonUniformIndexing || !available12.descriptorBindingPartiallyBound)
         throw std::runtime_error("Required Vulkan rendering, mesh-shader, or bindless texture features are missing");
@@ -1226,6 +1326,7 @@ bool VulkanRenderer::createDevice()
     createInfo.pNext = &features13;
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    enabledFeatures.independentBlend = VK_TRUE;
     createInfo.pEnabledFeatures = &enabledFeatures;
     createInfo.queueCreateInfoCount = 1;
     createInfo.pQueueCreateInfos = &queueInfo;
@@ -1422,7 +1523,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 18> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -1480,7 +1581,15 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[15].descriptorCount = 1;
     bindings[15].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    std::array<VkDescriptorBindingFlags, 16> bindingFlags{};
+    bindings[16].binding = 16;
+    bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[16].descriptorCount = 1;
+    bindings[16].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[17].binding = 17;
+    bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[17].descriptorCount = 1;
+    bindings[17].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    std::array<VkDescriptorBindingFlags, 18> bindingFlags{};
     bindingFlags[9] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     bindingFlags[10] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
@@ -1494,7 +1603,7 @@ bool VulkanRenderer::createSceneDescriptors()
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
 
     const std::array poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures + 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, kMaxMaterialTextures + 1},
@@ -1512,12 +1621,21 @@ bool VulkanRenderer::createMeshPipeline()
     const VkShaderModule taskModule = loadShaderModule(L"Shaders\\Task.spv");
     const VkShaderModule meshModule = loadShaderModule(L"Shaders\\Mesh.spv");
     const VkShaderModule fragmentModule = loadShaderModule(L"Shaders\\PbrFragment.spv");
+    const VkShaderModule denoiserFragmentModule = loadShaderModule(L"Shaders\\DenoiserPbrFragment.spv");
     const VkShaderModule backgroundVertexModule = loadShaderModule(L"Shaders\\BackgroundVertex.spv");
     const VkShaderModule backgroundFragmentModule = loadShaderModule(L"Shaders\\BackgroundFragment.spv");
+    const VkShaderModule denoiserBackgroundFragmentModule =
+        loadShaderModule(L"Shaders\\DenoiserBackgroundFragment.spv");
     const std::array stages{
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_TASK_BIT_EXT, taskModule, "TaskMain", nullptr},
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_MESH_BIT_EXT, meshModule, "MeshMain", nullptr},
         VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, "FragmentMain", nullptr},
+    };
+    const std::array denoiserStages{
+        stages[0], stages[1],
+        VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                        VK_SHADER_STAGE_FRAGMENT_BIT, denoiserFragmentModule,
+                                        "DenoiserFragmentMain", nullptr},
     };
 
     try
@@ -1580,18 +1698,40 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = meshPipelineLayout_;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &meshPipeline_), "vkCreateGraphicsPipelines");
-        const VkFormat denoiserFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-        renderingInfo.pColorAttachmentFormats = &denoiserFormat;
+        const std::array<VkFormat, 4> denoiserFormats{VK_FORMAT_R16G16B16A16_SFLOAT,
+                                                      VK_FORMAT_R16G16_SFLOAT,
+                                                      VK_FORMAT_R16G16B16A16_SFLOAT,
+                                                      VK_FORMAT_R16G16B16A16_SFLOAT};
+        std::array<VkPipelineColorBlendAttachmentState, 4> denoiserAttachments{};
+        denoiserAttachments.fill(attachment);
+        blend.attachmentCount = static_cast<std::uint32_t>(denoiserAttachments.size());
+        blend.pAttachments = denoiserAttachments.data();
+        renderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(denoiserFormats.size());
+        renderingInfo.pColorAttachmentFormats = denoiserFormats.data();
+        pipelineInfo.pStages = denoiserStages.data();
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &denoiserMeshPipeline_),
               "vkCreateGraphicsPipelines(Vulkan denoiser mesh input)");
 
         attachment.blendEnable = VK_TRUE;
         depthStencil.depthWriteEnable = VK_FALSE;
+        blend.attachmentCount = 1;
+        blend.pAttachments = &attachment;
+        renderingInfo.colorAttachmentCount = 1;
         renderingInfo.pColorAttachmentFormats = &swapchainFormat_;
+        pipelineInfo.pStages = stages.data();
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
                                         &transparentMeshPipeline_),
               "vkCreateGraphicsPipelines(transparent mesh)");
-        renderingInfo.pColorAttachmentFormats = &denoiserFormat;
+        denoiserAttachments.fill(VkPipelineColorBlendAttachmentState{});
+        for (VkPipelineColorBlendAttachmentState& denoiserAttachment : denoiserAttachments)
+            denoiserAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        denoiserAttachments[0] = attachment;
+        blend.attachmentCount = static_cast<std::uint32_t>(denoiserAttachments.size());
+        blend.pAttachments = denoiserAttachments.data();
+        renderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(denoiserFormats.size());
+        renderingInfo.pColorAttachmentFormats = denoiserFormats.data();
+        pipelineInfo.pStages = denoiserStages.data();
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
                                         &denoiserTransparentMeshPipeline_),
               "vkCreateGraphicsPipelines(Vulkan denoiser transparent mesh input)");
@@ -1606,6 +1746,12 @@ bool VulkanRenderer::createMeshPipeline()
                                              VK_SHADER_STAGE_FRAGMENT_BIT, backgroundFragmentModule,
                                              "BackgroundFragment", nullptr},
         };
+        const std::array denoiserBackgroundStages{
+            backgroundStages[0],
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                             VK_SHADER_STAGE_FRAGMENT_BIT, denoiserBackgroundFragmentModule,
+                                             "DenoiserBackgroundFragment", nullptr},
+        };
         VkPipelineDepthStencilStateCreateInfo backgroundDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         backgroundDepth.depthTestEnable = VK_FALSE;
         backgroundDepth.depthWriteEnable = VK_FALSE;
@@ -1618,10 +1764,17 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pVertexInputState = &backgroundVertexInput;
         pipelineInfo.pInputAssemblyState = &backgroundInputAssembly;
         pipelineInfo.pDepthStencilState = &backgroundDepth;
+        blend.attachmentCount = 1;
+        blend.pAttachments = &attachment;
+        renderingInfo.colorAttachmentCount = 1;
         renderingInfo.pColorAttachmentFormats = &swapchainFormat_;
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &backgroundPipeline_),
               "vkCreateGraphicsPipelines(background)");
-        renderingInfo.pColorAttachmentFormats = &denoiserFormat;
+        blend.attachmentCount = static_cast<std::uint32_t>(denoiserAttachments.size());
+        blend.pAttachments = denoiserAttachments.data();
+        renderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(denoiserFormats.size());
+        renderingInfo.pColorAttachmentFormats = denoiserFormats.data();
+        pipelineInfo.pStages = denoiserBackgroundStages.data();
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
                                         &denoiserBackgroundPipeline_),
               "vkCreateGraphicsPipelines(Vulkan denoiser background input)");
@@ -1629,16 +1782,20 @@ bool VulkanRenderer::createMeshPipeline()
     catch (...)
     {
         vkDestroyShaderModule(device_, fragmentModule, nullptr);
+        vkDestroyShaderModule(device_, denoiserFragmentModule, nullptr);
         vkDestroyShaderModule(device_, meshModule, nullptr);
         vkDestroyShaderModule(device_, taskModule, nullptr);
         vkDestroyShaderModule(device_, backgroundFragmentModule, nullptr);
+        vkDestroyShaderModule(device_, denoiserBackgroundFragmentModule, nullptr);
         vkDestroyShaderModule(device_, backgroundVertexModule, nullptr);
         throw;
     }
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
+    vkDestroyShaderModule(device_, denoiserFragmentModule, nullptr);
     vkDestroyShaderModule(device_, meshModule, nullptr);
     vkDestroyShaderModule(device_, taskModule, nullptr);
     vkDestroyShaderModule(device_, backgroundFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, denoiserBackgroundFragmentModule, nullptr);
     vkDestroyShaderModule(device_, backgroundVertexModule, nullptr);
     return true;
 }
@@ -1776,6 +1933,8 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(sceneInstanceBuffer_);
     destroyBuffer(materialBuffer_);
     destroyBuffer(lightBuffer_);
+    destroyBuffer(lightAliasBuffer_);
+    destroyBuffer(temporalFrameBuffer_);
     destroyBuffer(emissiveTriangleBuffer_);
     destroyBuffer(textureMetadataBuffer_);
     destroyTextureResources();
@@ -2289,6 +2448,7 @@ bool VulkanRenderer::uploadSceneResources()
     struct alignas(16) GpuInstance
     {
         Mat4 transform;
+        Mat4 previousTransform;
         Mat4 normalTransform;
         Vec4 scaleAndFlags;
         std::uint32_t geometry[4];
@@ -2310,9 +2470,9 @@ bool VulkanRenderer::uploadSceneResources()
         std::uint32_t materialData[4];
     };
     static_assert(sizeof(GpuMeshlet) == 64);
-    static_assert(sizeof(GpuInstance) == 192);
-    static_assert(offsetof(GpuInstance, materialIndex) == 160);
-    static_assert(offsetof(GpuInstance, boundsCenter) == 176);
+    static_assert(sizeof(GpuInstance) == 256);
+    static_assert(offsetof(GpuInstance, materialIndex) == 224);
+    static_assert(offsetof(GpuInstance, boundsCenter) == 240);
     static_assert(sizeof(GpuEmissiveTriangle) == 160);
     static_assert(sizeof(GpuMaterial) == 240);
     struct RasterMeshRange
@@ -2406,7 +2566,8 @@ bool VulkanRenderer::uploadSceneResources()
             geometryIndices.push_back(index);
     }
 
-    const auto appendInstance = [&](std::uint32_t meshIndex, const Mat4& transform) {
+    const auto appendInstance = [&](std::uint32_t meshIndex, const Mat4& transform,
+                                    const Mat4& previousTransform) {
         if (meshIndex >= meshToGeometry.size() || meshToGeometry[meshIndex] == UINT32_MAX)
             return;
         const float scaleX = length(Vec3{transform.m[0], transform.m[1], transform.m[2]});
@@ -2424,6 +2585,7 @@ bool VulkanRenderer::uploadSceneResources()
         const Vec4 bounds = meshBounds[meshIndex];
         const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
         gpuInstances.push_back({transform,
+                                previousTransform,
                                 normalTransformMatrix(transform),
                                 {maxScale, minScale, transformHandedness, bounds.w},
                                 {geometry.vertexOffset, geometry.indexOffset, geometry.indexCount, 0},
@@ -2443,13 +2605,13 @@ bool VulkanRenderer::uploadSceneResources()
     if (!scene_->instances.empty())
     {
         for (const Instance& instance : scene_->instances)
-            appendInstance(instance.meshIndex, instance.transform);
+            appendInstance(instance.meshIndex, instance.transform, instance.previousTransform);
     }
     else
     {
         const Mat4 identity = Mat4::identity();
         for (std::uint32_t meshIndex = 0; meshIndex < scene_->meshes.size(); ++meshIndex)
-            appendInstance(meshIndex, identity);
+            appendInstance(meshIndex, identity, identity);
     }
     if (vertices.empty() || meshlets.empty() || geometryIndices.empty() || gpuInstances.empty())
         return true;
@@ -2473,6 +2635,7 @@ bool VulkanRenderer::uploadSceneResources()
         for (const Light& light : scene_->lights)
             gpuLights.push_back(light.toGpu());
     }
+    const LightAliasTable lightAliasTable = buildLightAliasTable(scene_->lights);
     if (scene_->textures.empty())
         textureMetadata.push_back(TextureReference{}.toGpuMetadata());
     else
@@ -2570,10 +2733,15 @@ bool VulkanRenderer::uploadSceneResources()
                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     lightBuffer_ = createDeviceLocalBuffer(gpuLights.size() * sizeof(GpuLight),
                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    lightAliasBuffer_ = createDeviceLocalBuffer(lightAliasTable.entries.size() * sizeof(GpuLightAlias),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    temporalFrameBuffer_ = createDeviceLocalBuffer(sizeof(TemporalFrameData),
+                                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     emissiveTriangleBuffer_ = createDeviceLocalBuffer(emissiveTriangles.size() * sizeof(GpuEmissiveTriangle),
                                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     textureMetadataBuffer_ = createDeviceLocalBuffer(textureMetadata.size() * sizeof(GpuTextureMetadata),
                                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const TemporalFrameData initialTemporalFrame{};
     const std::array uploads{
         BufferUpload{&vertexBuffer_, vertices.data(), vertices.size() * sizeof(GpuVertex)},
         BufferUpload{&meshletBuffer_, meshlets.data(), meshlets.size() * sizeof(GpuMeshlet)},
@@ -2583,6 +2751,9 @@ bool VulkanRenderer::uploadSceneResources()
         BufferUpload{&sceneInstanceBuffer_, gpuInstances.data(), gpuInstances.size() * sizeof(GpuInstance)},
         BufferUpload{&materialBuffer_, gpuMaterials.data(), gpuMaterials.size() * sizeof(GpuMaterial)},
         BufferUpload{&lightBuffer_, gpuLights.data(), gpuLights.size() * sizeof(GpuLight)},
+        BufferUpload{&lightAliasBuffer_, lightAliasTable.entries.data(),
+                     lightAliasTable.entries.size() * sizeof(GpuLightAlias)},
+        BufferUpload{&temporalFrameBuffer_, &initialTemporalFrame, sizeof(TemporalFrameData)},
         BufferUpload{&emissiveTriangleBuffer_, emissiveTriangles.data(),
                      emissiveTriangles.size() * sizeof(GpuEmissiveTriangle)},
         BufferUpload{&textureMetadataBuffer_, textureMetadata.data(),
@@ -2602,7 +2773,7 @@ bool VulkanRenderer::uploadSceneResources()
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &sceneDescriptorSetLayout_;
     check(vkAllocateDescriptorSets(device_, &allocateInfo, &sceneDescriptorSet_), "vkAllocateDescriptorSets");
-    const std::array<VkDescriptorBufferInfo, 10> bufferInfos{{
+    const std::array<VkDescriptorBufferInfo, 12> bufferInfos{{
         {vertexBuffer_.buffer, 0, vertexBuffer_.size},
         {meshletBuffer_.buffer, 0, meshletBuffer_.size},
         {meshletVertexBuffer_.buffer, 0, meshletVertexBuffer_.size},
@@ -2613,8 +2784,10 @@ bool VulkanRenderer::uploadSceneResources()
         {lightBuffer_.buffer, 0, lightBuffer_.size},
         {emissiveTriangleBuffer_.buffer, 0, emissiveTriangleBuffer_.size},
         {textureMetadataBuffer_.buffer, 0, textureMetadataBuffer_.size},
+        {lightAliasBuffer_.buffer, 0, lightAliasBuffer_.size},
+        {temporalFrameBuffer_.buffer, 0, temporalFrameBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 16> writes{};
+    std::array<VkWriteDescriptorSet, 18> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2714,6 +2887,18 @@ bool VulkanRenderer::uploadSceneResources()
     writes[15].descriptorCount = 1;
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].pBufferInfo = &bufferInfos[9];
+    writes[16].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[16].dstSet = sceneDescriptorSet_;
+    writes[16].dstBinding = 16;
+    writes[16].descriptorCount = 1;
+    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[16].pBufferInfo = &bufferInfos[10];
+    writes[17].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[17].dstSet = sceneDescriptorSet_;
+    writes[17].dstBinding = 17;
+    writes[17].descriptorCount = 1;
+    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[17].pBufferInfo = &bufferInfos[11];
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
@@ -2732,7 +2917,7 @@ bool VulkanRenderer::uploadSceneResources()
     stats_.gpuSceneBytes = vertexBuffer_.size + meshletBuffer_.size + meshletVertexBuffer_.size +
                            meshletTriangleBuffer_.size + geometryIndexBuffer_.size + sceneInstanceBuffer_.size +
                            environmentTextureBytes_ + iblTextureBytes_ + materialBuffer_.size + lightBuffer_.size +
-                           emissiveTriangleBuffer_.size + textureMetadataBuffer_.size + accelerationInstanceBuffer_.size +
+                           lightAliasBuffer_.size + temporalFrameBuffer_.size + emissiveTriangleBuffer_.size + textureMetadataBuffer_.size + accelerationInstanceBuffer_.size +
                            tlasStorage_.size + stats_.textureBytes;
     for (const BlasResource& blas : blases_)
         stats_.gpuSceneBytes += blas.storage.size;
@@ -3367,16 +3552,25 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
             lights.push_back(light.toGpu());
         vkCmdUpdateBuffer(commandBuffer, lightBuffer_.buffer, 0,
                           lights.size() * sizeof(GpuLight), lights.data());
-        VkBufferMemoryBarrier2 lightBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
-        lightBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-        lightBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        lightBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        lightBarrier.buffer = lightBuffer_.buffer;
-        lightBarrier.size = lightBuffer_.size;
+        const LightAliasTable aliases = buildLightAliasTable(scene_->lights);
+        vkCmdUpdateBuffer(commandBuffer, lightAliasBuffer_.buffer, 0,
+                          aliases.entries.size() * sizeof(GpuLightAlias), aliases.entries.data());
+        std::array<VkBufferMemoryBarrier2, 2> lightBarriers{};
+        for (VkBufferMemoryBarrier2& barrier : lightBarriers)
+        {
+            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        }
+        lightBarriers[0].buffer = lightBuffer_.buffer;
+        lightBarriers[0].size = lightBuffer_.size;
+        lightBarriers[1].buffer = lightAliasBuffer_.buffer;
+        lightBarriers[1].size = lightAliasBuffer_.size;
         VkDependencyInfo lightDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        lightDependency.bufferMemoryBarrierCount = 1;
-        lightDependency.pBufferMemoryBarriers = &lightBarrier;
+        lightDependency.bufferMemoryBarrierCount = static_cast<std::uint32_t>(lightBarriers.size());
+        lightDependency.pBufferMemoryBarriers = lightBarriers.data();
         vkCmdPipelineBarrier2(commandBuffer, &lightDependency);
     }
     const std::uint32_t timestampBase = frameSlot_ * 2;

@@ -1,6 +1,7 @@
 #include "Optix/OptixRenderer.h"
 
 #include "Core/Log.h"
+#include "Core/LightSampling.h"
 
 #include <optix_function_table_definition.h>
 #include <optix_stack_size.h>
@@ -159,6 +160,8 @@ static_assert(sizeof(GpuOptixInstance) == 160);
 struct LaunchParameters
 {
     SlangStructuredBuffer output;
+    SlangStructuredBuffer sampleCounts;
+    SlangStructuredBuffer luminanceMoments;
     SlangStructuredBuffer denoisedOutput;
     SlangStructuredBuffer albedoGuide;
     SlangStructuredBuffer normalGuide;
@@ -172,6 +175,7 @@ struct LaunchParameters
     SlangStructuredBuffer materials;
     SlangStructuredBuffer emissiveTriangles;
     SlangStructuredBuffer lights;
+    SlangStructuredBuffer lightAliases;
     SlangStructuredBuffer textureMetadata;
     SlangStructuredBuffer environmentPixels;
     SlangStructuredBuffer environmentConditionalCdf;
@@ -184,6 +188,10 @@ struct LaunchParameters
     std::uint32_t maxBounces;
     std::uint32_t samplesPerFrame;
     std::uint32_t accumulatedSamples;
+    std::uint32_t adaptiveSampling;
+    std::uint32_t adaptiveMinSamples;
+    float adaptiveNoiseThreshold;
+    float analyticLightPowerValue;
     std::uint32_t rayTracedShadows;
     std::uint32_t rayTracedReflections;
     std::uint32_t displayBgra;
@@ -333,6 +341,7 @@ void OptixRenderer::shutdown()
 
 void OptixRenderer::setScene(const Scene* scene)
 {
+    denoiserTemporalHistoryValid_ = false;
     scene_ = scene;
     stats_.totalMeshlets = scene ? static_cast<std::uint32_t>(scene->meshletCount()) : 0;
     if (available_ && !buildSceneAcceleration())
@@ -342,6 +351,7 @@ void OptixRenderer::setScene(const Scene* scene)
 
 bool OptixRenderer::updateMaterial(std::uint32_t materialIndex)
 {
+    denoiserTemporalHistoryValid_ = false;
     if (!available_ || !scene_ || !materialBuffer_ || scene_->materials.size() != materialCount_ ||
         materialIndex >= scene_->materials.size())
         return false;
@@ -371,6 +381,7 @@ void OptixRenderer::resize(std::uint32_t width, std::uint32_t height)
         return;
     width_ = newWidth;
     height_ = newHeight;
+    denoiserTemporalHistoryValid_ = false;
     if (available_)
         resizeOutput();
 }
@@ -398,6 +409,9 @@ bool OptixRenderer::setGpuInteropSurface(const GpuInteropSurface& surface)
         interopInputBuffer_ = interopBaseBuffer_ + surface.inputOffset;
         interopDenoisedBuffer_ = interopBaseBuffer_ + surface.denoisedOffset;
         interopOutputBuffer_ = interopBaseBuffer_ + surface.displayOffset;
+        interopFlowBuffer_ = interopBaseBuffer_ + surface.flowOffset;
+        interopAlbedoBuffer_ = interopBaseBuffer_ + surface.albedoOffset;
+        interopNormalDepthBuffer_ = interopBaseBuffer_ + surface.normalDepthOffset;
 
         const auto importSemaphore = [](void* handle, CUexternalSemaphore& semaphore) {
             CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC semaphoreDesc{};
@@ -431,6 +445,9 @@ void OptixRenderer::clearGpuInteropSurface()
     interopInputBuffer_ = 0;
     interopDenoisedBuffer_ = 0;
     interopOutputBuffer_ = 0;
+    interopFlowBuffer_ = 0;
+    interopAlbedoBuffer_ = 0;
+    interopNormalDepthBuffer_ = 0;
     if (cudaReadySemaphore_)
         cuDestroyExternalSemaphore(cudaReadySemaphore_);
     if (vulkanCompleteSemaphore_)
@@ -448,7 +465,7 @@ void OptixRenderer::clearGpuInteropSurface()
 void OptixRenderer::resetAccumulation()
 {
     stats_.accumulatedSamples = 0;
-    denoiserTemporalHistoryValid_ = false;
+    resetSamplingBuffersPending_ = true;
 }
 
 bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
@@ -462,6 +479,15 @@ bool OptixRenderer::render(const Camera& camera, const RenderSettings& settings)
         const std::uint32_t launchSlot = static_cast<std::uint32_t>(launchSlotCursor_ % kLaunchSlotCount);
         if (!waitForLaunchSlot(launchSlot) || !updateShaderBindingTable(camera, settings, launchSlot))
             return false;
+        if (resetSamplingBuffersPending_)
+        {
+            const std::size_t pixelCount = static_cast<std::size_t>(width_) * height_;
+            checkCuda(cuMemsetD8Async(sampleCountBuffer_, 0, pixelCount * sizeof(std::uint32_t), cudaStream_),
+                      "cuMemsetD8Async(adaptive sample counts)");
+            checkCuda(cuMemsetD8Async(luminanceMomentsBuffer_, 0, pixelCount * sizeof(float) * 2, cudaStream_),
+                      "cuMemsetD8Async(adaptive luminance moments)");
+            resetSamplingBuffersPending_ = false;
+        }
         if (launchTimingPending_ && cuEventQuery(launchTimingEnd_) == CUDA_SUCCESS)
         {
             float elapsedMilliseconds = 0.0f;
@@ -581,6 +607,11 @@ bool OptixRenderer::resizeOutput()
         destroyOutputBuffers();
         const std::size_t byteCount = static_cast<std::size_t>(width_) * height_ * 4 * sizeof(float);
         checkCuda(cuMemAlloc(&outputBuffer_, byteCount), "cuMemAlloc(beauty output)");
+        const std::size_t pixelCount = static_cast<std::size_t>(width_) * height_;
+        checkCuda(cuMemAlloc(&sampleCountBuffer_, pixelCount * sizeof(std::uint32_t)),
+                  "cuMemAlloc(adaptive sample counts)");
+        checkCuda(cuMemAlloc(&luminanceMomentsBuffer_, pixelCount * sizeof(float) * 2),
+                  "cuMemAlloc(adaptive luminance moments)");
         resetAccumulation();
         return true;
     }
@@ -620,8 +651,8 @@ bool OptixRenderer::createDenoiser()
     {
         log(LogLevel::Info, "Creating OptiX AI denoiser");
         OptixDenoiserOptions options{};
-        options.guideAlbedo = 0;
-        options.guideNormal = 0;
+        options.guideAlbedo = 1;
+        options.guideNormal = 1;
         options.denoiseAlpha = OPTIX_DENOISER_ALPHA_MODE_COPY;
         checkOptix(optixDenoiserCreate(optixContext_, OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV, &options, &denoiser_),
                    "optixDenoiserCreate");
@@ -656,7 +687,6 @@ bool OptixRenderer::resizeDenoiser()
         checkCuda(cuMemAlloc(&denoiserState_, denoiserStateSize_), "cuMemAlloc(denoiser state)");
         checkCuda(cuMemAlloc(&denoiserScratch_, denoiserScratchSize_), "cuMemAlloc(denoiser scratch)");
         const std::size_t pixelCount = static_cast<std::size_t>(width_) * height_;
-        checkCuda(cuMemAlloc(&denoiserFlow_, pixelCount * sizeof(float) * 2), "cuMemAlloc(denoiser flow)");
         checkCuda(cuMemAlloc(&denoiserPreviousOutput_, pixelCount * sizeof(std::uint16_t) * 4),
                   "cuMemAlloc(denoiser previous output)");
         const std::size_t internalGuideBytes = pixelCount * denoiserInternalGuidePixelSize_;
@@ -664,8 +694,6 @@ bool OptixRenderer::resizeDenoiser()
                   "cuMemAlloc(denoiser previous internal guide)");
         checkCuda(cuMemAlloc(&denoiserOutputInternalGuide_, internalGuideBytes),
                   "cuMemAlloc(denoiser output internal guide)");
-        checkCuda(cuMemsetD8Async(denoiserFlow_, 0, pixelCount * sizeof(float) * 2, cudaStream_),
-                  "cuMemsetD8Async(denoiser flow)");
         checkCuda(cuMemsetD8Async(denoiserPreviousOutput_, 0, pixelCount * sizeof(std::uint16_t) * 4, cudaStream_),
                   "cuMemsetD8Async(denoiser previous output)");
         checkCuda(cuMemsetD8Async(denoiserPreviousInternalGuide_, 0, internalGuideBytes, cudaStream_),
@@ -701,12 +729,14 @@ bool OptixRenderer::invokeDenoiser(bool temporalRendering)
             return result;
         };
         OptixDenoiserGuideLayer guides{};
-        guides.flow.data = denoiserFlow_;
+        guides.flow.data = interopFlowBuffer_;
         guides.flow.width = width_;
         guides.flow.height = height_;
-        guides.flow.rowStrideInBytes = width_ * sizeof(float) * 2;
-        guides.flow.pixelStrideInBytes = sizeof(float) * 2;
-        guides.flow.format = OPTIX_PIXEL_FORMAT_FLOAT2;
+        guides.flow.rowStrideInBytes = width_ * sizeof(std::uint16_t) * 2;
+        guides.flow.pixelStrideInBytes = sizeof(std::uint16_t) * 2;
+        guides.flow.format = OPTIX_PIXEL_FORMAT_HALF2;
+        guides.albedo = image(interopAlbedoBuffer_);
+        guides.normal = image(interopNormalDepthBuffer_);
         const auto internalGuide = [this](CUdeviceptr buffer) {
             OptixImage2D result{};
             result.data = buffer;
@@ -758,8 +788,6 @@ void OptixRenderer::destroyDenoiserResources()
         cuMemFree(denoiserScratch_);
     if (denoiserState_)
         cuMemFree(denoiserState_);
-    if (denoiserFlow_)
-        cuMemFree(denoiserFlow_);
     if (denoiserPreviousOutput_)
         cuMemFree(denoiserPreviousOutput_);
     if (denoiserPreviousInternalGuide_)
@@ -768,7 +796,6 @@ void OptixRenderer::destroyDenoiserResources()
         cuMemFree(denoiserOutputInternalGuide_);
     denoiserScratch_ = 0;
     denoiserState_ = 0;
-    denoiserFlow_ = 0;
     denoiserPreviousOutput_ = 0;
     denoiserPreviousInternalGuide_ = 0;
     denoiserOutputInternalGuide_ = 0;
@@ -783,7 +810,13 @@ void OptixRenderer::destroyOutputBuffers()
     destroyDenoiserResources();
     if (outputBuffer_)
         cuMemFree(outputBuffer_);
+    if (sampleCountBuffer_)
+        cuMemFree(sampleCountBuffer_);
+    if (luminanceMomentsBuffer_)
+        cuMemFree(luminanceMomentsBuffer_);
     outputBuffer_ = 0;
+    sampleCountBuffer_ = 0;
+    luminanceMomentsBuffer_ = 0;
 }
 
 bool OptixRenderer::uploadTextureResources()
@@ -1002,6 +1035,8 @@ bool OptixRenderer::buildSceneAcceleration()
                 lights.push_back(light.toGpu());
         }
         const std::size_t lightBytes = lights.size() * sizeof(GpuLight);
+        const LightAliasTable lightAliasTable = buildLightAliasTable(scene_->lights);
+        const std::size_t lightAliasBytes = lightAliasTable.entries.size() * sizeof(GpuLightAlias);
         std::vector<GpuEmissiveTriangle> emissiveTriangles;
         float emissiveTotalPower = 0.0f;
         for (std::size_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
@@ -1095,6 +1130,7 @@ bool OptixRenderer::buildSceneAcceleration()
         checkCuda(cuMemAlloc(&textureMetadataBuffer_, textureMetadataBytes),
                   "cuMemAlloc(OptiX texture metadata)");
         checkCuda(cuMemAlloc(&lightBuffer_, lightBytes), "cuMemAlloc(OptiX lights)");
+        checkCuda(cuMemAlloc(&lightAliasBuffer_, lightAliasBytes), "cuMemAlloc(OptiX light aliases)");
         checkCuda(cuMemAlloc(&emissiveTriangleBuffer_, emissiveTriangleBytes),
                   "cuMemAlloc(OptiX emissive triangles)");
         checkCuda(cuMemAlloc(&environmentBuffer_, environmentBytes), "cuMemAlloc(OptiX HDR environment)");
@@ -1113,6 +1149,8 @@ bool OptixRenderer::buildSceneAcceleration()
         checkCuda(cuMemcpyHtoD(textureMetadataBuffer_, textureMetadata.data(), textureMetadataBytes),
                   "cuMemcpyHtoD(OptiX texture metadata)");
         checkCuda(cuMemcpyHtoD(lightBuffer_, lights.data(), lightBytes), "cuMemcpyHtoD(OptiX lights)");
+        checkCuda(cuMemcpyHtoD(lightAliasBuffer_, lightAliasTable.entries.data(), lightAliasBytes),
+                  "cuMemcpyHtoD(OptiX light aliases)");
         checkCuda(cuMemcpyHtoD(emissiveTriangleBuffer_, emissiveTriangles.data(), emissiveTriangleBytes),
                   "cuMemcpyHtoD(OptiX emissive triangles)");
         checkCuda(cuMemcpyHtoD(environmentBuffer_, environmentData, environmentBytes),
@@ -1128,6 +1166,7 @@ bool OptixRenderer::buildSceneAcceleration()
         materialCount_ = materials.size();
         textureMetadataCount_ = textureMetadata.size();
         lightCount_ = lights.size();
+        analyticLightPower_ = lightAliasTable.totalPower;
         instanceCount_ = gpuInstances.size();
         emissiveTriangleCount_ = emissiveTotalPower > 0.0f ? emissiveTriangles.size() : 0;
         emissiveLightPower_ = emissiveTotalPower;
@@ -1301,7 +1340,8 @@ bool OptixRenderer::buildSceneAcceleration()
         else
             stats_.textureBytes = 4;
         stats_.gpuSceneBytes = vertexBytes + normalBytes + tangentBytes + uvBytes + indexBytes +
-                               materialBytes + textureMetadataBytes + lightBytes + emissiveTriangleBytes + environmentBytes +
+                               materialBytes + textureMetadataBytes + lightBytes + lightAliasBytes +
+                               emissiveTriangleBytes + environmentBytes +
                                environmentConditionalCdfCount_ * sizeof(float) +
                                environmentMarginalCdfCount_ * sizeof(float) + instanceBytes + accelerationBytes +
                                stats_.textureBytes;
@@ -1341,6 +1381,8 @@ void OptixRenderer::destroySceneAcceleration()
         cuMemFree(textureMetadataBuffer_);
     if (lightBuffer_)
         cuMemFree(lightBuffer_);
+    if (lightAliasBuffer_)
+        cuMemFree(lightAliasBuffer_);
     if (emissiveTriangleBuffer_)
         cuMemFree(emissiveTriangleBuffer_);
     if (environmentBuffer_)
@@ -1365,6 +1407,7 @@ void OptixRenderer::destroySceneAcceleration()
     materialBuffer_ = 0;
     textureMetadataBuffer_ = 0;
     lightBuffer_ = 0;
+    lightAliasBuffer_ = 0;
     emissiveTriangleBuffer_ = 0;
     environmentBuffer_ = 0;
     environmentConditionalCdfBuffer_ = 0;
@@ -1379,6 +1422,7 @@ void OptixRenderer::destroySceneAcceleration()
     materialCount_ = 0;
     textureMetadataCount_ = 0;
     lightCount_ = 0;
+    analyticLightPower_ = 0.0f;
     instanceCount_ = 0;
     emissiveTriangleCount_ = 0;
     emissiveLightPower_ = 0.0f;
@@ -1586,10 +1630,17 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
                 lights.push_back(light.toGpu());
             checkCuda(cuMemcpyHtoDAsync(lightBuffer_, lights.data(), lights.size() * sizeof(GpuLight), cudaStream_),
                       "cuMemcpyHtoDAsync(OptiX lights)");
+            const LightAliasTable aliases = buildLightAliasTable(scene_->lights);
+            analyticLightPower_ = aliases.totalPower;
+            checkCuda(cuMemcpyHtoDAsync(lightAliasBuffer_, aliases.entries.data(),
+                                        aliases.entries.size() * sizeof(GpuLightAlias), cudaStream_),
+                      "cuMemcpyHtoDAsync(OptiX light aliases)");
         }
         auto& parameters = static_cast<LaunchParameters*>(launchParametersHost_)[launchSlot];
         parameters = {};
         parameters.output = {outputBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.sampleCounts = {sampleCountBuffer_, static_cast<std::size_t>(width_) * height_};
+        parameters.luminanceMoments = {luminanceMomentsBuffer_, static_cast<std::size_t>(width_) * height_};
         parameters.denoisedOutput = {};
         parameters.albedoGuide = {};
         parameters.normalGuide = {};
@@ -1603,6 +1654,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.materials = {materialBuffer_, materialCount_};
         parameters.emissiveTriangles = {emissiveTriangleBuffer_, emissiveTriangleCount_};
         parameters.lights = {lightBuffer_, lightCount_};
+        parameters.lightAliases = {lightAliasBuffer_, lightCount_};
         parameters.textureMetadata = {textureMetadataBuffer_, textureMetadataCount_};
         parameters.environmentPixels = {environmentBuffer_, environmentPixelCount_};
         parameters.environmentConditionalCdf = {environmentConditionalCdfBuffer_, environmentConditionalCdfCount_};
@@ -1615,6 +1667,10 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.maxBounces = settings.maxBounces;
         parameters.samplesPerFrame = settings.samplesPerFrame;
         parameters.accumulatedSamples = static_cast<std::uint32_t>(stats_.accumulatedSamples);
+        parameters.adaptiveSampling = settings.adaptiveSampling ? 1u : 0u;
+        parameters.adaptiveMinSamples = settings.adaptiveMinSamples;
+        parameters.adaptiveNoiseThreshold = settings.adaptiveNoiseThreshold;
+        parameters.analyticLightPowerValue = analyticLightPower_;
         parameters.rayTracedShadows = settings.rayTracedShadows ? 1u : 0u;
         parameters.rayTracedReflections = settings.rayTracedReflections ? 1u : 0u;
         parameters.displayBgra = interopBgra_ ? 1u : 0u;

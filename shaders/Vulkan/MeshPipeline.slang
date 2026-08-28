@@ -44,11 +44,20 @@ struct GpuMeshlet
 struct GpuInstance
 {
     float4x4 transform;
+    float4x4 previousTransform;
     float4x4 normalTransform;
     float4 scaleAndFlags;
     uint4 geometry;
     uint materialIndex;
     float4 boundsCenter;
+};
+
+struct TemporalFrameData
+{
+    float4x4 previousViewProjection;
+    uint historyValid;
+    float2 outputSize;
+    uint padding;
 };
 
 struct GpuLight
@@ -57,6 +66,14 @@ struct GpuLight
     float4 directionAndRange;
     float4 colorAndIntensity;
     float4 coneAndArea;
+};
+
+struct GpuLightAlias
+{
+    float probability;
+    uint alias;
+    float selectionPdf;
+    float padding;
 };
 
 struct GpuEmissiveTriangle
@@ -121,6 +138,8 @@ static const uint RENDER_FLAG_TRANSPARENT_PASS = 1u << 1;
 [[vk::binding(13, 0)]] StructuredBuffer<GpuLight> sceneLights;
 [[vk::binding(14, 0)]] StructuredBuffer<GpuEmissiveTriangle> emissiveTriangles;
 [[vk::binding(15, 0)]] StructuredBuffer<GpuTextureMetadata> textureMetadata;
+[[vk::binding(16, 0)]] StructuredBuffer<GpuLightAlias> lightAliases;
+[[vk::binding(17, 0)]] StructuredBuffer<TemporalFrameData> temporalFrame;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -133,11 +152,20 @@ struct MeshVertex
     nointerpolation uint materialId : TEXCOORD1;
     nointerpolation uint meshletIndex : TEXCOORD2;
     nointerpolation uint instanceIndex : TEXCOORD3;
+    float4 previousClipPosition : TEXCOORD4;
 };
 
 struct FragmentOutput
 {
     float4 color : SV_Target0;
+};
+
+struct DenoiserFragmentOutput
+{
+    float4 color : SV_Target0;
+    float2 flow : SV_Target1;
+    float4 albedo : SV_Target2;
+    float4 normalDepth : SV_Target3;
 };
 
 struct BackgroundVertexOutput
@@ -524,6 +552,33 @@ DirectLightSample sampleAnalyticLight(GpuLight light, float3 position, uint seed
     return sample;
 }
 
+DirectLightSample sampleAnalyticLightSet(float3 position, uint seed)
+{
+    DirectLightSample sample;
+    sample.direction = float3(0.0, 1.0, 0.0);
+    sample.radiance = float3(0.0);
+    sample.distance = 0.0;
+    uint lightCount;
+    uint lightStride;
+    uint aliasCount;
+    uint aliasStride;
+    sceneLights.GetDimensions(lightCount, lightStride);
+    lightAliases.GetDimensions(aliasCount, aliasStride);
+    if (lightCount == 0u || aliasCount == 0u)
+        return sample;
+    float scaled = min(randomFromHash(seed), 0.99999994) * float(aliasCount);
+    uint column = min(uint(scaled), aliasCount - 1u);
+    GpuLightAlias entry = lightAliases[column];
+    uint lightIndex = frac(scaled) < entry.probability ? column : entry.alias;
+    lightIndex = min(lightIndex, lightCount - 1u);
+    float selectionPdf = lightAliases[lightIndex].selectionPdf;
+    if (selectionPdf <= 0.0)
+        return sample;
+    sample = sampleAnalyticLight(sceneLights[lightIndex], position, seed ^ 0x7f4a7c15u);
+    sample.radiance /= selectionPdf;
+    return sample;
+}
+
 float traceDirectVisibility(float3 position, float3 normal, DirectLightSample lightSample)
 {
     float coordinateScale = max(max(abs(position.x), abs(position.y)), abs(position.z));
@@ -621,8 +676,7 @@ BackgroundVertexOutput BackgroundVertex(uint vertexIndex : SV_VertexID)
     return output;
 }
 
-[shader("fragment")]
-FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
+FragmentOutput shadeBackground(BackgroundVertexOutput input)
 {
     FragmentOutput output;
     float3 color = frame.skyZenithAndVisibility.w != 0.0
@@ -633,6 +687,28 @@ FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
         color = color / (1.0 + color);
     }
     output.color = float4(color, 1.0);
+    return output;
+}
+
+[shader("fragment")]
+FragmentOutput BackgroundFragment(BackgroundVertexOutput input)
+{
+    return shadeBackground(input);
+}
+
+[shader("fragment")]
+DenoiserFragmentOutput DenoiserBackgroundFragment(BackgroundVertexOutput input)
+{
+    FragmentOutput beauty = shadeBackground(input);
+    TemporalFrameData temporal = temporalFrame[0];
+    float4 previousClip = mul(temporal.previousViewProjection, float4(input.direction, 0.0));
+    float2 previousNdc = previousClip.xy / max(abs(previousClip.w), 1e-6);
+    float2 previousPixel = (previousNdc * 0.5 + 0.5) * temporal.outputSize;
+    DenoiserFragmentOutput output;
+    output.color = beauty.color;
+    output.flow = temporal.historyValid != 0u ? input.position.xy - previousPixel : float2(0.0);
+    output.albedo = float4(0.0);
+    output.normalDepth = float4(0.0, 0.0, 0.0, 65504.0);
     return output;
 }
 
@@ -733,6 +809,9 @@ void MeshMain(
         GpuVertex source = sceneVertices[vertexIndex];
         float4 worldPosition = mul(instance.transform, float4(source.position.xyz, 1.0));
         vertices[outputVertex].position = mul(frame.viewProjection, worldPosition);
+        float4 previousWorldPosition = mul(instance.previousTransform, float4(source.position.xyz, 1.0));
+        vertices[outputVertex].previousClipPosition =
+            mul(temporalFrame[0].previousViewProjection, previousWorldPosition);
         vertices[outputVertex].worldPosition = worldPosition.xyz;
         vertices[outputVertex].worldNormal = normalize(mul((float3x3)instance.normalTransform, source.normal.xyz));
         vertices[outputVertex].worldTangent = float4(
@@ -750,8 +829,7 @@ void MeshMain(
     }
 }
 
-[shader("fragment")]
-FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
+FragmentOutput shadeFragment(MeshVertex input, bool frontFacing)
 {
     FragmentOutput output;
     if (frame.showMeshlets == 1u)
@@ -792,27 +870,17 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
     float3 baseColor = surface.baseColor;
     float3 directRadiance = float3(0.0);
     float3 color = surface.emissive;
-    uint lightCount;
-    uint lightStride;
-    sceneLights.GetDimensions(lightCount, lightStride);
     uint pixelSeed = uint(input.position.x) * 0x9e3779b9u ^ uint(input.position.y) * 0x85ebca6bu;
     if (globalLightMode != 1)
     {
-        for (uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
-        {
-            DirectLightSample lightSample = sampleAnalyticLight(sceneLights[lightIndex], input.worldPosition,
-                                                                pixelSeed ^ (lightIndex * 0x27d4eb2fu));
-            float visibility = frame.rayTracedShadows != 0
-                                   ? traceDirectVisibility(input.worldPosition, normal, lightSample) : 1.0;
-            float nDotLight = saturate(dot(normal, lightSample.direction));
-            color += evaluateRealtimeSurfaceBsdf(surface, viewDirection, lightSample.direction) *
-                     nDotLight * lightSample.radiance * visibility;
-            if (lightIndex == 0u)
-            {
-                lightDirection = lightSample.direction;
-                directRadiance = lightSample.radiance * visibility;
-            }
-        }
+        DirectLightSample lightSample = sampleAnalyticLightSet(input.worldPosition, pixelSeed);
+        float visibility = frame.rayTracedShadows != 0
+                               ? traceDirectVisibility(input.worldPosition, normal, lightSample) : 1.0;
+        float nDotLight = saturate(dot(normal, lightSample.direction));
+        color += evaluateRealtimeSurfaceBsdf(surface, viewDirection, lightSample.direction) *
+                 nDotLight * lightSample.radiance * visibility;
+        lightDirection = lightSample.direction;
+        directRadiance = lightSample.radiance * visibility;
     }
     DirectLightSample emissiveLight = sampleEmissiveLight(input.worldPosition, pixelSeed ^ 0x165667b1u);
     if (dot(emissiveLight.radiance, emissiveLight.radiance) > 0.0)
@@ -946,18 +1014,13 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
             float3 localReflection = float3(0.0);
             if (globalLightMode != 1)
             {
-                for (uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
-                {
-                    DirectLightSample hitLight = sampleAnalyticLight(
-                        sceneLights[lightIndex], hitPosition,
-                        pixelSeed ^ (lightIndex * 0x27d4eb2fu) ^ 0xb5297a4du);
-                    float hitVisibility = frame.rayTracedShadows != 0
-                                              ? traceDirectVisibility(hitPosition, hitNormal, hitLight) : 1.0;
-                    localReflection += evaluateRealtimeSurfaceBsdf(hitSurface, reflectedViewDirection,
-                                                                   hitLight.direction) *
-                                       saturate(dot(hitNormal, hitLight.direction)) *
-                                       hitLight.radiance * hitVisibility;
-                }
+                DirectLightSample hitLight = sampleAnalyticLightSet(hitPosition, pixelSeed ^ 0xb5297a4du);
+                float hitVisibility = frame.rayTracedShadows != 0
+                                          ? traceDirectVisibility(hitPosition, hitNormal, hitLight) : 1.0;
+                localReflection += evaluateRealtimeSurfaceBsdf(hitSurface, reflectedViewDirection,
+                                                               hitLight.direction) *
+                                   saturate(dot(hitNormal, hitLight.direction)) *
+                                   hitLight.radiance * hitVisibility;
             }
             DirectLightSample hitEmissiveLight = sampleEmissiveLight(hitPosition, pixelSeed ^ 0x68e31da4u);
             if (dot(hitEmissiveLight.radiance, hitEmissiveLight.radiance) > 0.0)
@@ -1092,5 +1155,40 @@ FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
         color = color / (1.0 + color);
     }
     output.color = float4(color, material.materialFlags.y == ALPHA_MODE_BLEND ? surface.alpha : 1.0);
+    return output;
+}
+
+[shader("fragment")]
+FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
+{
+    return shadeFragment(input, frontFacing);
+}
+
+[shader("fragment")]
+DenoiserFragmentOutput DenoiserFragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
+{
+    FragmentOutput beauty = shadeFragment(input, frontFacing);
+    GpuMaterial material = loadMaterial(input.materialId);
+    float3 interpolatedNormal = normalize(input.worldNormal);
+    float3 geometricNormal = cross(ddx(input.worldPosition), ddy(input.worldPosition));
+    geometricNormal = dot(geometricNormal, geometricNormal) > 1e-12
+                          ? normalize(geometricNormal) : interpolatedNormal;
+    if (dot(geometricNormal, interpolatedNormal) < 0.0)
+        geometricNormal = -geometricNormal;
+    SurfaceData surface = resolveMaterialSurface(material, input.worldPosition, geometricNormal,
+                                                 interpolatedNormal, input.worldTangent, input.uv);
+    float3 viewDirection = normalize(frame.cameraPosition.xyz - input.worldPosition);
+    float3 normal = dot(surface.shadingNormal, viewDirection) < 0.0
+                        ? -surface.shadingNormal : surface.shadingNormal;
+    TemporalFrameData temporal = temporalFrame[0];
+    float2 previousNdc = input.previousClipPosition.xy /
+                         max(abs(input.previousClipPosition.w), 1e-6);
+    float2 previousPixel = (previousNdc * 0.5 + 0.5) * temporal.outputSize;
+    float2 flow = temporal.historyValid != 0u ? input.position.xy - previousPixel : float2(0.0);
+    DenoiserFragmentOutput output;
+    output.color = beauty.color;
+    output.flow = flow;
+    output.albedo = float4(surface.baseColor * (1.0 - surface.metallic), 1.0);
+    output.normalDepth = float4(normal, length(frame.cameraPosition.xyz - input.worldPosition));
     return output;
 }

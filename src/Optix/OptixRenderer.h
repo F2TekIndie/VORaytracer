@@ -34,6 +34,7 @@ public:
     bool setGpuInteropSurface(const GpuInteropSurface& surface);
     bool denoiseVulkanFrame(float exposure, bool temporalRendering);
     void clearGpuInteropSurface();
+    void invalidateTemporalHistory() { denoiserTemporalHistoryValid_ = false; }
     [[nodiscard]] bool hasGpuInteropSurface() const { return interopOutputBuffer_ != 0; }
     [[nodiscard]] std::uint32_t outputWidth() const { return width_; }
     [[nodiscard]] std::uint32_t outputHeight() const { return height_; }
@@ -76,10 +77,15 @@ private:
     OptixProgramGroup hitProgramGroup_{};
     OptixPipeline pipeline_{};
     CUdeviceptr outputBuffer_{};
+    CUdeviceptr sampleCountBuffer_{};
+    CUdeviceptr luminanceMomentsBuffer_{};
     CUdeviceptr interopBaseBuffer_{};
     CUdeviceptr interopInputBuffer_{};
     CUdeviceptr interopDenoisedBuffer_{};
     CUdeviceptr interopOutputBuffer_{};
+    CUdeviceptr interopFlowBuffer_{};
+    CUdeviceptr interopAlbedoBuffer_{};
+    CUdeviceptr interopNormalDepthBuffer_{};
     CUexternalMemory externalMemory_{};
     CUexternalSemaphore cudaReadySemaphore_{};
     CUexternalSemaphore vulkanCompleteSemaphore_{};
@@ -96,6 +102,7 @@ private:
     CUdeviceptr materialBuffer_{};
     CUdeviceptr textureMetadataBuffer_{};
     CUdeviceptr lightBuffer_{};
+    CUdeviceptr lightAliasBuffer_{};
     CUdeviceptr emissiveTriangleBuffer_{};
     CUdeviceptr environmentBuffer_{};
     CUdeviceptr environmentConditionalCdfBuffer_{};
@@ -108,6 +115,7 @@ private:
     std::size_t materialCount_{};
     std::size_t textureMetadataCount_{};
     std::size_t lightCount_{};
+    float analyticLightPower_{};
     std::size_t instanceCount_{};
     std::size_t emissiveTriangleCount_{};
     float emissiveLightPower_{};
@@ -121,7 +129,6 @@ private:
     OptixDenoiser denoiser_{};
     CUdeviceptr denoiserState_{};
     CUdeviceptr denoiserScratch_{};
-    CUdeviceptr denoiserFlow_{};
     CUdeviceptr denoiserPreviousOutput_{};
     CUdeviceptr denoiserPreviousInternalGuide_{};
     CUdeviceptr denoiserOutputInternalGuide_{};
@@ -134,6 +141,7 @@ private:
     bool firstInteropLaunch_{true};
     std::array<bool, kLaunchSlotCount> launchSlotPending_{};
     bool launchTimingPending_{};
+    bool resetSamplingBuffersPending_{true};
     bool interopBgra_{true};
     std::uint32_t width_{1};
     std::uint32_t height_{1};

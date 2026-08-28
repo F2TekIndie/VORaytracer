@@ -51,6 +51,9 @@ struct RenderSettings
     bool indirectLighting{true};
     bool denoiser{false};
     bool temporalRendering{true};
+    bool adaptiveSampling{true};
+    std::uint32_t adaptiveMinSamples{16};
+    float adaptiveNoiseThreshold{0.02f};
     bool vsync{true};
     bool showMeshlets{false};
     DebugView debugView{DebugView::Beauty};
@@ -85,6 +88,9 @@ struct GpuInteropSurface
     std::uint64_t inputOffset{};
     std::uint64_t denoisedOffset{};
     std::uint64_t displayOffset{};
+    std::uint64_t flowOffset{};
+    std::uint64_t albedoOffset{};
+    std::uint64_t normalDepthOffset{};
     std::uint64_t generation{};
     std::uint32_t width{};
     std::uint32_t height{};
@@ -93,7 +99,7 @@ struct GpuInteropSurface
     [[nodiscard]] explicit operator bool() const
     {
         return memoryHandle && cudaReadySemaphoreHandle && vulkanCompleteSemaphoreHandle && pixelByteSize > 0 &&
-               bufferByteSize >= displayOffset + pixelByteSize;
+               bufferByteSize >= normalDepthOffset + pixelByteSize * 2;
     }
 };
 
