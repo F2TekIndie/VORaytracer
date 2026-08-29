@@ -49,6 +49,11 @@ public:
     bool requestImageCapture(std::filesystem::path outputPath,
                              std::filesystem::path referencePath = {},
                              float maximumRmse = 0.02f);
+    void setTextureStreamingOptions(bool enabled, std::uint32_t budgetMiB)
+    {
+        textureStreamingEnabled_ = enabled;
+        textureBudgetMiB_ = budgetMiB > 0 ? budgetMiB : 1u;
+    }
 
 private:
     static constexpr std::uint32_t kFramesInFlight = 2;
@@ -142,6 +147,23 @@ private:
     };
     static_assert(sizeof(TemporalFrameData) == 80);
 
+    struct GpuDdgiProbe
+    {
+        Vec4 positionAndValidity{};
+        Vec4 irradiance{};
+        Vec4 directionAndDistance{};
+    };
+    static_assert(sizeof(GpuDdgiProbe) == 48);
+
+    struct DdgiSettings
+    {
+        Vec4 gridMinimumAndHysteresis{};
+        Vec4 gridMaximumAndIntensity{};
+        std::uint32_t gridDimensions[4]{8, 4, 8, 0};
+        std::uint32_t frameRaysAndFlags[4]{0, 8, 1, 0};
+    };
+    static_assert(sizeof(DdgiSettings) == 64);
+
     bool createInstance();
     bool createSurface();
     bool selectPhysicalDevice();
@@ -159,6 +181,7 @@ private:
     void destroyTextureResources();
     bool uploadSceneResources();
     bool uploadTextureResources();
+    void finishTextureUpload();
     bool buildAccelerationStructures();
     void destroyAccelerationStructures();
     GpuBuffer createDeviceLocalBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
@@ -166,6 +189,8 @@ private:
     std::uint32_t findMemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags properties) const;
     void recordCommands(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, const GpuBuffer* externalBuffer);
     void recordDenoiserInputCommands(VkCommandBuffer commandBuffer);
+    void recordOitPass(VkCommandBuffer commandBuffer, VkImageView targetView, VkPipeline compositePipeline);
+    void recordDdgiUpdate(VkCommandBuffer commandBuffer);
     void updateFrameConstants(const Camera& camera, const RenderSettings& settings);
     bool createDenoiserInputImage(std::uint32_t width, std::uint32_t height);
     void destroyDenoiserInputImage();
@@ -197,6 +222,9 @@ private:
     VkDeviceMemory depthImageMemory_{VK_NULL_HANDLE};
     VkImageView depthImageView_{VK_NULL_HANDLE};
     bool depthImageInitialized_{};
+    GpuTexture oitAccumulation_{};
+    GpuTexture oitRevealage_{};
+    bool oitImagesInitialized_{};
 
     VkCommandPool commandPool_{VK_NULL_HANDLE};
     VkQueryPool timestampQueryPool_{VK_NULL_HANDLE};
@@ -212,6 +240,9 @@ private:
     VkPipeline denoiserMeshPipeline_{VK_NULL_HANDLE};
     VkPipeline denoiserTransparentMeshPipeline_{VK_NULL_HANDLE};
     VkPipeline denoiserBackgroundPipeline_{VK_NULL_HANDLE};
+    VkPipeline oitCompositePipeline_{VK_NULL_HANDLE};
+    VkPipeline denoiserOitCompositePipeline_{VK_NULL_HANDLE};
+    VkPipeline ddgiUpdatePipeline_{VK_NULL_HANDLE};
     PFN_vkCmdDrawMeshTasksEXT cmdDrawMeshTasks_{};
     VkDescriptorSetLayout sceneDescriptorSetLayout_{VK_NULL_HANDLE};
     VkDescriptorPool sceneDescriptorPool_{VK_NULL_HANDLE};
@@ -226,6 +257,8 @@ private:
     GpuBuffer lightBuffer_{};
     GpuBuffer lightAliasBuffer_{};
     GpuBuffer temporalFrameBuffer_{};
+    GpuBuffer ddgiProbeBuffer_{};
+    GpuBuffer ddgiSettingsBuffer_{};
     GpuBuffer emissiveTriangleBuffer_{};
     GpuBuffer textureMetadataBuffer_{};
     std::vector<GpuTexture> materialTextures_;
@@ -235,6 +268,13 @@ private:
     VkDeviceSize iblTextureBytes_{};
     std::vector<VkSampler> materialTextureSamplers_;
     VkSampler environmentSampler_{VK_NULL_HANDLE};
+    GpuBuffer textureUploadStaging_{};
+    VkCommandBuffer textureUploadCommand_{VK_NULL_HANDLE};
+    VkFence textureUploadFence_{VK_NULL_HANDLE};
+    bool materialTextureBc3_{};
+    bool textureStreamingEnabled_{true};
+    std::uint32_t textureBudgetMiB_{512};
+    VkDeviceSize materialTextureBytes_{};
     GpuBuffer tlasStorage_{};
     GpuBuffer accelerationInstanceBuffer_{};
     std::vector<BlasResource> blases_;
@@ -252,6 +292,7 @@ private:
     std::uint32_t uploadedVertexCount_{};
     std::uint32_t uploadedTriangleCount_{};
     FramePushConstants framePushConstants_{};
+    DdgiSettings ddgiSettings_{};
     Mat4 previousViewProjection_{Mat4::identity()};
     bool temporalHistoryValid_{};
     GpuBuffer gpuInteropBuffer_{};

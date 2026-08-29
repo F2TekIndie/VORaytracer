@@ -96,6 +96,21 @@ struct GpuTextureMetadata
     float4 rotationAndUvSet;
 };
 
+struct GpuDdgiProbe
+{
+    float4 positionAndValidity;
+    float4 irradiance;
+    float4 directionAndDistance;
+};
+
+struct DdgiSettings
+{
+    float4 gridMinimumAndHysteresis;
+    float4 gridMaximumAndIntensity;
+    uint4 gridDimensions;
+    uint4 frameRaysAndFlags;
+};
+
 struct FramePushConstants
 {
     float4x4 viewProjection;
@@ -140,6 +155,11 @@ static const uint RENDER_FLAG_TRANSPARENT_PASS = 1u << 1;
 [[vk::binding(15, 0)]] StructuredBuffer<GpuTextureMetadata> textureMetadata;
 [[vk::binding(16, 0)]] StructuredBuffer<GpuLightAlias> lightAliases;
 [[vk::binding(17, 0)]] StructuredBuffer<TemporalFrameData> temporalFrame;
+[[vk::binding(18, 0)]] Texture2D<float4> oitAccumulationTexture;
+[[vk::binding(19, 0)]] Texture2D<float> oitRevealageTexture;
+[[vk::binding(20, 0)]] StructuredBuffer<GpuDdgiProbe> ddgiProbes;
+[[vk::binding(21, 0)]] StructuredBuffer<DdgiSettings> ddgiSettingsBuffer;
+[[vk::binding(22, 0)]] RWStructuredBuffer<GpuDdgiProbe> ddgiProbeUpdates;
 [[vk::push_constant]] ConstantBuffer<FramePushConstants> frame;
 
 struct MeshVertex
@@ -166,6 +186,12 @@ struct DenoiserFragmentOutput
     float2 flow : SV_Target1;
     float4 albedo : SV_Target2;
     float4 normalDepth : SV_Target3;
+};
+
+struct OitFragmentOutput
+{
+    float4 accumulation : SV_Target0;
+    float revealage : SV_Target1;
 };
 
 struct BackgroundVertexOutput
@@ -480,6 +506,150 @@ float3 sampleDiffuseEnvironment(float3 normal)
     if (mode == 0)
         return float3(0.0);
     return sampleGlobalEnvironment(normal);
+}
+
+float3 sampleDdgiIrradiance(float3 worldPosition, float3 normal)
+{
+    DdgiSettings settings = ddgiSettingsBuffer[0];
+    if (settings.frameRaysAndFlags.z == 0u)
+        return float3(0.0);
+    float3 extent = max(settings.gridMaximumAndIntensity.xyz - settings.gridMinimumAndHysteresis.xyz,
+                        float3(1e-4));
+    float3 gridCoordinate = saturate((worldPosition - settings.gridMinimumAndHysteresis.xyz) / extent) *
+                            float3(settings.gridDimensions.xyz - 1u);
+    uint3 lower = uint3(floor(gridCoordinate));
+    uint3 upper = min(lower + 1u, settings.gridDimensions.xyz - 1u);
+    float3 blend = frac(gridCoordinate);
+    float3 irradiance = float3(0.0);
+    float3 dominantDirection = float3(0.0);
+    float validity = 0.0;
+    for (uint corner = 0; corner < 8u; ++corner)
+    {
+        uint3 coordinate = uint3((corner & 1u) != 0u ? upper.x : lower.x,
+                                 (corner & 2u) != 0u ? upper.y : lower.y,
+                                 (corner & 4u) != 0u ? upper.z : lower.z);
+        float3 weight3 = float3((corner & 1u) != 0u ? blend.x : 1.0 - blend.x,
+                                (corner & 2u) != 0u ? blend.y : 1.0 - blend.y,
+                                (corner & 4u) != 0u ? blend.z : 1.0 - blend.z);
+        float weight = weight3.x * weight3.y * weight3.z;
+        uint index = coordinate.x + settings.gridDimensions.x *
+                     (coordinate.y + settings.gridDimensions.y * coordinate.z);
+        GpuDdgiProbe probe = ddgiProbes[index];
+        float probeWeight = weight * probe.positionAndValidity.w;
+        irradiance += probe.irradiance.xyz * probeWeight;
+        dominantDirection += probe.directionAndDistance.xyz * probeWeight;
+        validity += probeWeight;
+    }
+    if (validity <= 1e-5)
+        return float3(0.0);
+    irradiance /= validity;
+    dominantDirection = normalize(dominantDirection / validity + float3(1e-6, 0.0, 0.0));
+    float directionalWeight = 0.35 + 0.65 * saturate(dot(normal, dominantDirection));
+    return irradiance * directionalWeight * settings.gridMaximumAndIntensity.w;
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void DdgiUpdateMain(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    DdgiSettings settings = ddgiSettingsBuffer[0];
+    uint probeCount = settings.gridDimensions.x * settings.gridDimensions.y * settings.gridDimensions.z;
+    uint probeIndex = dispatchThreadId.x;
+    if (probeIndex >= probeCount || settings.frameRaysAndFlags.z == 0u)
+        return;
+    GpuDdgiProbe previous = ddgiProbeUpdates[probeIndex];
+    uint rayCount = clamp(settings.frameRaysAndFlags.y, 1u, 32u);
+    float3 accumulatedRadiance = float3(0.0);
+    float3 accumulatedDirection = float3(0.0);
+    float accumulatedDistance = 0.0;
+    for (uint rayIndex = 0; rayIndex < rayCount; ++rayIndex)
+    {
+        uint seed = meshletHash(probeIndex * 0x9e3779b9u ^ rayIndex * 0x85ebca6bu ^
+                                settings.frameRaysAndFlags.x * 0xc2b2ae35u);
+        float u = (float(rayIndex) + 0.5) / float(rayCount);
+        float v = float(seed & 0x00ffffffu) / float(0x01000000u);
+        float z = 1.0 - 2.0 * u;
+        float radius = sqrt(max(1.0 - z * z, 0.0));
+        float angle = 2.0 * PI * v;
+        float3 direction = float3(radius * cos(angle), z, radius * sin(angle));
+        RayDesc ray;
+        ray.Origin = previous.positionAndValidity.xyz;
+        ray.Direction = direction;
+        ray.TMin = 0.002;
+        ray.TMax = length(settings.gridMaximumAndIntensity.xyz - settings.gridMinimumAndHysteresis.xyz) * 2.0;
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+        query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xff, ray);
+        while (query.Proceed())
+        {
+            CandidateMaterial candidate = resolveCandidateMaterial(query.CandidateInstanceID(),
+                                                                    query.CandidatePrimitiveIndex(),
+                                                                    query.CandidateTriangleBarycentrics());
+            if (candidate.accepted && candidate.alphaMode != ALPHA_MODE_BLEND &&
+                (candidate.doubleSided || query.CandidateTriangleFrontFace()))
+                query.CommitNonOpaqueTriangleHit();
+        }
+        float3 radiance;
+        float distance = ray.TMax;
+        if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            uint instanceIndex = query.CommittedInstanceID();
+            GpuInstance instance = sceneInstances[instanceIndex];
+            uint primitiveIndex = query.CommittedPrimitiveIndex();
+            uint triangleOffset = instance.geometry.y + primitiveIndex * 3u;
+            uint3 triangle = uint3(geometryIndices[triangleOffset], geometryIndices[triangleOffset + 1u],
+                                   geometryIndices[triangleOffset + 2u]);
+            float2 barycentrics = query.CommittedTriangleBarycentrics();
+            float barycentric0 = 1.0 - barycentrics.x - barycentrics.y;
+            float3 normal = normalize(sceneVertices[instance.geometry.x + triangle.x].normal.xyz * barycentric0 +
+                                      sceneVertices[instance.geometry.x + triangle.y].normal.xyz * barycentrics.x +
+                                      sceneVertices[instance.geometry.x + triangle.z].normal.xyz * barycentrics.y);
+            normal = normalize(mul((float3x3)instance.normalTransform, normal));
+            if (dot(normal, -direction) < 0.0) normal = -normal;
+            float4 uvSets = sceneVertices[instance.geometry.x + triangle.x].uv * barycentric0 +
+                            sceneVertices[instance.geometry.x + triangle.y].uv * barycentrics.x +
+                            sceneVertices[instance.geometry.x + triangle.z].uv * barycentrics.y;
+            GpuMaterial material = loadMaterial(instance.materialIndex);
+            float4 baseSample = material.textureIndices0.x == INVALID_TEXTURE_ID ? float4(1.0) :
+                materialTextures[NonUniformResourceIndex(material.textureIndices0.x)].SampleLevel(
+                    materialTextureSamplers[NonUniformResourceIndex(material.textureIndices0.x)],
+                    transformedTextureUv(material.textureIndices0.x, uvSets), 2.0);
+            float3 baseColor = max(material.baseColorFactor.xyz * baseSample.xyz, 0.0);
+            float metallic = saturate(material.emissiveAndMetallic.w);
+            if (material.textureIndices0.y != INVALID_TEXTURE_ID)
+                metallic *= materialTextures[NonUniformResourceIndex(material.textureIndices0.y)].SampleLevel(
+                    materialTextureSamplers[NonUniformResourceIndex(material.textureIndices0.y)],
+                    transformedTextureUv(material.textureIndices0.y, uvSets), 2.0).z;
+            float3 emissiveSample = material.textureIndices0.w == INVALID_TEXTURE_ID ? float3(1.0) :
+                materialTextures[NonUniformResourceIndex(material.textureIndices0.w)].SampleLevel(
+                    materialTextureSamplers[NonUniformResourceIndex(material.textureIndices0.w)],
+                    transformedTextureUv(material.textureIndices0.w, uvSets), 2.0).xyz;
+            float3 emissive = material.emissiveAndMetallic.xyz * emissiveSample;
+            float3 incoming = uint(frame.lightDirectionAndMode.w + 0.5) == 0u
+                                  ? frame.lightColorAndIntensity.xyz * frame.lightColorAndIntensity.w *
+                                        saturate(dot(normal, normalize(-frame.lightDirectionAndMode.xyz)))
+                                  : sampleDiffuseEnvironment(normal);
+            radiance = emissive + baseColor * (1.0 - metallic) * incoming;
+            distance = query.CommittedRayT();
+        }
+        else
+            radiance = sampleGlobalEnvironment(direction);
+        accumulatedRadiance += radiance;
+        accumulatedDirection += direction * max(dot(radiance, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+        accumulatedDistance += distance;
+    }
+    float inverseRayCount = 1.0 / float(rayCount);
+    float3 irradiance = accumulatedRadiance * inverseRayCount;
+    float3 dominantDirection = normalize(accumulatedDirection + float3(1e-6, 0.0, 0.0));
+    float averageDistance = accumulatedDistance * inverseRayCount;
+    float historyWeight = previous.positionAndValidity.w > 0.0
+                              ? saturate(settings.gridMinimumAndHysteresis.w) : 0.0;
+    GpuDdgiProbe updated = previous;
+    updated.positionAndValidity.w = 1.0;
+    updated.irradiance = float4(lerp(irradiance, previous.irradiance.xyz, historyWeight), 0.0);
+    updated.directionAndDistance = float4(
+        normalize(lerp(dominantDirection, previous.directionAndDistance.xyz, historyWeight)),
+        lerp(averageDistance, previous.directionAndDistance.w, historyWeight));
+    ddgiProbeUpdates[probeIndex] = updated;
 }
 
 float3 samplePrefilteredEnvironment(float3 reflectionDirection, float roughness)
@@ -920,7 +1090,8 @@ FragmentOutput shadeFragment(MeshVertex input, bool frontFacing)
     }
     if (frame.skyHorizonAndIndirect.w != 0.0 && surface.metallic < 0.999)
     {
-        float3 indirectRadiance = sampleDiffuseEnvironment(normal);
+        float3 indirectRadiance = sampleDiffuseEnvironment(normal) +
+                                  sampleDdgiIrradiance(input.worldPosition, normal);
         float nDotV = saturate(dot(normal, viewDirection));
         float3 diffuseF0 = lerp(float3(dielectricF0(surface.ior)), baseColor, surface.metallic);
         float3 diffuseFresnel = fresnelSchlickRoughness(nDotV, diffuseF0, surface.roughness);
@@ -1162,6 +1333,31 @@ FragmentOutput shadeFragment(MeshVertex input, bool frontFacing)
 FragmentOutput FragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
 {
     return shadeFragment(input, frontFacing);
+}
+
+[shader("fragment")]
+OitFragmentOutput OitFragmentMain(MeshVertex input, bool frontFacing : SV_IsFrontFace)
+{
+    FragmentOutput shaded = shadeFragment(input, frontFacing);
+    float alpha = saturate(shaded.color.a);
+    float depthWeight = max(1.0 - input.position.z * 0.9, 0.1);
+    float weight = clamp((alpha * 8.0 + 0.01) * depthWeight * depthWeight * depthWeight,
+                         0.01, 8.0);
+    OitFragmentOutput output;
+    output.accumulation = float4(shaded.color.rgb * alpha, alpha) * weight;
+    output.revealage = alpha;
+    return output;
+}
+
+[shader("fragment")]
+FragmentOutput OitCompositeFragment(BackgroundVertexOutput input)
+{
+    int2 pixel = int2(input.position.xy);
+    float4 accumulation = oitAccumulationTexture.Load(int3(pixel, 0));
+    float revealage = saturate(oitRevealageTexture.Load(int3(pixel, 0)));
+    FragmentOutput output;
+    output.color = float4(accumulation.rgb / max(accumulation.a, 1e-5), 1.0 - revealage);
+    return output;
 }
 
 [shader("fragment")]

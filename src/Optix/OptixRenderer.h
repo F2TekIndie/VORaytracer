@@ -38,6 +38,11 @@ public:
     [[nodiscard]] bool hasGpuInteropSurface() const { return interopOutputBuffer_ != 0; }
     [[nodiscard]] std::uint32_t outputWidth() const { return width_; }
     [[nodiscard]] std::uint32_t outputHeight() const { return height_; }
+    void setTextureStreamingOptions(bool enabled, std::uint32_t budgetMiB)
+    {
+        textureStreamingEnabled_ = enabled;
+        textureBudgetMiB_ = budgetMiB > 0 ? budgetMiB : 1u;
+    }
 
 private:
     static constexpr std::uint32_t kLaunchSlotCount = 3;
@@ -110,6 +115,10 @@ private:
     CUdeviceptr textureTableBuffer_{};
     std::vector<CUmipmappedArray> textureArrays_;
     std::vector<CUtexObject> textureObjects_;
+    void* textureUploadHost_{};
+    bool textureStreamingEnabled_{true};
+    std::uint32_t textureBudgetMiB_{512};
+    std::size_t materialTextureBytes_{};
     std::size_t vertexCount_{};
     std::size_t triangleCount_{};
     std::size_t materialCount_{};
@@ -117,6 +126,7 @@ private:
     std::size_t lightCount_{};
     float analyticLightPower_{};
     std::size_t instanceCount_{};
+    std::uint32_t motionTransformCount_{};
     std::size_t emissiveTriangleCount_{};
     float emissiveLightPower_{};
     std::size_t environmentPixelCount_{};
@@ -124,6 +134,7 @@ private:
     std::size_t environmentMarginalCdfCount_{};
     CUdeviceptr gasBuffer_{};
     CUdeviceptr iasInstanceBuffer_{};
+    CUdeviceptr motionTransformBuffer_{};
     std::vector<CUdeviceptr> meshGasBuffers_;
     OptixTraversableHandle gasHandle_{};
     OptixDenoiser denoiser_{};
@@ -149,5 +160,7 @@ private:
     bool available_{};
     std::string unavailableReason_;
     RendererStats stats_{};
+    Camera previousCamera_{};
+    bool previousCameraValid_{};
 };
 } // namespace vor

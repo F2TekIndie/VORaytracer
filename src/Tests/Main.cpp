@@ -202,6 +202,10 @@ int main()
         require(texture.mipOffsets.size() == 2 && texture.mipOffsets[0] == 0 && texture.mipOffsets[1] == 16,
                 "texture mip offsets");
         require(texture.rgba8Pixels.size() == 20, "texture mip byte count");
+        require(texture.hasBc3() && texture.bc3MipOffsets.size() == 2 &&
+                    texture.bc3MipOffsets[0] == 0 && texture.bc3MipOffsets[1] == 16 &&
+                    texture.bc3Pixels.size() == 32,
+                "BC3 texture mip chain generation");
         const Material& texturedMaterial = texturedImport.scene.materials[
             texturedImport.scene.meshes.front().materialIndex];
         require(texturedMaterial.baseColorTexture >= 0, "base-color texture reference");

@@ -2,6 +2,7 @@
 
 #include "Core/Log.h"
 #include "Core/LightSampling.h"
+#include "Core/TextureCompression.h"
 
 #include <optix_function_table_definition.h>
 #include <optix_stack_size.h>
@@ -13,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -149,13 +151,15 @@ static_assert(sizeof(GpuEmissiveTriangle) == 160);
 struct alignas(16) GpuOptixInstance
 {
     Mat4 transform;
+    Mat4 previousTransform;
     Mat4 normalTransform;
+    Mat4 previousNormalTransform;
     std::uint32_t geometry[4];
     std::uint32_t materialIndex;
     float handedness;
     std::uint32_t padding[2];
 };
-static_assert(sizeof(GpuOptixInstance) == 160);
+static_assert(sizeof(GpuOptixInstance) == 288);
 
 struct LaunchParameters
 {
@@ -199,7 +203,7 @@ struct LaunchParameters
     std::uint32_t writeDisplay;
     std::uint32_t materialOverrideId;
     std::uint32_t debugView;
-    std::uint32_t padding;
+    std::uint32_t motionTransformCount;
     std::uint32_t indirectLighting;
     std::uint32_t globalLightMode;
     std::uint32_t environmentWidth;
@@ -213,6 +217,9 @@ struct LaunchParameters
     Vec4 cameraPositionAndFov;
     Vec4 cameraTargetAndAspect;
     Vec4 cameraUp;
+    Vec4 previousCameraPositionAndShutter;
+    Vec4 previousCameraTargetAndAperture;
+    Vec4 previousCameraUpAndFocus;
     Vec4 lightPosition;
     Vec4 lightColorAndIntensity;
     Vec4 lightDirection;
@@ -343,6 +350,7 @@ void OptixRenderer::setScene(const Scene* scene)
 {
     denoiserTemporalHistoryValid_ = false;
     scene_ = scene;
+    previousCameraValid_ = false;
     stats_.totalMeshlets = scene ? static_cast<std::uint32_t>(scene->meshletCount()) : 0;
     if (available_ && !buildSceneAcceleration())
         log(LogLevel::Error, "OptiX scene acceleration build failed: " + unavailableReason_);
@@ -827,6 +835,7 @@ bool OptixRenderer::uploadTextureResources()
     fallback.mipCount = 1;
     fallback.mipOffsets = {0};
     fallback.rgba8Pixels = {255, 255, 255, 255};
+    compressTextureBc3(fallback);
     std::vector<const TextureReference*> sources;
     if (scene_ && !scene_->textures.empty())
     {
@@ -839,37 +848,111 @@ bool OptixRenderer::uploadTextureResources()
     else
         sources.push_back(&fallback);
 
+    const auto canUseCudaBc3 = [](const TextureReference& source) {
+        return source.hasBc3() && source.width >= 4u && source.height >= 4u &&
+               source.width % 4u == 0u && source.height % 4u == 0u;
+    };
+    std::vector<bool> useBc3(sources.size());
+    std::vector<std::uint32_t> residentBaseMips(sources.size(), 0u);
+    for (std::size_t index = 0; index < sources.size(); ++index)
+        useBc3[index] = canUseCudaBc3(*sources[index]);
+    const auto pixelsFor = [&](std::size_t index) -> const std::vector<std::uint8_t>& {
+        return useBc3[index] ? sources[index]->bc3Pixels : sources[index]->rgba8Pixels;
+    };
+    const auto offsetsFor = [&](std::size_t index) -> const std::vector<std::uint32_t>& {
+        return useBc3[index] ? sources[index]->bc3MipOffsets : sources[index]->mipOffsets;
+    };
+    std::size_t residentTextureBytes = 0;
+    for (std::size_t index = 0; index < sources.size(); ++index)
+        residentTextureBytes += pixelsFor(index).size();
+    if (textureStreamingEnabled_)
+    {
+        const std::size_t budgetBytes = static_cast<std::size_t>(textureBudgetMiB_) * 1024u * 1024u;
+        while (residentTextureBytes > budgetBytes)
+        {
+            std::size_t bestIndex = sources.size(), bestSaving = 0;
+            for (std::size_t index = 0; index < sources.size(); ++index)
+            {
+                const TextureReference& source = *sources[index];
+                const std::uint32_t nextMip = residentBaseMips[index] + 1u;
+                if (nextMip >= source.mipCount ||
+                    (useBc3[index] && (std::max(source.width >> nextMip, 1u) < 4u ||
+                                       std::max(source.height >> nextMip, 1u) < 4u)))
+                    continue;
+                const auto& offsets = offsetsFor(index);
+                const std::size_t saving = offsets[nextMip] - offsets[nextMip - 1u];
+                if (saving > bestSaving) { bestSaving = saving; bestIndex = index; }
+            }
+            if (bestIndex == sources.size() || bestSaving == 0)
+                break;
+            ++residentBaseMips[bestIndex];
+            residentTextureBytes -= bestSaving;
+        }
+    }
+    materialTextureBytes_ = residentTextureBytes;
+    std::vector<std::size_t> sourceOffsets(sources.size());
+    std::size_t uploadBytes = 0;
+    for (std::size_t index = 0; index < sources.size(); ++index)
+    {
+        uploadBytes = (uploadBytes + 15u) & ~std::size_t{15u};
+        sourceOffsets[index] = uploadBytes;
+        const auto& pixels = pixelsFor(index);
+        uploadBytes += pixels.size() - offsetsFor(index)[residentBaseMips[index]];
+    }
+    checkCuda(cuMemHostAlloc(&textureUploadHost_, uploadBytes, CU_MEMHOSTALLOC_PORTABLE),
+              "cuMemHostAlloc(material texture staging)");
+    for (std::size_t index = 0; index < sources.size(); ++index)
+    {
+        const auto& pixels = pixelsFor(index);
+        const std::size_t sourceOffset = offsetsFor(index)[residentBaseMips[index]];
+        std::memcpy(static_cast<std::byte*>(textureUploadHost_) + sourceOffsets[index],
+                    pixels.data() + sourceOffset, pixels.size() - sourceOffset);
+    }
+
     textureArrays_.reserve(sources.size());
     textureObjects_.reserve(sources.size());
-    for (const TextureReference* sourcePointer : sources)
+    for (std::size_t sourceIndex = 0; sourceIndex < sources.size(); ++sourceIndex)
     {
+        const TextureReference* sourcePointer = sources[sourceIndex];
         const TextureReference& source = *sourcePointer;
+        // CUDA's native BC arrays require complete 4x4 base blocks. Keep tiny
+        // or non-block-aligned assets uncompressed so normalized UVs and array
+        // creation remain exact.
+        const bool compressed = useBc3[sourceIndex];
+        const std::uint32_t baseMip = residentBaseMips[sourceIndex];
+        const std::uint32_t residentMipCount = source.mipCount - baseMip;
         CUDA_ARRAY3D_DESCRIPTOR arrayDescription{};
-        arrayDescription.Width = source.width;
-        arrayDescription.Height = source.height;
+        arrayDescription.Width = std::max(source.width >> baseMip, 1u);
+        arrayDescription.Height = std::max(source.height >> baseMip, 1u);
         arrayDescription.Depth = 0;
-        arrayDescription.Format = CU_AD_FORMAT_UNSIGNED_INT8;
-        arrayDescription.NumChannels = 4;
+        arrayDescription.Format = compressed
+                                      ? (source.srgb ? CU_AD_FORMAT_BC3_UNORM_SRGB : CU_AD_FORMAT_BC3_UNORM)
+                                      : CU_AD_FORMAT_UNSIGNED_INT8;
+        arrayDescription.NumChannels = 4u;
         CUmipmappedArray mipmappedArray{};
-        checkCuda(cuMipmappedArrayCreate(&mipmappedArray, &arrayDescription, source.mipCount),
+        checkCuda(cuMipmappedArrayCreate(&mipmappedArray, &arrayDescription, residentMipCount),
                   "cuMipmappedArrayCreate(material texture)");
         textureArrays_.push_back(mipmappedArray);
-        std::uint32_t width = source.width;
-        std::uint32_t height = source.height;
-        for (std::uint32_t mip = 0; mip < source.mipCount; ++mip)
+        std::uint32_t width = static_cast<std::uint32_t>(arrayDescription.Width);
+        std::uint32_t height = static_cast<std::uint32_t>(arrayDescription.Height);
+        const auto& mipOffsets = offsetsFor(sourceIndex);
+        for (std::uint32_t mip = 0; mip < residentMipCount; ++mip)
         {
             CUarray level{};
             checkCuda(cuMipmappedArrayGetLevel(&level, mipmappedArray, mip),
                       "cuMipmappedArrayGetLevel(material texture)");
             CUDA_MEMCPY2D copy{};
             copy.srcMemoryType = CU_MEMORYTYPE_HOST;
-            copy.srcHost = source.rgba8Pixels.data() + source.mipOffsets[mip];
-            copy.srcPitch = static_cast<std::size_t>(width) * 4;
+            const std::size_t mipOffset = mipOffsets[baseMip + mip] - mipOffsets[baseMip];
+            copy.srcHost = static_cast<const std::byte*>(textureUploadHost_) +
+                           sourceOffsets[sourceIndex] + mipOffset;
+            copy.srcPitch = compressed ? static_cast<std::size_t>(std::max((width + 3u) / 4u, 1u)) * 16u
+                                   : static_cast<std::size_t>(width) * 4u;
             copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
             copy.dstArray = level;
-            copy.WidthInBytes = static_cast<std::size_t>(width) * 4;
-            copy.Height = height;
-            checkCuda(cuMemcpy2D(&copy), "cuMemcpy2D(material texture)");
+            copy.WidthInBytes = copy.srcPitch;
+            copy.Height = compressed ? std::max((height + 3u) / 4u, 1u) : height;
+            checkCuda(cuMemcpy2DAsync(&copy, cudaStream_), "cuMemcpy2DAsync(material texture)");
             width = std::max(width / 2, 1u);
             height = std::max(height / 2, 1u);
         }
@@ -895,7 +978,7 @@ bool OptixRenderer::uploadTextureResources()
         textureDescription.filterMode = CU_TR_FILTER_MODE_LINEAR;
         textureDescription.mipmapFilterMode = CU_TR_FILTER_MODE_LINEAR;
         textureDescription.flags = CU_TRSF_NORMALIZED_COORDINATES | (source.srgb ? CU_TRSF_SRGB : 0u);
-        textureDescription.maxMipmapLevelClamp = static_cast<float>(source.mipCount - 1);
+        textureDescription.maxMipmapLevelClamp = static_cast<float>(residentMipCount - 1u);
         CUtexObject textureObject{};
         checkCuda(cuTexObjectCreate(&textureObject, &resource, &textureDescription, nullptr),
                   "cuTexObjectCreate(material texture)");
@@ -914,6 +997,9 @@ bool OptixRenderer::uploadTextureResources()
 
 void OptixRenderer::destroyTextureResources()
 {
+    if (textureUploadHost_)
+        cuMemFreeHost(textureUploadHost_);
+    textureUploadHost_ = nullptr;
     if (textureTableBuffer_)
         cuMemFree(textureTableBuffer_);
     textureTableBuffer_ = 0;
@@ -923,6 +1009,7 @@ void OptixRenderer::destroyTextureResources()
     for (CUmipmappedArray array : textureArrays_)
         cuMipmappedArrayDestroy(array);
     textureArrays_.clear();
+    materialTextureBytes_ = 0;
 }
 
 bool OptixRenderer::buildSceneAcceleration()
@@ -930,6 +1017,7 @@ bool OptixRenderer::buildSceneAcceleration()
     try
     {
         checkCuda(cuCtxSetCurrent(cudaContext_), "cuCtxSetCurrent");
+        checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(scene replacement)");
         destroySceneAcceleration();
         if (!scene_ || scene_->meshes.empty())
             throw std::runtime_error("Scene contains no geometry for OptiX");
@@ -974,11 +1062,13 @@ bool OptixRenderer::buildSceneAcceleration()
 
         std::vector<GpuOptixInstance> gpuInstances;
         std::vector<std::uint32_t> instanceMeshIndices;
-        const auto appendInstance = [&](std::uint32_t meshIndex, const Mat4& transform) {
+        const auto appendInstance = [&](std::uint32_t meshIndex, const Mat4& transform,
+                                        const Mat4& previousTransform) {
             if (meshIndex >= meshGeometries.size() || !meshGeometries[meshIndex].valid)
                 return;
             const MeshGeometry& geometry = meshGeometries[meshIndex];
-            gpuInstances.push_back({transform, normalTransformMatrix(transform),
+            gpuInstances.push_back({transform, previousTransform,
+                                    normalTransformMatrix(transform), normalTransformMatrix(previousTransform),
                                     {geometry.vertexOffset, geometry.triangleOffset, geometry.triangleCount, 0u},
                                     geometry.materialIndex, transformHandedness(transform), {}});
             instanceMeshIndices.push_back(meshIndex);
@@ -986,13 +1076,13 @@ bool OptixRenderer::buildSceneAcceleration()
         if (!scene_->instances.empty())
         {
             for (const Instance& instance : scene_->instances)
-                appendInstance(instance.meshIndex, instance.transform);
+                appendInstance(instance.meshIndex, instance.transform, instance.previousTransform);
         }
         else
         {
             const Mat4 identity = Mat4::identity();
             for (std::uint32_t meshIndex = 0; meshIndex < scene_->meshes.size(); ++meshIndex)
-                appendInstance(meshIndex, identity);
+                appendInstance(meshIndex, identity, identity);
         }
         if (positions.empty() || indices.size() < 3 || gpuInstances.empty())
             throw std::runtime_error("Scene contains no indexed triangles for OptiX");
@@ -1275,28 +1365,93 @@ bool OptixRenderer::buildSceneAcceleration()
             }
         }
 
+        const auto writeOptixTransform = [](const Mat4& transform, float (&result)[12]) {
+            result[0] = transform.m[0];
+            result[1] = transform.m[4];
+            result[2] = transform.m[8];
+            result[3] = transform.m[12];
+            result[4] = transform.m[1];
+            result[5] = transform.m[5];
+            result[6] = transform.m[9];
+            result[7] = transform.m[13];
+            result[8] = transform.m[2];
+            result[9] = transform.m[6];
+            result[10] = transform.m[10];
+            result[11] = transform.m[14];
+        };
+        const auto transformsDiffer = [](const Mat4& first, const Mat4& second) {
+            for (std::size_t component = 0; component < first.m.size(); ++component)
+            {
+                if (std::abs(first.m[component] - second.m[component]) > 1.0e-6f)
+                    return true;
+            }
+            return false;
+        };
+
+        std::vector<std::int32_t> motionTransformSlots(gpuInstances.size(), -1);
+        std::uint32_t motionTransformCount = 0;
+        for (std::size_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
+        {
+            if (transformsDiffer(gpuInstances[instanceIndex].previousTransform,
+                                 gpuInstances[instanceIndex].transform))
+                motionTransformSlots[instanceIndex] = static_cast<std::int32_t>(motionTransformCount++);
+        }
+        motionTransformCount_ = motionTransformCount;
+        constexpr std::size_t motionAlignment = OPTIX_TRANSFORM_BYTE_ALIGNMENT;
+        const std::size_t motionTransformStride =
+            (sizeof(OptixMatrixMotionTransform) + motionAlignment - 1u) & ~(motionAlignment - 1u);
+        const std::size_t motionTransformBytes = motionTransformCount * motionTransformStride;
+        std::vector<std::byte> motionTransformHost(motionTransformBytes);
+        if (motionTransformBytes > 0)
+        {
+            for (std::size_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
+            {
+                const std::int32_t slot = motionTransformSlots[instanceIndex];
+                if (slot < 0)
+                    continue;
+                OptixMatrixMotionTransform motionTransform{};
+                motionTransform.child = meshHandles[instanceMeshIndices[instanceIndex]];
+                motionTransform.motionOptions.numKeys = 2;
+                motionTransform.motionOptions.flags = OPTIX_MOTION_FLAG_NONE;
+                motionTransform.motionOptions.timeBegin = 0.0f;
+                motionTransform.motionOptions.timeEnd = 1.0f;
+                writeOptixTransform(gpuInstances[instanceIndex].previousTransform, motionTransform.transform[0]);
+                writeOptixTransform(gpuInstances[instanceIndex].transform, motionTransform.transform[1]);
+                std::memcpy(motionTransformHost.data() + static_cast<std::size_t>(slot) * motionTransformStride,
+                            &motionTransform, sizeof(motionTransform));
+            }
+            checkCuda(cuMemAlloc(&motionTransformBuffer_, motionTransformBytes),
+                      "cuMemAlloc(OptiX motion transforms)");
+            checkCuda(cuMemcpyHtoDAsync(motionTransformBuffer_, motionTransformHost.data(),
+                                        motionTransformBytes, cudaStream_),
+                      "cuMemcpyHtoDAsync(OptiX motion transforms)");
+        }
+
         std::vector<OptixInstance> optixInstances(gpuInstances.size());
+        const Mat4 identity = Mat4::identity();
         for (std::uint32_t instanceIndex = 0; instanceIndex < gpuInstances.size(); ++instanceIndex)
         {
-            const Mat4& transform = gpuInstances[instanceIndex].transform;
+            const std::int32_t motionSlot = motionTransformSlots[instanceIndex];
+            const Mat4& transform = motionSlot >= 0 ? identity : gpuInstances[instanceIndex].transform;
             OptixInstance& instance = optixInstances[instanceIndex];
-            instance.transform[0] = transform.m[0];
-            instance.transform[1] = transform.m[4];
-            instance.transform[2] = transform.m[8];
-            instance.transform[3] = transform.m[12];
-            instance.transform[4] = transform.m[1];
-            instance.transform[5] = transform.m[5];
-            instance.transform[6] = transform.m[9];
-            instance.transform[7] = transform.m[13];
-            instance.transform[8] = transform.m[2];
-            instance.transform[9] = transform.m[6];
-            instance.transform[10] = transform.m[10];
-            instance.transform[11] = transform.m[14];
+            writeOptixTransform(transform, instance.transform);
             instance.instanceId = instanceIndex;
             instance.sbtOffset = 0;
             instance.visibilityMask = 0xff;
             instance.flags = OPTIX_INSTANCE_FLAG_NONE;
-            instance.traversableHandle = meshHandles[instanceMeshIndices[instanceIndex]];
+            if (motionSlot >= 0)
+            {
+                const CUdeviceptr motionTransformAddress = motionTransformBuffer_ +
+                    static_cast<CUdeviceptr>(motionSlot) * motionTransformStride;
+                checkOptix(optixConvertPointerToTraversableHandle(
+                               optixContext_, motionTransformAddress,
+                               OPTIX_TRAVERSABLE_TYPE_MATRIX_MOTION_TRANSFORM, &instance.traversableHandle),
+                           "optixConvertPointerToTraversableHandle(matrix motion transform)");
+            }
+            else
+            {
+                instance.traversableHandle = meshHandles[instanceMeshIndices[instanceIndex]];
+            }
         }
         const std::size_t iasInstanceBytes = optixInstances.size() * sizeof(OptixInstance);
         checkCuda(cuMemAlloc(&iasInstanceBuffer_, iasInstanceBytes), "cuMemAlloc(OptiX IAS instances)");
@@ -1319,6 +1474,11 @@ bool OptixRenderer::buildSceneAcceleration()
                                    iasSizes.outputSizeInBytes, &gasHandle_, nullptr, 0),
                    "optixAccelBuild(IAS)");
         checkCuda(cuStreamSynchronize(cudaStream_), "cuStreamSynchronize(OptiX GAS/IAS)");
+        if (textureUploadHost_)
+        {
+            checkCuda(cuMemFreeHost(textureUploadHost_), "cuMemFreeHost(material texture staging)");
+            textureUploadHost_ = nullptr;
+        }
         for (std::size_t index = 0; index < originalGasBuffers.size(); ++index)
         {
             if (compactedGasBuffers[index] != originalGasBuffers[index])
@@ -1326,19 +1486,12 @@ bool OptixRenderer::buildSceneAcceleration()
         }
         meshGasBuffers_ = std::move(compactedGasBuffers);
         cuMemFree(temporaryBuffer);
-        accelerationBytes += iasSizes.outputSizeInBytes + iasInstanceBytes;
+        accelerationBytes += iasSizes.outputSizeInBytes + iasInstanceBytes + motionTransformBytes;
         stats_.materialBytes = materialBytes;
         stats_.residentMaterials = static_cast<std::uint32_t>(materials.size());
         stats_.residentTextures = static_cast<std::uint32_t>(textureObjects_.size());
         stats_.descriptorCapacity = 1024;
-        stats_.textureBytes = 0;
-        if (scene_ && !scene_->textures.empty())
-        {
-            for (const TextureReference& texture : scene_->textures)
-                stats_.textureBytes += texture.rgba8Pixels.size();
-        }
-        else
-            stats_.textureBytes = 4;
+        stats_.textureBytes = materialTextureBytes_;
         stats_.gpuSceneBytes = vertexBytes + normalBytes + tangentBytes + uvBytes + indexBytes +
                                materialBytes + textureMetadataBytes + lightBytes + lightAliasBytes +
                                emissiveTriangleBytes + environmentBytes +
@@ -1349,6 +1502,7 @@ bool OptixRenderer::buildSceneAcceleration()
                                 std::to_string(indices.size() / 3) + " unique triangles, " +
                                 std::to_string(gasBuilds.size()) + " GAS, " +
                                 std::to_string(gpuInstances.size()) + " IAS instances, " +
+                                std::to_string(motionTransformCount) + " motion transforms, " +
                                 std::to_string(emissiveTriangleCount_) + " emissive lights, GAS compacted " +
                                 std::to_string(uncompactedGasBytes) + " -> " +
                                 std::to_string(accelerationBytes - iasSizes.outputSizeInBytes - iasInstanceBytes) +
@@ -1373,6 +1527,8 @@ void OptixRenderer::destroySceneAcceleration()
     meshGasBuffers_.clear();
     if (iasInstanceBuffer_)
         cuMemFree(iasInstanceBuffer_);
+    if (motionTransformBuffer_)
+        cuMemFree(motionTransformBuffer_);
     if (indexBuffer_)
         cuMemFree(indexBuffer_);
     if (materialBuffer_)
@@ -1403,6 +1559,7 @@ void OptixRenderer::destroySceneAcceleration()
         cuMemFree(vertexBuffer_);
     gasBuffer_ = 0;
     iasInstanceBuffer_ = 0;
+    motionTransformBuffer_ = 0;
     indexBuffer_ = 0;
     materialBuffer_ = 0;
     textureMetadataBuffer_ = 0;
@@ -1424,6 +1581,7 @@ void OptixRenderer::destroySceneAcceleration()
     lightCount_ = 0;
     analyticLightPower_ = 0.0f;
     instanceCount_ = 0;
+    motionTransformCount_ = 0;
     emissiveTriangleCount_ = 0;
     emissiveLightPower_ = 0.0f;
     environmentPixelCount_ = 0;
@@ -1451,8 +1609,8 @@ bool OptixRenderer::createPipeline()
         moduleOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
 #endif
         OptixPipelineCompileOptions pipelineOptions{};
-        pipelineOptions.usesMotionBlur = false;
-        pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
+        pipelineOptions.usesMotionBlur = true;
+        pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
         // Primitive, instance, barycentrics, distance and hit state lower to seven payload registers.
         pipelineOptions.numPayloadValues = 7;
         pipelineOptions.numAttributeValues = 2;
@@ -1519,7 +1677,7 @@ bool OptixRenderer::createPipeline()
         checkOptix(optixUtilComputeStackSizes(&stackSizes, 1, 0, 0, &directFromTraversal, &directFromState,
                                               &continuation),
                    "optixUtilComputeStackSizes");
-        checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 2),
+        checkOptix(optixPipelineSetStackSize(pipeline_, directFromTraversal, directFromState, continuation, 3),
                    "optixPipelineSetStackSize");
 
         for (std::uint32_t slot = 0; slot < kLaunchSlotCount; ++slot)
@@ -1680,6 +1838,7 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
                                             ? scene_->materialOverrideId
                                             : kInvalidMaterialId;
         parameters.debugView = static_cast<std::uint32_t>(settings.debugView);
+        parameters.motionTransformCount = motionTransformCount_;
         const Environment fallbackEnvironment{};
         const Environment& environment = scene_ ? scene_->environment : fallbackEnvironment;
         parameters.indirectLighting = settings.indirectLighting ? 1u : 0u;
@@ -1698,6 +1857,16 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         parameters.cameraTargetAndAspect = {camera.target.x, camera.target.y, camera.target.z,
                                             static_cast<float>(width_) / static_cast<float>(std::max(height_, 1u))};
         parameters.cameraUp = {camera.up.x, camera.up.y, camera.up.z, 0.0f};
+        const Camera& previousCamera = previousCameraValid_ ? previousCamera_ : camera;
+        parameters.previousCameraPositionAndShutter = {
+            previousCamera.position.x, previousCamera.position.y, previousCamera.position.z,
+            std::clamp(camera.shutterInterval, 0.0f, 1.0f)};
+        parameters.previousCameraTargetAndAperture = {
+            previousCamera.target.x, previousCamera.target.y, previousCamera.target.z,
+            std::max(camera.apertureRadius, 0.0f)};
+        parameters.previousCameraUpAndFocus = {
+            previousCamera.up.x, previousCamera.up.y, previousCamera.up.z,
+            std::max(camera.focusDistance, 0.001f)};
         const Light light = scene_ && !scene_->lights.empty() ? scene_->lights.front() : Light{};
         parameters.lightPosition = {light.position.x, light.position.y, light.position.z, 1.0f};
         parameters.lightColorAndIntensity = {light.color.x, light.color.y, light.color.z, light.intensity};
@@ -1712,6 +1881,8 @@ bool OptixRenderer::updateShaderBindingTable(const Camera& camera, const RenderS
         checkCuda(cuMemcpyHtoDAsync(raygenRecords_[launchSlot] + offsetof(RaygenRecord, parameters), &parameters,
                                     sizeof(parameters), cudaStream_),
                   "cuMemcpyHtoDAsync(launch parameters)");
+        previousCamera_ = camera;
+        previousCameraValid_ = true;
         return true;
     }
     catch (const std::exception& error)

@@ -49,6 +49,12 @@ struct RenderSettings
     bool rayTracedShadows{true};
     bool rayTracedReflections{true};
     bool indirectLighting{true};
+    bool probeGlobalIllumination{true};
+    std::uint32_t probeRaysPerFrame{8};
+    float probeHysteresis{0.92f};
+    float probeIntensity{1.0f};
+    bool textureStreaming{true};
+    std::uint32_t textureBudgetMiB{512};
     bool denoiser{false};
     bool temporalRendering{true};
     bool adaptiveSampling{true};

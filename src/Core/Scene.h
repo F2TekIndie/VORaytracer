@@ -74,6 +74,10 @@ struct TextureReference
     std::uint32_t mipCount{};
     std::vector<std::uint32_t> mipOffsets;
     std::vector<std::uint8_t> rgba8Pixels;
+    // GPU-ready BC3 mip chain shared by Vulkan and OptiX. BC3 preserves the
+    // alpha channel required by blended and masked materials.
+    std::vector<std::uint32_t> bc3MipOffsets;
+    std::vector<std::uint8_t> bc3Pixels;
     std::uint32_t uvSet{};
     Vec2 uvScale{1.0f, 1.0f};
     Vec2 uvOffset{};
@@ -85,6 +89,12 @@ struct TextureReference
     {
         return width > 0 && height > 0 && mipCount > 0 && mipOffsets.size() == mipCount &&
                !rgba8Pixels.empty();
+    }
+
+    [[nodiscard]] bool hasBc3() const
+    {
+        return width > 0 && height > 0 && mipCount > 0 && bc3MipOffsets.size() == mipCount &&
+               !bc3Pixels.empty();
     }
 
 
@@ -234,6 +244,10 @@ struct Camera
     float verticalFovDegrees{60.0f};
     float nearPlane{0.05f};
     float farPlane{1000.0f};
+    float apertureRadius{};
+    float focusDistance{4.0f};
+    // Fraction of the previous-to-current camera transform covered by one exposure.
+    float shutterInterval{};
 };
 
 struct Scene

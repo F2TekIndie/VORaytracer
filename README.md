@@ -31,16 +31,17 @@ VORaytracer ist unter der [GNU Lesser General Public License v3.0 oder später](
 - device-local Vulkan-Geometrie über Staging-Uploads
 - separate Vulkan-BLAS pro Geometrie und TLAS-Instanzen ohne getrennte `vkQueueWaitIdle()`-Stopps
 - gemeinsames modulares Slang-PBR-System für Metallic-Roughness, Clearcoat, Glas/Absorption, Anisotropie, Sheen, Emission, Subsurface und homogene Volumen
-- bindless Vulkan-Materialtexturen und CUDA-Mipmapped-Texture-Objects für Base Color, Opacity, Metallic-Roughness, Normal, skalare Height/Bump-Maps, AO, Emissive und spezialisierte Loben
+- BC3-komprimierte Vulkan-Materialtexturen, CUDA-BC3-Mipmapped-Arrays mit RGBA8-Kompatibilitätsfallback sowie budgetierte Top-Mip-Residency für Base Color, Opacity, Metallic-Roughness, Normal, skalare Height/Bump-Maps, AO, Emissive und spezialisierte Loben
 - zwei UV-Kanäle pro Vertex sowie texturspezifische Assimp-UV-Auswahl, Skalierung, Rotation, Offset und Repeat-/Clamp-/Mirror-Adressierung in beiden Backends
-- Vulkan-Alpha-Mask und echte Alpha-Blend-Pässe mit Opacity-Faktor/-Textur, transparenten Ray-Query-Schatten und optionalem Denoiser
+- Vulkan-Alpha-Mask und gewichtetes, sortierunabhängiges OIT für Alpha-Blend-Materialien mit FP16-Akkumulation/Revealage, transparenten Ray-Query-Schatten und optionalem Denoiser
 - Vulkan-GGX-Auswertung mit Ray-Query-Schatten, Reflexionen sowie begrenzten Echtzeitapproximationen für Transmission, Subsurface und Volumen
 - Richtungslicht, prozeduraler Himmel oder HDR-Environment als globale Beleuchtung
 - vorverarbeitetes, roughnessabhängiges Vulkan-HDR-IBL mit Cosine-Irradiance, GGX-Prefilterung und Split-Sum-BRDF-LUT
+- nicht-progressive Vulkan-DDGI-Approximation mit einem weltbegrenzten 8x4x8-Probevolumen, festem Ray-Budget, zeitlicher Probe-Filterung und trilinearer Abtastung für einen diffusen Folgebounce
 - gemeinsame direkte Beleuchtung durch Richtungs-, Punkt-, Spot-, Flächen- und emissive Dreieckslichter in Vulkan und OptiX
 - optionaler temporaler OptiX-AI-Denoiser als Vulkan-Postrender-Schritt mit `HALF4`-Beauty, echten Bewegungsvektoren sowie Albedo-, Normal- und Tiefen-Guides aus einem MRT-Pass
 - CUDA/Vulkan-External-Memory- und Semaphore-Interop ohne Bildkopie zur CPU
-- progressiver OptiX-Pathtracer mit per-Pixel-adaptivem Sampling, GGX-VNDF, NEE/MIS für HDR, Richtungs- und Mesh-Lichter, Medium-Stack, Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
+- progressiver OptiX-Pathtracer mit per-Pixel-adaptivem Sampling, Thin-Lens-Depth-of-Field, Shutter-Sampling zwischen vorheriger/aktueller Kamera- und Instanztransformation, GGX-VNDF, NEE/MIS für HDR, Richtungs- und Mesh-Lichter, Medium-Stack, Samples pro Frame, maximaler Pfadtiefe und Russian Roulette
 - leistungsgewichtete Walker-Alias-Tabellen wählen analytische Lichter in Vulkan und OptiX in O(1); emissive Dreiecke verwenden weiterhin ihre logarithmische CDF-Auswahl
 - wiederverwendbare OptiX-GAS pro Mesh und IAS-Szeneninstanzen ohne Geometrie-Flattening
 - standardisiertes hellgraues Kunststoffmaterial als nichtdestruktive Laufzeitüberschreibung
@@ -121,6 +122,9 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 - `Meshlet debug colors`: Zeigt im Vulkan-Pfad eine stabile Zufallsfarbe pro Meshlet.
 - `Ray-traced reflections`: Aktiviert Vulkan-Reflexions-Ray-Queries; im OptiX-Pfad steuert die Option die reflektierenden Sekundärpfade.
 - `Indirect lighting`: Schaltet die globale Beleuchtung durch HDR, prozeduralen Himmel oder Richtungslicht entsprechend der aktiven Konfiguration.
+- `DDGI probe volume`: Aktiviert im Vulkan-Pfad den begrenzten zweiten diffusen Bounce. Ray-Budget, Hysterese und Intensität sind direkt einstellbar.
+- `Budgeted mip residency`: Komprimiert Materialtexturen auf der GPU und entfernt bei Budgetdruck zuerst die größten Top-Mips; das Ändern baut nur die residenten GPU-Szenenressourcen neu auf.
+- `Aperture radius`, `Focus distance`, `Shutter interval`: steuern OptiX-Depth-of-Field und Bewegungsunschärfe für Kamera und animierte Instanzen. Apertur und Shutter `0` reproduzieren die bisherige Pinhole-Kamera ohne Blur.
 - `Temporal stabilization`: Reprojiziert die Vulkan-Denoiser-History mit echten Pixel-Bewegungsvektoren. Szenen-, Material- und Größenänderungen beginnen eine neue Sequenz.
 - `Adaptive sampling`: Beendet im OptiX-Pfad die Abtastung konvergierter Pixel anhand ihres relativen Standardfehlers; Mindest-Samplezahl und Rauschschwelle sind einstellbar.
 - `Material editor`: Wählt Mesh und Material, zeigt Texturzuweisungen und bearbeitet sämtliche PBR-Faktoren. Faktoränderungen übertragen nur den betroffenen GPU-Materialeintrag; Emissionsänderungen bauen zusätzlich die Mesh-Licht-CDF neu auf.
@@ -132,11 +136,11 @@ Im Menü `File` und über die jeweiligen Browse-Schaltflächen stehen native Win
 
 Vulkan ist kein progressiver Pathtracer. Jeder Frame wird direkt über Task-/Mesh-Shader, PBR-Fragmentauswertung und optionale Inline Ray Queries erzeugt. Deshalb gelten `Samples per frame` und `Max bounces` nicht für diesen Pfad. Der optionale Denoiser wird ausschließlich nach dem Vulkan-Rendering ausgeführt.
 
-Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Beim Laden entstehen ein Cosine-Irradiance-Atlas, GGX-vorgefilterte Roughness-Stufen und eine Split-Sum-BRDF-LUT; der Fragmentshader führt dadurch keine teure Environment-Faltung pro Pixel aus. Roughness wählt die GGX-Stufe und wird nicht vom HDR überschrieben. Alpha-Blend-Materialien verwenden sortierunabhängige dithered Coverage mit regulärem Depth-Write. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Der Denoiser-Pfad erzeugt Beauty, Pixel-Flow, Diffuse-Albedo und Welt-Normale plus Tiefe in einem MRT-Pass und schreibt alle Ebenen direkt in den CUDA/Vulkan-Interop-Speicher. Die temporale History bleibt dadurch auch während Kamerabewegungen reprojizierbar.
+Das HDR-Environment beeinflusst diffuse und spiegelnde Beleuchtung. Beim Laden entstehen ein Cosine-Irradiance-Atlas, GGX-vorgefilterte Roughness-Stufen und eine Split-Sum-BRDF-LUT; der Fragmentshader führt dadurch keine teure Environment-Faltung pro Pixel aus. Roughness wählt die GGX-Stufe und wird nicht vom HDR überschrieben. Ein kleines DDGI-Probevolumen ergänzt optional einen zeitlich gefilterten diffusen Folgebounce mit fester Arbeit pro Frame. Alpha-Blend-Materialien schreiben mit deaktiviertem Depth-Write in getrennte FP16-Akkumulations-/Revealage-Targets und werden anschließend gewichtet zusammengesetzt. Ohne Denoiser führt der Fragmentshader Tone Mapping aus und rendert direkt ins Swapchain-Image. Der Denoiser-Pfad erzeugt Beauty, Pixel-Flow, Diffuse-Albedo und Welt-Normale plus Tiefe in einem MRT-Pass und schreibt alle Ebenen direkt in den CUDA/Vulkan-Interop-Speicher. Die temporale History bleibt dadurch auch während Kamerabewegungen reprojizierbar.
 
 ### OptiX
 
-OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Per-Pixel-Samplezähler und Welford-Luminanzmomente überspringen konvergierte Pixel ohne CPU-Rücklesung oder globale Synchronisation. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Ray-Cone-Footprints wählen die Mip-Level der CUDA-Texturen. Reflexions- und indirekte Transportloben werden entsprechend ihrer UI-Schalter mit jeweils konsistenter Evaluation und PDF gesampelt. Subsurface verwendet einen instanzgebundenen, begrenzten Random Walk. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
+OptiX akkumuliert progressiv in einem CUDA-`float4`-Buffer. `Samples per frame` und `Max bounces` steuern den Integrator. Per-Pixel-Samplezähler und Welford-Luminanzmomente überspringen konvergierte Pixel ohne CPU-Rücklesung oder globale Synchronisation. Kamera-, Material-, Licht- oder Szenenänderungen setzen die Akkumulation zurück. Die Kamera unterstützt einen Thin-Lens-Ursprung mit Fokusdistanz sowie Shutter-Sampling über die vorherige und aktuelle Kamerapose. Instanzen mit abweichendem `previousTransform` verwenden echte Zwei-Key-OptiX-Motion-Transforms; statische Szenen bleiben auf dem günstigeren klassischen Traversal. Ray-Cone-Footprints wählen die residenten Mip-Level der CUDA-Texturen. Reflexions- und indirekte Transportloben werden entsprechend ihrer UI-Schalter mit jeweils konsistenter Evaluation und PDF gesampelt. Subsurface verwendet einen instanzgebundenen, begrenzten Random Walk. Der OptiX-Pfad besitzt keinen eigenen Denoiser; sein Bild wird auf der GPU tonemapped und über Vulkan präsentiert.
 Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enthält die Szeneninstanzen und ihre Transformationen.
 
 ## Umgebungsvariablen für Smoke-Tests
@@ -151,6 +155,7 @@ Geometrien bleiben objektlokal in je einem wiederverwendbaren GAS; ein IAS enth�
 | `VOR_MESHLET_DEBUG=1` | aktiviert die Meshlet-Debugfarben |
 | `VOR_REFLECTIONS=0` | deaktiviert reflektierende Sekundärpfade für automatisierte Tests |
 | `VOR_INDIRECT_LIGHTING=0` | deaktiviert diffuse/transmissive Sekundärpfade für automatisierte Tests |
+| `VOR_TEXTURE_BUDGET_MIB=<MiB>` | setzt das gemeinsame Vulkan-/OptiX-Budget für residente Material-Mips |
 | `VOR_DEFAULT_PLASTIC=1` | startet mit der nichtdestruktiven Default-Plastic-Materialüberschreibung |
 | `VOR_GLOBAL_LIGHT=sky` | startet mit prozeduralem Himmel |
 | `VOR_GLOBAL_LIGHT=hdr` | startet im HDR-Modus |
@@ -176,7 +181,7 @@ Der Slang-Hinweis `E38040` beim OptiX-Build ist erwartet: Der Raygen-Parameter w
 
 ## Bewusste Grenzen
 
-- LOD-Stufen werden erzeugt, derzeit wird aber nur das Basis-LOD hochgeladen und gerendert.
+- Vulkan lädt alle erzeugten LOD-Meshlets und wählt sie im Task-Shader anhand des projizierten Fehlers; OptiX baut sein GAS derzeit aus dem Basis-LOD.
 - Die Laufzeit-Vertexstruktur hält die in glTF üblichen UV-Sets 0 und 1; weitere Assimp-UV-Kanäle werden derzeit auf Set 1 begrenzt.
 - Vulkan bleibt nicht-progressiv: Transmission, Subsurface und Volumen verwenden klar gekennzeichnete Echtzeitapproximationen; der vollständige stochastische Transport liegt im OptiX-Pfad.
 - Volumen sind homogen; heterogene Dichtefelder und mehrschichtige Hautmodelle sind nicht Bestandteil dieses Updates.

@@ -8,7 +8,7 @@ Diese Übersicht zeigt, welche Daten beide Backends teilen und wo sich Vulkan un
 flowchart LR
     Model["Modell über IFileOpenDialog"] --> Assimp["Assimp-Import"]
     Assimp --> Scene["Gemeinsame CPU-Szene<br/>Meshes, Instanzen, Lichter, GpuMaterial"]
-    Assimp --> Textures["CPU-Texturcache mit Mips,<br/>UV0/UV1, UV-Transform und Sampler"]
+    Assimp --> Textures["CPU-Texturcache mit RGBA8-/BC3-Mips,<br/>UV0/UV1, UV-Transform und Sampler"]
     Scene --> Meshopt["meshoptimizer<br/>Remap, Cache, Meshlets, Bounds, LODs"]
     HDR["Radiance HDR über IFileOpenDialog"] --> STB["stb_image<br/>Float-Decodierung"]
     STB --> Mips["HDR-Mips und Importance-CDF"]
@@ -17,6 +17,9 @@ flowchart LR
     Meshopt --> OptixData["CUDA-/OptiX-Ressourcen"]
     Textures --> VulkanData
     Textures --> OptixData
+    Textures --> Residency["Gemeinsames Mip-Budget<br/>größte Top-Mips zuerst entfernen"]
+    Residency --> VulkanData
+    Residency --> OptixData
     Mips --> VulkanData
     Mips --> OptixData
     IBL --> VulkanData
@@ -42,8 +45,14 @@ flowchart TD
     TLAS --> Queries["Inline Ray Queries<br/>Schatten und optionale Reflexionen"]
     Light["Richtungs-/Punkt-/Spot-/Flächenlicht,<br/>emissive Meshes, Sky oder HDR-IBL"] --> Fragment
     Queries --> Fragment
+    TLAS --> DDGI["8x4x8 DDGI-Probes<br/>festes Ray-Budget + Hysterese"]
+    DDGI --> Fragment
     Fragment --> Approx["Begrenzte Echtzeitapproximationen<br/>Transmission, SSS, Volumen"]
-    Approx --> Denoise{"Vulkan-Denoiser aktiv?"}
+    Approx --> Alpha{"Alpha Blend?"}
+    Alpha -->|Nein| Denoise{"Vulkan-Denoiser aktiv?"}
+    Alpha -->|Ja| OIT["FP16 Weighted OIT<br/>Accumulation + Revealage"]
+    OIT --> Composite["Sortierunabhängiges Composite"]
+    Composite --> Denoise
     Denoise -->|Nein| ToneMap["Tone Mapping im Fragmentshader<br/>direkt ins Swapchain-Image"]
     Denoise -->|Ja| HDRImage["Lineares Vulkan-Offscreenbild<br/>RGBA16F"]
     HDRImage --> ExtHalf["Vulkan Image → exportierter<br/>persistenter HALF4-Buffer"]
@@ -69,6 +78,8 @@ Wichtige Eigenschaften:
 - Persistente External-Memory-Zuordnung und Semaphoren vermeiden CPU-Wartepunkte und Map/Unmap pro Frame.
 - Materialfaktoren werden bei UI-Änderungen als einzelner 240-Byte-Bereich in den device-local Materialbuffer übertragen.
 - Debugansichten greifen vor der Beleuchtung auf dieselben aufgelösten `SurfaceData` wie das Beauty-Rendering zu.
+- Das Probevolumen ergänzt einen begrenzten diffusen Folgebounce; es ist kein progressiver Bildintegrator.
+- Blend-Materialien werden mit Weighted OIT ohne transparentes Depth-Write zusammengesetzt.
 
 ## OptiX: progressiver Pathtracer
 
@@ -76,12 +87,14 @@ Wichtige Eigenschaften:
 flowchart TD
     Scene["Gemeinsame Szene, Kamera,<br/>Materialien und Beleuchtung"] --> CudaBuffers["Einmalige objektlokale CUDA-Buffer<br/>Vertex, Index, Normal, Tangente, UV"]
     CudaBuffers --> GAS["Wiederverwendbares Triangle-GAS<br/>pro Mesh"]
-    GAS --> IAS["IAS mit Szeneninstanzen,<br/>Transformationen und Material-IDs"]
+    GAS --> Motion["Optionale Zwei-Key-Motion-Transforms<br/>previous → current"]
+    GAS --> IAS["Statische IAS-Instanzen,<br/>Transformationen und Material-IDs"]
+    Motion --> IAS
 
     Shader["Slang → PTX<br/>Raygen, Miss, Closest Hit"] --> Pipeline["OptiX-Pipeline und SBT"]
     Pipeline --> Launch["optixLaunch"]
     IAS --> Launch
-    Params["Kleine Launch-Parameter<br/>Kamera, Samples, Bounces, Licht"] --> Launch
+    Params["Kleine Launch-Parameter<br/>Thin Lens, Fokus, Shutter,<br/>Samples, Bounces, Licht"] --> Launch
 
     Launch --> Integrator["Progressiver PBR-Pathtracer<br/>VNDF, NEE/MIS, Mesh-Lichter,<br/>SSS, Medien, Russian Roulette"]
     Integrator --> Accum["CUDA float4<br/>Akkumulationsbuffer"]
@@ -103,6 +116,8 @@ Wichtige Eigenschaften:
 - HDR wird über eine zweistufige Luminanz-/Sinus-CDF importance-gesampelt; BSDF-, Environment- und emissive Dreieckslichter werden mit MIS kombiniert.
 - Materialfaktoren aktualisieren nur einen GPU-Eintrag und setzen die Akkumulation zurück; Emissionsänderungen aktualisieren zusätzlich die Lichtverteilung.
 - CUDA-Events messen den Launch asynchron, ohne den Renderpfad per `cuCtxSynchronize()` pro Frame zu blockieren.
+- Shutter-Samples interpolieren die vorherige und aktuelle Kamera- sowie Instanztransformation; statische Szenen umgehen das teurere Motion-Traversal. Apertur `0` bleibt eine Pinhole-Kamera.
+- Materialtexturen verwenden CUDA-BC3-Arrays, sofern Format und Blockausrichtung passen, ansonsten RGBA8; Uploads kommen aus gepinntem Staging-Speicher.
 
 ## Backend-Wechsel
 

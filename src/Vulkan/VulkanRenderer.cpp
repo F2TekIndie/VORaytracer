@@ -1,6 +1,7 @@
 #include "Vulkan/VulkanRenderer.h"
 
 #include "Core/LightSampling.h"
+#include "Core/TextureCompression.h"
 
 #include "Core/Log.h"
 
@@ -731,6 +732,12 @@ void VulkanRenderer::updateFrameConstants(const Camera& camera, const RenderSett
                                                  : static_cast<std::uint32_t>(settings.debugView) + 1u;
     framePushConstants_.renderFlags = 0u;
     framePushConstants_.environmentMipCount = environment.hasHdr() ? environment.hdrMipCount : 0u;
+    ddgiSettings_.gridMinimumAndHysteresis.w = std::clamp(settings.probeHysteresis, 0.0f, 0.999f);
+    ddgiSettings_.gridMaximumAndIntensity.w = std::max(settings.probeIntensity, 0.0f);
+    ddgiSettings_.frameRaysAndFlags[0] = static_cast<std::uint32_t>(stats_.frameIndex);
+    ddgiSettings_.frameRaysAndFlags[1] = std::clamp(settings.probeRaysPerFrame, 1u, 32u);
+    ddgiSettings_.frameRaysAndFlags[2] = settings.indirectLighting && settings.probeGlobalIllumination && tlas_
+                                             ? 1u : 0u;
 }
 
 bool VulkanRenderer::renderDenoiserInput(const Camera& camera, const RenderSettings& settings)
@@ -829,6 +836,7 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     temporalDependency.bufferMemoryBarrierCount = 1;
     temporalDependency.pBufferMemoryBarriers = &temporalBarrier;
     vkCmdPipelineBarrier2(commandBuffer, &temporalDependency);
+    recordDdgiUpdate(commandBuffer);
 
     VkBufferMemoryBarrier2 acquireBuffer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
     acquireBuffer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
@@ -897,7 +905,7 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     depthAttachment.imageView = depthImageView_;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.clearValue.depthStencil = {1.0f, 0};
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering.renderArea.extent = swapchainExtent_;
@@ -914,12 +922,15 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
     VkRect2D scissor{{0, 0}, swapchainExtent_};
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    bool hasTransparentPass = false;
     if (sceneDescriptorSet_ && uploadedMeshletCount_ > 0)
     {
         constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
-                                               VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                                               VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                               VK_SHADER_STAGE_COMPUTE_BIT;
         FramePushConstants drawConstants = framePushConstants_;
         const RenderPassAvailability passes = renderPassAvailability(scene_, drawConstants.materialOverrideId);
+        hasTransparentPass = passes.transparent;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, denoiserBackgroundPipeline_);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                                 &sceneDescriptorSet_, 0, nullptr);
@@ -938,10 +949,10 @@ void VulkanRenderer::recordDenoiserInputCommands(VkCommandBuffer commandBuffer)
         };
         if (passes.opaque)
             drawMeshPass(denoiserMeshPipeline_, false);
-        if (passes.transparent)
-            drawMeshPass(denoiserTransparentMeshPipeline_, true);
     }
     vkCmdEndRendering(commandBuffer);
+    if (hasTransparentPass)
+        recordOitPass(commandBuffer, denoiserInputImageView_, denoiserOitCompositePipeline_);
 
     std::array<VkImageMemoryBarrier2, 4> toTransfer{};
     const std::array guideImages{denoiserInputImage_, denoiserGuideImages_[0],
@@ -1486,6 +1497,58 @@ bool VulkanRenderer::createSwapchain()
     depthViewInfo.subresourceRange.layerCount = 1;
     check(vkCreateImageView(device_, &depthViewInfo, nullptr, &depthImageView_), "vkCreateImageView(depth)");
     depthImageInitialized_ = false;
+
+    const auto createOitImage = [&](VkFormat format, GpuTexture& texture, const char* label) {
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = format;
+        imageInfo.extent = {swapchainExtent_.width, swapchainExtent_.height, 1};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(device_, &imageInfo, nullptr, &texture.image), label);
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device_, texture.image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(device_, &allocation, nullptr, &texture.memory), "vkAllocateMemory(OIT)");
+        check(vkBindImageMemory(device_, texture.image, texture.memory, 0), "vkBindImageMemory(OIT)");
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = texture.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = format;
+        view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view.subresourceRange.levelCount = 1;
+        view.subresourceRange.layerCount = 1;
+        check(vkCreateImageView(device_, &view, nullptr, &texture.view), "vkCreateImageView(OIT)");
+    };
+    createOitImage(VK_FORMAT_R16G16B16A16_SFLOAT, oitAccumulation_, "vkCreateImage(OIT accumulation)");
+    createOitImage(VK_FORMAT_R16_SFLOAT, oitRevealage_, "vkCreateImage(OIT revealage)");
+    oitImagesInitialized_ = false;
+    if (sceneDescriptorSet_)
+    {
+        std::array<VkDescriptorImageInfo, 2> infos{};
+        infos[0].imageView = oitAccumulation_.view;
+        infos[1].imageView = oitRevealage_.view;
+        for (VkDescriptorImageInfo& info : infos)
+            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        for (std::uint32_t index = 0; index < writes.size(); ++index)
+        {
+            writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[index].dstSet = sceneDescriptorSet_;
+            writes[index].dstBinding = 18u + index;
+            writes[index].descriptorCount = 1;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[index].pImageInfo = &infos[index];
+        }
+        vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
     return true;
 }
 
@@ -1523,7 +1586,7 @@ bool VulkanRenderer::createCommands()
 
 bool VulkanRenderer::createSceneDescriptors()
 {
-    std::array<VkDescriptorSetLayoutBinding, 18> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 23> bindings{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         bindings[index].binding = index;
@@ -1589,7 +1652,27 @@ bool VulkanRenderer::createSceneDescriptors()
     bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[17].descriptorCount = 1;
     bindings[17].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    std::array<VkDescriptorBindingFlags, 18> bindingFlags{};
+    for (std::uint32_t bindingIndex = 18; bindingIndex <= 19; ++bindingIndex)
+    {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[bindingIndex].descriptorCount = 1;
+        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    for (std::uint32_t bindingIndex = 0; bindingIndex <= 17; ++bindingIndex)
+        bindings[bindingIndex].stageFlags |= VK_SHADER_STAGE_COMPUTE_BIT;
+    for (std::uint32_t bindingIndex = 20; bindingIndex <= 21; ++bindingIndex)
+    {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[bindingIndex].descriptorCount = 1;
+        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    bindings[22].binding = 22;
+    bindings[22].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[22].descriptorCount = 1;
+    bindings[22].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    std::array<VkDescriptorBindingFlags, 23> bindingFlags{};
     bindingFlags[9] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     bindingFlags[10] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
@@ -1603,9 +1686,9 @@ bool VulkanRenderer::createSceneDescriptors()
     check(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &sceneDescriptorSetLayout_), "vkCreateDescriptorSetLayout");
 
     const std::array poolSizes{
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures + 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxMaterialTextures + 4},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_SAMPLER, kMaxMaterialTextures + 1},
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1622,6 +1705,9 @@ bool VulkanRenderer::createMeshPipeline()
     const VkShaderModule meshModule = loadShaderModule(L"Shaders\\Mesh.spv");
     const VkShaderModule fragmentModule = loadShaderModule(L"Shaders\\PbrFragment.spv");
     const VkShaderModule denoiserFragmentModule = loadShaderModule(L"Shaders\\DenoiserPbrFragment.spv");
+    const VkShaderModule oitFragmentModule = loadShaderModule(L"Shaders\\OitFragment.spv");
+    const VkShaderModule oitCompositeFragmentModule = loadShaderModule(L"Shaders\\OitCompositeFragment.spv");
+    const VkShaderModule ddgiUpdateModule = loadShaderModule(L"Shaders\\DdgiUpdate.spv");
     const VkShaderModule backgroundVertexModule = loadShaderModule(L"Shaders\\BackgroundVertex.spv");
     const VkShaderModule backgroundFragmentModule = loadShaderModule(L"Shaders\\BackgroundFragment.spv");
     const VkShaderModule denoiserBackgroundFragmentModule =
@@ -1637,12 +1723,19 @@ bool VulkanRenderer::createMeshPipeline()
                                         VK_SHADER_STAGE_FRAGMENT_BIT, denoiserFragmentModule,
                                         "DenoiserFragmentMain", nullptr},
     };
+    const std::array oitStages{
+        stages[0], stages[1],
+        VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                        VK_SHADER_STAGE_FRAGMENT_BIT, oitFragmentModule,
+                                        "OitFragmentMain", nullptr},
+    };
 
     try
     {
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
-                                       VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                                       VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                       VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstantRange.offset = 0;
         pushConstantRange.size = sizeof(FramePushConstants);
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -1651,6 +1744,14 @@ bool VulkanRenderer::createMeshPipeline()
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &pushConstantRange;
         check(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &meshPipelineLayout_), "vkCreatePipelineLayout");
+
+        VkComputePipelineCreateInfo computeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        computeInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                             VK_SHADER_STAGE_COMPUTE_BIT, ddgiUpdateModule, "DdgiUpdateMain", nullptr};
+        computeInfo.layout = meshPipelineLayout_;
+        check(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &computeInfo, nullptr,
+                                       &ddgiUpdatePipeline_),
+              "vkCreateComputePipelines(DDGI update)");
 
         VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         viewportState.viewportCount = 1;
@@ -1712,29 +1813,35 @@ bool VulkanRenderer::createMeshPipeline()
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &denoiserMeshPipeline_),
               "vkCreateGraphicsPipelines(Vulkan denoiser mesh input)");
 
-        attachment.blendEnable = VK_TRUE;
         depthStencil.depthWriteEnable = VK_FALSE;
-        blend.attachmentCount = 1;
-        blend.pAttachments = &attachment;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachmentFormats = &swapchainFormat_;
-        pipelineInfo.pStages = stages.data();
+        const std::array<VkFormat, 2> oitFormats{VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16_SFLOAT};
+        std::array<VkPipelineColorBlendAttachmentState, 2> oitAttachments{};
+        oitAttachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        oitAttachments[0].blendEnable = VK_TRUE;
+        oitAttachments[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        oitAttachments[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        oitAttachments[0].colorBlendOp = VK_BLEND_OP_ADD;
+        oitAttachments[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        oitAttachments[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        oitAttachments[0].alphaBlendOp = VK_BLEND_OP_ADD;
+        oitAttachments[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+        oitAttachments[1].blendEnable = VK_TRUE;
+        oitAttachments[1].srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        oitAttachments[1].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        oitAttachments[1].colorBlendOp = VK_BLEND_OP_ADD;
+        oitAttachments[1].srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        oitAttachments[1].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        oitAttachments[1].alphaBlendOp = VK_BLEND_OP_ADD;
+        blend.attachmentCount = static_cast<std::uint32_t>(oitAttachments.size());
+        blend.pAttachments = oitAttachments.data();
+        renderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(oitFormats.size());
+        renderingInfo.pColorAttachmentFormats = oitFormats.data();
+        pipelineInfo.pStages = oitStages.data();
         check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
                                         &transparentMeshPipeline_),
-              "vkCreateGraphicsPipelines(transparent mesh)");
-        denoiserAttachments.fill(VkPipelineColorBlendAttachmentState{});
-        for (VkPipelineColorBlendAttachmentState& denoiserAttachment : denoiserAttachments)
-            denoiserAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        denoiserAttachments[0] = attachment;
-        blend.attachmentCount = static_cast<std::uint32_t>(denoiserAttachments.size());
-        blend.pAttachments = denoiserAttachments.data();
-        renderingInfo.colorAttachmentCount = static_cast<std::uint32_t>(denoiserFormats.size());
-        renderingInfo.pColorAttachmentFormats = denoiserFormats.data();
-        pipelineInfo.pStages = denoiserStages.data();
-        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
-                                        &denoiserTransparentMeshPipeline_),
-              "vkCreateGraphicsPipelines(Vulkan denoiser transparent mesh input)");
+              "vkCreateGraphicsPipelines(weighted OIT mesh)");
+        denoiserTransparentMeshPipeline_ = VK_NULL_HANDLE;
         attachment.blendEnable = VK_FALSE;
         depthStencil.depthWriteEnable = VK_TRUE;
 
@@ -1752,6 +1859,12 @@ bool VulkanRenderer::createMeshPipeline()
                                              VK_SHADER_STAGE_FRAGMENT_BIT, denoiserBackgroundFragmentModule,
                                              "DenoiserBackgroundFragment", nullptr},
         };
+        const std::array oitCompositeStages{
+            backgroundStages[0],
+            VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                             VK_SHADER_STAGE_FRAGMENT_BIT, oitCompositeFragmentModule,
+                                             "OitCompositeFragment", nullptr},
+        };
         VkPipelineDepthStencilStateCreateInfo backgroundDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         backgroundDepth.depthTestEnable = VK_FALSE;
         backgroundDepth.depthWriteEnable = VK_FALSE;
@@ -1764,6 +1877,28 @@ bool VulkanRenderer::createMeshPipeline()
         pipelineInfo.pVertexInputState = &backgroundVertexInput;
         pipelineInfo.pInputAssemblyState = &backgroundInputAssembly;
         pipelineInfo.pDepthStencilState = &backgroundDepth;
+        attachment.blendEnable = VK_TRUE;
+        attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        attachment.colorBlendOp = VK_BLEND_OP_ADD;
+        attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+        blend.attachmentCount = 1;
+        blend.pAttachments = &attachment;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachmentFormats = &swapchainFormat_;
+        pipelineInfo.pStages = oitCompositeStages.data();
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                        &oitCompositePipeline_),
+              "vkCreateGraphicsPipelines(OIT composite)");
+        const VkFormat denoiserBeautyFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        renderingInfo.pColorAttachmentFormats = &denoiserBeautyFormat;
+        check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                        &denoiserOitCompositePipeline_),
+              "vkCreateGraphicsPipelines(denoiser OIT composite)");
+        attachment.blendEnable = VK_FALSE;
+        pipelineInfo.pStages = backgroundStages.data();
         blend.attachmentCount = 1;
         blend.pAttachments = &attachment;
         renderingInfo.colorAttachmentCount = 1;
@@ -1783,6 +1918,9 @@ bool VulkanRenderer::createMeshPipeline()
     {
         vkDestroyShaderModule(device_, fragmentModule, nullptr);
         vkDestroyShaderModule(device_, denoiserFragmentModule, nullptr);
+        vkDestroyShaderModule(device_, oitFragmentModule, nullptr);
+        vkDestroyShaderModule(device_, oitCompositeFragmentModule, nullptr);
+        vkDestroyShaderModule(device_, ddgiUpdateModule, nullptr);
         vkDestroyShaderModule(device_, meshModule, nullptr);
         vkDestroyShaderModule(device_, taskModule, nullptr);
         vkDestroyShaderModule(device_, backgroundFragmentModule, nullptr);
@@ -1792,6 +1930,9 @@ bool VulkanRenderer::createMeshPipeline()
     }
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
     vkDestroyShaderModule(device_, denoiserFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, oitFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, oitCompositeFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, ddgiUpdateModule, nullptr);
     vkDestroyShaderModule(device_, meshModule, nullptr);
     vkDestroyShaderModule(device_, taskModule, nullptr);
     vkDestroyShaderModule(device_, backgroundFragmentModule, nullptr);
@@ -1870,6 +2011,18 @@ void VulkanRenderer::destroySwapchain()
     depthImage_ = VK_NULL_HANDLE;
     depthImageMemory_ = VK_NULL_HANDLE;
     depthImageInitialized_ = false;
+    const auto destroyOitImage = [&](GpuTexture& texture) {
+        if (texture.view)
+            vkDestroyImageView(device_, texture.view, nullptr);
+        if (texture.image)
+            vkDestroyImage(device_, texture.image, nullptr);
+        if (texture.memory)
+            vkFreeMemory(device_, texture.memory, nullptr);
+        texture = {};
+    };
+    destroyOitImage(oitAccumulation_);
+    destroyOitImage(oitRevealage_);
+    oitImagesInitialized_ = false;
     for (VkImageView view : swapchainImageViews_)
         vkDestroyImageView(device_, view, nullptr);
     for (VkSemaphore semaphore : renderFinishedSemaphores_)
@@ -1902,6 +2055,12 @@ void VulkanRenderer::destroyMeshPipeline()
         vkDestroyPipeline(device_, denoiserTransparentMeshPipeline_, nullptr);
     if (denoiserBackgroundPipeline_)
         vkDestroyPipeline(device_, denoiserBackgroundPipeline_, nullptr);
+    if (oitCompositePipeline_)
+        vkDestroyPipeline(device_, oitCompositePipeline_, nullptr);
+    if (denoiserOitCompositePipeline_)
+        vkDestroyPipeline(device_, denoiserOitCompositePipeline_, nullptr);
+    if (ddgiUpdatePipeline_)
+        vkDestroyPipeline(device_, ddgiUpdatePipeline_, nullptr);
     if (meshPipelineLayout_)
         vkDestroyPipelineLayout(device_, meshPipelineLayout_, nullptr);
     meshPipeline_ = VK_NULL_HANDLE;
@@ -1910,6 +2069,9 @@ void VulkanRenderer::destroyMeshPipeline()
     denoiserMeshPipeline_ = VK_NULL_HANDLE;
     denoiserTransparentMeshPipeline_ = VK_NULL_HANDLE;
     denoiserBackgroundPipeline_ = VK_NULL_HANDLE;
+    oitCompositePipeline_ = VK_NULL_HANDLE;
+    denoiserOitCompositePipeline_ = VK_NULL_HANDLE;
+    ddgiUpdatePipeline_ = VK_NULL_HANDLE;
     meshPipelineLayout_ = VK_NULL_HANDLE;
 }
 
@@ -1935,6 +2097,8 @@ void VulkanRenderer::destroySceneResources()
     destroyBuffer(lightBuffer_);
     destroyBuffer(lightAliasBuffer_);
     destroyBuffer(temporalFrameBuffer_);
+    destroyBuffer(ddgiProbeBuffer_);
+    destroyBuffer(ddgiSettingsBuffer_);
     destroyBuffer(emissiveTriangleBuffer_);
     destroyBuffer(textureMetadataBuffer_);
     destroyTextureResources();
@@ -1957,6 +2121,7 @@ void VulkanRenderer::destroyTextureResources()
 {
     if (!device_)
         return;
+    finishTextureUpload();
     for (VkSampler sampler : materialTextureSamplers_)
         vkDestroySampler(device_, sampler, nullptr);
     materialTextureSamplers_.clear();
@@ -1989,6 +2154,27 @@ void VulkanRenderer::destroyTextureResources()
     iblTexture_ = {};
     environmentTextureBytes_ = 0;
     iblTextureBytes_ = 0;
+    materialTextureBytes_ = 0;
+}
+
+void VulkanRenderer::finishTextureUpload()
+{
+    if (!device_)
+        return;
+    if (textureUploadFence_)
+        check(vkWaitForFences(device_, 1, &textureUploadFence_, VK_TRUE, UINT64_MAX),
+              "vkWaitForFences(texture upload readiness)");
+    if (textureUploadFence_)
+        vkDestroyFence(device_, textureUploadFence_, nullptr);
+    if (textureUploadCommand_)
+        vkFreeCommandBuffers(device_, commandPool_, 1, &textureUploadCommand_);
+    if (textureUploadStaging_.buffer)
+        vkDestroyBuffer(device_, textureUploadStaging_.buffer, nullptr);
+    if (textureUploadStaging_.memory)
+        vkFreeMemory(device_, textureUploadStaging_.memory, nullptr);
+    textureUploadFence_ = VK_NULL_HANDLE;
+    textureUploadCommand_ = VK_NULL_HANDLE;
+    textureUploadStaging_ = {};
 }
 
 bool VulkanRenderer::uploadTextureResources()
@@ -2000,6 +2186,7 @@ bool VulkanRenderer::uploadTextureResources()
     fallback.mipCount = 1;
     fallback.mipOffsets = {0};
     fallback.rgba8Pixels = {255, 255, 255, 255};
+    compressTextureBc3(fallback);
     std::vector<const TextureReference*> sources;
     if (scene_ && !scene_->textures.empty())
     {
@@ -2011,6 +2198,57 @@ bool VulkanRenderer::uploadTextureResources()
     }
     else
         sources.push_back(&fallback);
+
+    VkFormatProperties bc3LinearProperties{};
+    VkFormatProperties bc3SrgbProperties{};
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_, VK_FORMAT_BC3_UNORM_BLOCK, &bc3LinearProperties);
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_, VK_FORMAT_BC3_SRGB_BLOCK, &bc3SrgbProperties);
+    constexpr VkFormatFeatureFlags requiredBc3Features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    materialTextureBc3_ = (bc3LinearProperties.optimalTilingFeatures & requiredBc3Features) == requiredBc3Features &&
+                          (bc3SrgbProperties.optimalTilingFeatures & requiredBc3Features) == requiredBc3Features;
+    if (materialTextureBc3_)
+        materialTextureBc3_ = std::all_of(sources.begin(), sources.end(), [](const TextureReference* source) {
+            return source->hasBc3();
+        });
+    std::vector<std::uint32_t> residentBaseMips(sources.size(), 0u);
+    const auto texturePixels = [&](const TextureReference& source) -> const std::vector<std::uint8_t>& {
+        return materialTextureBc3_ ? source.bc3Pixels : source.rgba8Pixels;
+    };
+    const auto textureMipOffsets = [&](const TextureReference& source) -> const std::vector<std::uint32_t>& {
+        return materialTextureBc3_ ? source.bc3MipOffsets : source.mipOffsets;
+    };
+    const auto residentBytes = [&](std::size_t index) {
+        const TextureReference& source = *sources[index];
+        return texturePixels(source).size() - textureMipOffsets(source)[residentBaseMips[index]];
+    };
+    std::size_t residentTextureBytes = 0;
+    for (std::size_t index = 0; index < sources.size(); ++index)
+        residentTextureBytes += residentBytes(index);
+    if (textureStreamingEnabled_)
+    {
+        const std::size_t budgetBytes = static_cast<std::size_t>(textureBudgetMiB_) * 1024u * 1024u;
+        while (residentTextureBytes > budgetBytes)
+        {
+            std::size_t bestIndex = sources.size();
+            std::size_t bestSaving = 0;
+            for (std::size_t index = 0; index < sources.size(); ++index)
+            {
+                const TextureReference& source = *sources[index];
+                const std::uint32_t baseMip = residentBaseMips[index];
+                if (baseMip + 1u >= source.mipCount)
+                    continue;
+                const auto& offsets = textureMipOffsets(source);
+                const std::size_t saving = offsets[baseMip + 1u] - offsets[baseMip];
+                if (saving > bestSaving) { bestSaving = saving; bestIndex = index; }
+            }
+            if (bestIndex == sources.size() || bestSaving == 0)
+                break;
+            ++residentBaseMips[bestIndex];
+            residentTextureBytes -= bestSaving;
+        }
+    }
+    materialTextureBytes_ = residentTextureBytes;
 
     const bool hasEnvironment = scene_ && scene_->environment.hasHdr();
     const std::uint32_t environmentWidth = hasEnvironment ? scene_->environment.hdrWidth : 1u;
@@ -2056,16 +2294,22 @@ bool VulkanRenderer::uploadTextureResources()
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
             const TextureReference& source = *sources[index];
-            stagingSize = (stagingSize + 3u) & ~VkDeviceSize{3u};
+            const std::uint32_t baseMip = residentBaseMips[index];
+            const auto& mipOffsets = textureMipOffsets(source);
+            const auto& pixels = texturePixels(source);
+            stagingSize = (stagingSize + 15u) & ~VkDeviceSize{15u};
             offsets[index] = stagingSize;
-            stagingSize += source.rgba8Pixels.size();
+            stagingSize += pixels.size() - mipOffsets[baseMip];
 
             GpuTexture& texture = materialTextures_[index];
             VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             imageInfo.imageType = VK_IMAGE_TYPE_2D;
-            imageInfo.format = source.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-            imageInfo.extent = {source.width, source.height, 1};
-            imageInfo.mipLevels = source.mipCount;
+            imageInfo.format = materialTextureBc3_
+                                   ? (source.srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK)
+                                   : (source.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
+            imageInfo.extent = {std::max(source.width >> baseMip, 1u),
+                                std::max(source.height >> baseMip, 1u), 1};
+            imageInfo.mipLevels = source.mipCount - baseMip;
             imageInfo.arrayLayers = 1;
             imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
             imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2160,8 +2404,14 @@ bool VulkanRenderer::uploadTextureResources()
         void* mapped = nullptr;
         check(vkMapMemory(device_, staging.memory, 0, stagingSize, 0, &mapped), "vkMapMemory(texture staging)");
         for (std::size_t index = 0; index < sources.size(); ++index)
-            std::memcpy(static_cast<std::byte*>(mapped) + offsets[index], sources[index]->rgba8Pixels.data(),
-                        sources[index]->rgba8Pixels.size());
+        {
+            const TextureReference& source = *sources[index];
+            const auto& pixels = texturePixels(source);
+            const auto& mipOffsets = textureMipOffsets(source);
+            const std::size_t sourceOffset = mipOffsets[residentBaseMips[index]];
+            std::memcpy(static_cast<std::byte*>(mapped) + offsets[index], pixels.data() + sourceOffset,
+                        pixels.size() - sourceOffset);
+        }
         std::memcpy(static_cast<std::byte*>(mapped) + environmentOffset, environmentHalf.data(),
                     environmentTextureBytes_);
         std::memcpy(static_cast<std::byte*>(mapped) + iblOffset, iblHalf.data(), iblTextureBytes_);
@@ -2189,7 +2439,7 @@ bool VulkanRenderer::uploadTextureResources()
             barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             barrier.image = materialTextures_[index].image;
             barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = sources[index]->mipCount;
+            barrier.subresourceRange.levelCount = sources[index]->mipCount - residentBaseMips[index];
             barrier.subresourceRange.layerCount = 1;
         }
         VkDependencyInfo toTransferDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -2230,13 +2480,16 @@ bool VulkanRenderer::uploadTextureResources()
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
             const TextureReference& source = *sources[index];
-            std::vector<VkBufferImageCopy> copies(source.mipCount);
-            std::uint32_t width = source.width;
-            std::uint32_t height = source.height;
-            for (std::uint32_t mip = 0; mip < source.mipCount; ++mip)
+            const std::uint32_t baseMip = residentBaseMips[index];
+            const auto& mipOffsets = textureMipOffsets(source);
+            std::vector<VkBufferImageCopy> copies(source.mipCount - baseMip);
+            std::uint32_t width = std::max(source.width >> baseMip, 1u);
+            std::uint32_t height = std::max(source.height >> baseMip, 1u);
+            for (std::uint32_t mip = 0; mip < copies.size(); ++mip)
             {
+                const std::uint32_t sourceMip = baseMip + mip;
                 VkBufferImageCopy& copy = copies[mip];
-                copy.bufferOffset = offsets[index] + source.mipOffsets[mip];
+                copy.bufferOffset = offsets[index] + mipOffsets[sourceMip] - mipOffsets[baseMip];
                 copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 copy.imageSubresource.mipLevel = mip;
                 copy.imageSubresource.layerCount = 1;
@@ -2291,7 +2544,7 @@ bool VulkanRenderer::uploadTextureResources()
             barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             barrier.image = materialTextures_[index].image;
             barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.levelCount = sources[index]->mipCount;
+            barrier.subresourceRange.levelCount = sources[index]->mipCount - residentBaseMips[index];
             barrier.subresourceRange.layerCount = 1;
         }
         VkDependencyInfo toShaderDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -2335,16 +2588,16 @@ bool VulkanRenderer::uploadTextureResources()
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
         check(vkQueueSubmit(graphicsQueue_, 1, &submit, fence), "vkQueueSubmit(texture upload)");
-        check(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(texture upload)");
-
         for (std::size_t index = 0; index < sources.size(); ++index)
         {
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = materialTextures_[index].image;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = sources[index]->srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            viewInfo.format = materialTextureBc3_
+                                  ? (sources[index]->srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK)
+                                  : (sources[index]->srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
             viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            viewInfo.subresourceRange.levelCount = sources[index]->mipCount;
+            viewInfo.subresourceRange.levelCount = sources[index]->mipCount - residentBaseMips[index];
             viewInfo.subresourceRange.layerCount = 1;
             check(vkCreateImageView(device_, &viewInfo, nullptr, &materialTextures_[index].view),
                   "vkCreateImageView(material texture)");
@@ -2393,12 +2646,12 @@ bool VulkanRenderer::uploadTextureResources()
         check(vkCreateSampler(device_, &samplerInfo, nullptr, &environmentSampler_),
               "vkCreateSampler(HDR environment)");
 
-        vkDestroyFence(device_, fence, nullptr);
+        textureUploadFence_ = fence;
+        textureUploadCommand_ = command;
+        textureUploadStaging_ = staging;
         fence = VK_NULL_HANDLE;
-        vkFreeCommandBuffers(device_, commandPool_, 1, &command);
         command = VK_NULL_HANDLE;
-        vkDestroyBuffer(device_, staging.buffer, nullptr);
-        vkFreeMemory(device_, staging.memory, nullptr);
+        staging = {};
         return true;
     }
     catch (...)
@@ -2566,6 +2819,11 @@ bool VulkanRenderer::uploadSceneResources()
             geometryIndices.push_back(index);
     }
 
+    Vec3 ddgiMinimum{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                     std::numeric_limits<float>::max()};
+    Vec3 ddgiMaximum{std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
+                     std::numeric_limits<float>::lowest()};
+    bool hasDdgiBounds = false;
     const auto appendInstance = [&](std::uint32_t meshIndex, const Mat4& transform,
                                     const Mat4& previousTransform) {
         if (meshIndex >= meshToGeometry.size() || meshToGeometry[meshIndex] == UINT32_MAX)
@@ -2583,6 +2841,21 @@ bool VulkanRenderer::uploadSceneResources()
         const UploadedGeometry& geometry = uploadedGeometries_[meshToGeometry[meshIndex]];
         const Mesh& mesh = scene_->meshes[meshIndex];
         const Vec4 bounds = meshBounds[meshIndex];
+        if (!mesh.isGroundPlane)
+        {
+            const Vec3 worldCenter{
+                transform.m[0] * bounds.x + transform.m[4] * bounds.y + transform.m[8] * bounds.z + transform.m[12],
+                transform.m[1] * bounds.x + transform.m[5] * bounds.y + transform.m[9] * bounds.z + transform.m[13],
+                transform.m[2] * bounds.x + transform.m[6] * bounds.y + transform.m[10] * bounds.z + transform.m[14]};
+            const float worldRadius = bounds.w * maxScale;
+            ddgiMinimum.x = std::min(ddgiMinimum.x, worldCenter.x - worldRadius);
+            ddgiMinimum.y = std::min(ddgiMinimum.y, worldCenter.y - worldRadius);
+            ddgiMinimum.z = std::min(ddgiMinimum.z, worldCenter.z - worldRadius);
+            ddgiMaximum.x = std::max(ddgiMaximum.x, worldCenter.x + worldRadius);
+            ddgiMaximum.y = std::max(ddgiMaximum.y, worldCenter.y + worldRadius);
+            ddgiMaximum.z = std::max(ddgiMaximum.z, worldCenter.z + worldRadius);
+            hasDdgiBounds = true;
+        }
         const std::uint32_t materialIndex = mesh.materialIndex < scene_->materials.size() ? mesh.materialIndex : 0u;
         gpuInstances.push_back({transform,
                                 previousTransform,
@@ -2615,6 +2888,40 @@ bool VulkanRenderer::uploadSceneResources()
     }
     if (vertices.empty() || meshlets.empty() || geometryIndices.empty() || gpuInstances.empty())
         return true;
+
+    if (!hasDdgiBounds)
+    {
+        ddgiMinimum = {-1.0f, -1.0f, -1.0f};
+        ddgiMaximum = {1.0f, 1.0f, 1.0f};
+    }
+    Vec3 ddgiExtent = ddgiMaximum - ddgiMinimum;
+    const float minimumExtent = std::max(length(ddgiExtent) * 0.025f, 0.05f);
+    ddgiExtent.x = std::max(ddgiExtent.x, minimumExtent);
+    ddgiExtent.y = std::max(ddgiExtent.y, minimumExtent);
+    ddgiExtent.z = std::max(ddgiExtent.z, minimumExtent);
+    const Vec3 ddgiCenter = (ddgiMinimum + ddgiMaximum) * 0.5f;
+    ddgiMinimum = ddgiCenter - ddgiExtent * 0.55f;
+    ddgiMaximum = ddgiCenter + ddgiExtent * 0.55f;
+    ddgiSettings_.gridMinimumAndHysteresis = {ddgiMinimum.x, ddgiMinimum.y, ddgiMinimum.z, 0.92f};
+    ddgiSettings_.gridMaximumAndIntensity = {ddgiMaximum.x, ddgiMaximum.y, ddgiMaximum.z, 1.0f};
+    constexpr std::uint32_t ddgiWidth = 8, ddgiHeight = 4, ddgiDepth = 8;
+    ddgiSettings_.gridDimensions[0] = ddgiWidth;
+    ddgiSettings_.gridDimensions[1] = ddgiHeight;
+    ddgiSettings_.gridDimensions[2] = ddgiDepth;
+    std::vector<GpuDdgiProbe> ddgiProbes(ddgiWidth * ddgiHeight * ddgiDepth);
+    for (std::uint32_t z = 0; z < ddgiDepth; ++z)
+        for (std::uint32_t y = 0; y < ddgiHeight; ++y)
+            for (std::uint32_t x = 0; x < ddgiWidth; ++x)
+            {
+                const Vec3 fraction{static_cast<float>(x) / static_cast<float>(ddgiWidth - 1u),
+                                    static_cast<float>(y) / static_cast<float>(ddgiHeight - 1u),
+                                    static_cast<float>(z) / static_cast<float>(ddgiDepth - 1u)};
+                const Vec3 position{ddgiMinimum.x + (ddgiMaximum.x - ddgiMinimum.x) * fraction.x,
+                                    ddgiMinimum.y + (ddgiMaximum.y - ddgiMinimum.y) * fraction.y,
+                                    ddgiMinimum.z + (ddgiMaximum.z - ddgiMinimum.z) * fraction.z};
+                ddgiProbes[x + ddgiWidth * (y + ddgiHeight * z)].positionAndValidity =
+                    {position.x, position.y, position.z, 0.0f};
+            }
 
     if (scene_->materials.empty())
         gpuMaterials.push_back(Material{}.toGpu());
@@ -2737,6 +3044,10 @@ bool VulkanRenderer::uploadSceneResources()
                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     temporalFrameBuffer_ = createDeviceLocalBuffer(sizeof(TemporalFrameData),
                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    ddgiProbeBuffer_ = createDeviceLocalBuffer(ddgiProbes.size() * sizeof(GpuDdgiProbe),
+                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    ddgiSettingsBuffer_ = createDeviceLocalBuffer(sizeof(DdgiSettings),
+                                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     emissiveTriangleBuffer_ = createDeviceLocalBuffer(emissiveTriangles.size() * sizeof(GpuEmissiveTriangle),
                                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     textureMetadataBuffer_ = createDeviceLocalBuffer(textureMetadata.size() * sizeof(GpuTextureMetadata),
@@ -2754,6 +3065,8 @@ bool VulkanRenderer::uploadSceneResources()
         BufferUpload{&lightAliasBuffer_, lightAliasTable.entries.data(),
                      lightAliasTable.entries.size() * sizeof(GpuLightAlias)},
         BufferUpload{&temporalFrameBuffer_, &initialTemporalFrame, sizeof(TemporalFrameData)},
+        BufferUpload{&ddgiProbeBuffer_, ddgiProbes.data(), ddgiProbes.size() * sizeof(GpuDdgiProbe)},
+        BufferUpload{&ddgiSettingsBuffer_, &ddgiSettings_, sizeof(DdgiSettings)},
         BufferUpload{&emissiveTriangleBuffer_, emissiveTriangles.data(),
                      emissiveTriangles.size() * sizeof(GpuEmissiveTriangle)},
         BufferUpload{&textureMetadataBuffer_, textureMetadata.data(),
@@ -2761,19 +3074,21 @@ bool VulkanRenderer::uploadSceneResources()
     };
     if (!uploadDeviceLocalBuffers(uploads))
         throw std::runtime_error("Failed to stage Vulkan scene geometry into device-local memory");
-    if (!uploadTextureResources())
-        throw std::runtime_error("Failed to upload Vulkan material textures");
     uploadedVertexCount_ = static_cast<std::uint32_t>(vertices.size());
     uploadedTriangleCount_ = static_cast<std::uint32_t>(geometryIndices.size() / 3);
     if (!buildAccelerationStructures())
         throw std::runtime_error("Failed to build Vulkan BLAS/TLAS");
+    // Submit textures after the AS build. The graphics queue preserves ordering,
+    // so the first frame can consume them without a scene-load-time fence wait.
+    if (!uploadTextureResources())
+        throw std::runtime_error("Failed to upload Vulkan material textures");
 
     VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocateInfo.descriptorPool = sceneDescriptorPool_;
     allocateInfo.descriptorSetCount = 1;
     allocateInfo.pSetLayouts = &sceneDescriptorSetLayout_;
     check(vkAllocateDescriptorSets(device_, &allocateInfo, &sceneDescriptorSet_), "vkAllocateDescriptorSets");
-    const std::array<VkDescriptorBufferInfo, 12> bufferInfos{{
+    const std::array<VkDescriptorBufferInfo, 14> bufferInfos{{
         {vertexBuffer_.buffer, 0, vertexBuffer_.size},
         {meshletBuffer_.buffer, 0, meshletBuffer_.size},
         {meshletVertexBuffer_.buffer, 0, meshletVertexBuffer_.size},
@@ -2786,8 +3101,10 @@ bool VulkanRenderer::uploadSceneResources()
         {textureMetadataBuffer_.buffer, 0, textureMetadataBuffer_.size},
         {lightAliasBuffer_.buffer, 0, lightAliasBuffer_.size},
         {temporalFrameBuffer_.buffer, 0, temporalFrameBuffer_.size},
+        {ddgiProbeBuffer_.buffer, 0, ddgiProbeBuffer_.size},
+        {ddgiSettingsBuffer_.buffer, 0, ddgiSettingsBuffer_.size},
     }};
-    std::array<VkWriteDescriptorSet, 18> writes{};
+    std::array<VkWriteDescriptorSet, 23> writes{};
     for (std::uint32_t index = 0; index < 4; ++index)
     {
         writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2899,6 +3216,39 @@ bool VulkanRenderer::uploadSceneResources()
     writes[17].descriptorCount = 1;
     writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[17].pBufferInfo = &bufferInfos[11];
+    VkDescriptorImageInfo oitAccumulationInfo{};
+    oitAccumulationInfo.imageView = oitAccumulation_.view;
+    oitAccumulationInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    writes[18].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[18].dstSet = sceneDescriptorSet_;
+    writes[18].dstBinding = 18;
+    writes[18].descriptorCount = 1;
+    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[18].pImageInfo = &oitAccumulationInfo;
+    VkDescriptorImageInfo oitRevealageInfo{};
+    oitRevealageInfo.imageView = oitRevealage_.view;
+    oitRevealageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[19].dstSet = sceneDescriptorSet_;
+    writes[19].dstBinding = 19;
+    writes[19].descriptorCount = 1;
+    writes[19].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[19].pImageInfo = &oitRevealageInfo;
+    for (std::uint32_t writeIndex = 20; writeIndex <= 21; ++writeIndex)
+    {
+        writes[writeIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[writeIndex].dstSet = sceneDescriptorSet_;
+        writes[writeIndex].dstBinding = writeIndex;
+        writes[writeIndex].descriptorCount = 1;
+        writes[writeIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[writeIndex].pBufferInfo = &bufferInfos[writeIndex - 8];
+    }
+    writes[22].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[22].dstSet = sceneDescriptorSet_;
+    writes[22].dstBinding = 22;
+    writes[22].descriptorCount = 1;
+    writes[22].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[22].pBufferInfo = &bufferInfos[12];
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     uploadedMeshletCount_ = static_cast<std::uint32_t>(meshlets.size());
     stats_.totalMeshlets = uploadedMeshletCount_;
@@ -2906,18 +3256,12 @@ bool VulkanRenderer::uploadSceneResources()
     stats_.residentMaterials = static_cast<std::uint32_t>(gpuMaterials.size());
     stats_.residentTextures = static_cast<std::uint32_t>(materialTextures_.size());
     stats_.descriptorCapacity = kMaxMaterialTextures;
-    stats_.textureBytes = 0;
-    if (scene_ && !scene_->textures.empty())
-    {
-        for (const TextureReference& texture : scene_->textures)
-            stats_.textureBytes += texture.rgba8Pixels.size();
-    }
-    else
-        stats_.textureBytes = 4;
+    stats_.textureBytes = materialTextureBytes_;
     stats_.gpuSceneBytes = vertexBuffer_.size + meshletBuffer_.size + meshletVertexBuffer_.size +
                            meshletTriangleBuffer_.size + geometryIndexBuffer_.size + sceneInstanceBuffer_.size +
                            environmentTextureBytes_ + iblTextureBytes_ + materialBuffer_.size + lightBuffer_.size +
-                           lightAliasBuffer_.size + temporalFrameBuffer_.size + emissiveTriangleBuffer_.size + textureMetadataBuffer_.size + accelerationInstanceBuffer_.size +
+                           lightAliasBuffer_.size + temporalFrameBuffer_.size + ddgiProbeBuffer_.size +
+                           ddgiSettingsBuffer_.size + emissiveTriangleBuffer_.size + textureMetadataBuffer_.size + accelerationInstanceBuffer_.size +
                            tlasStorage_.size + stats_.textureBytes;
     for (const BlasResource& blas : blases_)
         stats_.gpuSceneBytes += blas.storage.size;
@@ -3536,6 +3880,167 @@ std::uint32_t VulkanRenderer::findMemoryType(std::uint32_t typeBits, VkMemoryPro
     throw std::runtime_error("No compatible Vulkan memory type found");
 }
 
+void VulkanRenderer::recordDdgiUpdate(VkCommandBuffer commandBuffer)
+{
+    if (!sceneDescriptorSet_ || !ddgiUpdatePipeline_ || !ddgiProbeBuffer_.buffer ||
+        !ddgiSettingsBuffer_.buffer || ddgiSettings_.frameRaysAndFlags[2] == 0u)
+        return;
+    vkCmdUpdateBuffer(commandBuffer, ddgiSettingsBuffer_.buffer, 0, sizeof(ddgiSettings_), &ddgiSettings_);
+    VkBufferMemoryBarrier2 settingsBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    settingsBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    settingsBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    settingsBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    settingsBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    settingsBarrier.buffer = ddgiSettingsBuffer_.buffer;
+    settingsBarrier.size = ddgiSettingsBuffer_.size;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &settingsBarrier;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ddgiUpdatePipeline_);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, meshPipelineLayout_, 0, 1,
+                            &sceneDescriptorSet_, 0, nullptr);
+    constexpr VkShaderStageFlags allFrameStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                                   VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                                   VK_SHADER_STAGE_COMPUTE_BIT;
+    vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allFrameStages, 0,
+                       sizeof(framePushConstants_), &framePushConstants_);
+    const std::uint32_t probeCount = ddgiSettings_.gridDimensions[0] * ddgiSettings_.gridDimensions[1] *
+                                     ddgiSettings_.gridDimensions[2];
+    vkCmdDispatch(commandBuffer, (probeCount + 31u) / 32u, 1, 1);
+    VkBufferMemoryBarrier2 probeBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    probeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    probeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    probeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    probeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    probeBarrier.buffer = ddgiProbeBuffer_.buffer;
+    probeBarrier.size = ddgiProbeBuffer_.size;
+    dependency.pBufferMemoryBarriers = &probeBarrier;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+}
+
+void VulkanRenderer::recordOitPass(VkCommandBuffer commandBuffer, VkImageView targetView,
+                                   VkPipeline compositePipeline)
+{
+    std::array<VkImageMemoryBarrier2, 3> toAttachments{};
+    for (std::uint32_t index = 0; index < 2; ++index)
+    {
+        VkImageMemoryBarrier2& barrier = toAttachments[index];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = oitImagesInitialized_ ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                                     : VK_PIPELINE_STAGE_2_NONE;
+        barrier.srcAccessMask = oitImagesInitialized_ ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = oitImagesInitialized_ ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                  : VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.image = index == 0 ? oitAccumulation_.image : oitRevealage_.image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+    }
+    VkImageMemoryBarrier2& depthDependency = toAttachments[2];
+    depthDependency.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    depthDependency.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    depthDependency.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depthDependency.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+    depthDependency.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    depthDependency.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthDependency.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthDependency.image = depthImage_;
+    depthDependency.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthDependency.subresourceRange.levelCount = 1;
+    depthDependency.subresourceRange.layerCount = 1;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(toAttachments.size());
+    dependency.pImageMemoryBarriers = toAttachments.data();
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+
+    std::array<VkRenderingAttachmentInfo, 2> oitAttachments{};
+    const std::array oitViews{oitAccumulation_.view, oitRevealage_.view};
+    for (std::uint32_t index = 0; index < oitAttachments.size(); ++index)
+    {
+        oitAttachments[index].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        oitAttachments[index].imageView = oitViews[index];
+        oitAttachments[index].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        oitAttachments[index].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        oitAttachments[index].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    oitAttachments[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    oitAttachments[1].clearValue.color = {{1.0f, 0.0f, 0.0f, 0.0f}};
+    VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depthAttachment.imageView = depthImageView_;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea.extent = swapchainExtent_;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(oitAttachments.size());
+    rendering.pColorAttachments = oitAttachments.data();
+    rendering.pDepthAttachment = &depthAttachment;
+    vkCmdBeginRendering(commandBuffer, &rendering);
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(swapchainExtent_.width);
+    viewport.height = static_cast<float>(swapchainExtent_.height);
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{{0, 0}, swapchainExtent_};
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    FramePushConstants constants = framePushConstants_;
+    constants.renderFlags |= kRenderFlagTransparentPass;
+    constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                           VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                           VK_SHADER_STAGE_COMPUTE_BIT;
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, transparentMeshPipeline_);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
+                            &sceneDescriptorSet_, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(constants), &constants);
+    cmdDrawMeshTasks_(commandBuffer,
+                      (uploadedMeshletCount_ + kMeshletsPerTaskGroup - 1) / kMeshletsPerTaskGroup, 1, 1);
+    vkCmdEndRendering(commandBuffer);
+
+    std::array<VkImageMemoryBarrier2, 2> toShader{};
+    for (std::uint32_t index = 0; index < toShader.size(); ++index)
+    {
+        VkImageMemoryBarrier2& barrier = toShader[index];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.image = index == 0 ? oitAccumulation_.image : oitRevealage_.image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+    }
+    dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(toShader.size());
+    dependency.pImageMemoryBarriers = toShader.data();
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    oitImagesInitialized_ = true;
+
+    VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    target.imageView = targetView;
+    target.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    target.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    target.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &target;
+    rendering.pDepthAttachment = nullptr;
+    vkCmdBeginRendering(commandBuffer, &rendering);
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
+                            &sceneDescriptorSet_, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, meshPipelineLayout_, stages, 0, sizeof(constants), &constants);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    vkCmdEndRendering(commandBuffer);
+}
+
 void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
                                     std::uint32_t imageIndex,
                                     const GpuBuffer* externalBuffer)
@@ -3573,6 +4078,7 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         lightDependency.pBufferMemoryBarriers = lightBarriers.data();
         vkCmdPipelineBarrier2(commandBuffer, &lightDependency);
     }
+    recordDdgiUpdate(commandBuffer);
     const std::uint32_t timestampBase = frameSlot_ * 2;
     vkCmdResetQueryPool(commandBuffer, timestampQueryPool_, timestampBase, 2);
     vkCmdWriteTimestamp2(commandBuffer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
@@ -3671,7 +4177,7 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     depthAttachment.imageView = depthImageView_;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.clearValue.depthStencil = {1.0f, 0};
     VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
     renderingInfo.renderArea.extent = swapchainExtent_;
@@ -3689,15 +4195,18 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
     VkRect2D scissor{{0, 0}, swapchainExtent_};
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    bool hasTransparentPass = false;
     if (!externalBuffer && sceneDescriptorSet_ && uploadedMeshletCount_ > 0)
     {
         FramePushConstants drawConstants = framePushConstants_;
         const RenderPassAvailability passes = renderPassAvailability(scene_, drawConstants.materialOverrideId);
+        hasTransparentPass = passes.transparent;
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, backgroundPipeline_);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                                 &sceneDescriptorSet_, 0, nullptr);
         constexpr VkShaderStageFlags allPushConstantStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |
-                                                              VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                                                              VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                                              VK_SHADER_STAGE_COMPUTE_BIT;
         vkCmdPushConstants(commandBuffer, meshPipelineLayout_, allPushConstantStages,
                            0, sizeof(FramePushConstants), &drawConstants);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
@@ -3713,9 +4222,22 @@ void VulkanRenderer::recordCommands(VkCommandBuffer commandBuffer,
         };
         if (passes.opaque)
             drawMeshPass(meshPipeline_, false);
-        if (passes.transparent)
-            drawMeshPass(transparentMeshPipeline_, true);
     }
+    vkCmdEndRendering(commandBuffer);
+    if (hasTransparentPass)
+        recordOitPass(commandBuffer, swapchainImageViews_[imageIndex], oitCompositePipeline_);
+
+    VkRenderingAttachmentInfo uiAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    uiAttachment.imageView = swapchainImageViews_[imageIndex];
+    uiAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    uiAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    uiAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo uiRendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    uiRendering.renderArea.extent = swapchainExtent_;
+    uiRendering.layerCount = 1;
+    uiRendering.colorAttachmentCount = 1;
+    uiRendering.pColorAttachments = &uiAttachment;
+    vkCmdBeginRendering(commandBuffer, &uiRendering);
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
     vkCmdEndRendering(commandBuffer);
 

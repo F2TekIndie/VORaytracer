@@ -12,6 +12,29 @@ import BsdfConductor;
 import BsdfClearcoat;
 import BsdfSheen;
 
+// Slang's classic TraceRay compatibility intrinsic fixes ray time to zero on CUDA.
+// The HitObject path exposes OptiX's timed traversal and then invokes the same
+// closest-hit/miss programs, preserving the existing payload ABI.
+__generic<payload_t>
+void traceOptixMotionRay(
+    RaytracingAccelerationStructure accelerationStructure,
+    uint rayFlags,
+    uint instanceInclusionMask,
+    uint rayContributionToHitGroupIndex,
+    uint multiplierForGeometryContributionToHitGroupIndex,
+    uint missShaderIndex,
+    RayDesc ray,
+    float rayTime,
+    inout payload_t payload)
+{
+    HitObject hitObject = HitObject.TraceMotionRay(accelerationStructure, rayFlags,
+                                                    instanceInclusionMask,
+                                                    rayContributionToHitGroupIndex,
+                                                    multiplierForGeometryContributionToHitGroupIndex,
+                                                    missShaderIndex, ray, rayTime, payload);
+    HitObject.Invoke(accelerationStructure, hitObject, payload);
+}
+
 struct RadiancePayload
 {
     uint primitiveIndex;
@@ -66,7 +89,9 @@ struct GpuLightAlias
 struct GpuOptixInstance
 {
     float4x4 transform;
+    float4x4 previousTransform;
     float4x4 normalTransform;
+    float4x4 previousNormalTransform;
     uint4 geometry;
     uint materialIndex;
     float handedness;
@@ -114,7 +139,7 @@ struct LaunchParameters
     uint writeDisplay;
     uint materialOverrideId;
     uint debugView;
-    uint padding;
+    uint motionTransformCount;
     uint indirectLighting;
     uint globalLightMode;
     uint environmentWidth;
@@ -128,6 +153,9 @@ struct LaunchParameters
     float4 cameraPositionAndFov;
     float4 cameraTargetAndAspect;
     float4 cameraUp;
+    float4 previousCameraPositionAndShutter;
+    float4 previousCameraTargetAndAperture;
+    float4 previousCameraUpAndFocus;
     float4 lightPosition;
     float4 lightColorAndIntensity;
     float4 lightDirection;
@@ -231,30 +259,34 @@ struct ResolvedHit
     uint instanceIndex;
 };
 
-ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, RayDesc ray, float textureLod)
+ResolvedHit resolveHit(LaunchParameters parameters, RadiancePayload payload, RayDesc ray,
+                       float textureLod, float rayTime)
 {
     ResolvedHit result;
     GpuOptixInstance hitInstance = parameters.instances[payload.instanceIndex];
+    float4x4 instanceTransform = lerp(hitInstance.previousTransform, hitInstance.transform, rayTime);
+    float4x4 instanceNormalTransform = lerp(hitInstance.previousNormalTransform,
+                                            hitInstance.normalTransform, rayTime);
     uint3 localTriangle = parameters.indices[hitInstance.geometry.y + payload.primitiveIndex];
     uint3 triangle = localTriangle + hitInstance.geometry.x;
     float barycentric0 = 1.0 - payload.barycentrics.x - payload.barycentrics.y;
 
-    float3 worldPosition0 = mul(hitInstance.transform, float4(parameters.positions[triangle.x], 1.0)).xyz;
-    float3 worldPosition1 = mul(hitInstance.transform, float4(parameters.positions[triangle.y], 1.0)).xyz;
-    float3 worldPosition2 = mul(hitInstance.transform, float4(parameters.positions[triangle.z], 1.0)).xyz;
+    float3 worldPosition0 = mul(instanceTransform, float4(parameters.positions[triangle.x], 1.0)).xyz;
+    float3 worldPosition1 = mul(instanceTransform, float4(parameters.positions[triangle.y], 1.0)).xyz;
+    float3 worldPosition2 = mul(instanceTransform, float4(parameters.positions[triangle.z], 1.0)).xyz;
     result.geometricNormal = normalize(cross(worldPosition1 - worldPosition0, worldPosition2 - worldPosition0));
     result.position = ray.Origin + ray.Direction * payload.hitDistance;
 
     float3 shadingNormal = normalize(parameters.normals[triangle.x] * barycentric0 +
                                      parameters.normals[triangle.y] * payload.barycentrics.x +
                                      parameters.normals[triangle.z] * payload.barycentrics.y);
-    shadingNormal = normalize(mul((float3x3)hitInstance.normalTransform, shadingNormal));
+    shadingNormal = normalize(mul((float3x3)instanceNormalTransform, shadingNormal));
     if (dot(shadingNormal, result.geometricNormal) < 0.0)
         shadingNormal = -shadingNormal;
     float4 vertexTangent = parameters.tangents[triangle.x] * barycentric0 +
                            parameters.tangents[triangle.y] * payload.barycentrics.x +
                            parameters.tangents[triangle.z] * payload.barycentrics.y;
-    vertexTangent.xyz = normalize(mul((float3x3)hitInstance.transform, vertexTangent.xyz));
+    vertexTangent.xyz = normalize(mul((float3x3)instanceTransform, vertexTangent.xyz));
     vertexTangent.w *= hitInstance.handedness;
     float4 uv = parameters.uvs[triangle.x] * barycentric0 +
                 parameters.uvs[triangle.y] * payload.barycentrics.x +
@@ -352,7 +384,7 @@ bool skipCameraPathHit(ResolvedHit hit, float3 rayDirection, float coverageSampl
     return false;
 }
 
-float3 traceVisibility(LaunchParameters parameters, RayDesc sourceRay)
+float3 traceVisibility(LaunchParameters parameters, RayDesc sourceRay, float rayTime)
 {
     float3 visibility = float3(1.0);
     RayDesc shadowRay = sourceRay;
@@ -364,14 +396,18 @@ float3 traceVisibility(LaunchParameters parameters, RayDesc sourceRay)
         shadowPayload.barycentrics = float2(0.0);
         shadowPayload.hitDistance = 0.0;
         shadowPayload.hit = 0;
-        TraceRay(parameters.scene,
-                 RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES,
-                 0xff, 0, 1, 0, shadowRay, shadowPayload);
+        uint shadowRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                              RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+        if (parameters.motionTransformCount != 0u)
+            traceOptixMotionRay(parameters.scene, shadowRayFlags, 0xff, 0, 1, 0,
+                                shadowRay, rayTime, shadowPayload);
+        else
+            TraceRay(parameters.scene, shadowRayFlags, 0xff, 0, 1, 0, shadowRay, shadowPayload);
         if (shadowPayload.hit == 0)
             return visibility;
 
         float shadowTextureLod = log2(max(shadowPayload.hitDistance * 0.05, 1.0));
-        ResolvedHit hit = resolveHit(parameters, shadowPayload, shadowRay, shadowTextureLod);
+        ResolvedHit hit = resolveHit(parameters, shadowPayload, shadowRay, shadowTextureLod, rayTime);
         uint alphaMode = hit.material.materialFlags.y;
         // Sidedness controls surface shading, not whether an opaque triangle casts a shadow.
         // Treating single-sided back faces as transparent creates triangle-shaped light leaks on
@@ -775,9 +811,6 @@ void RayGen(LaunchParameters parameters)
     if (any(launchIndex.xy >= parameters.outputSize))
         return;
 
-    float3 forward = normalize(parameters.cameraTargetAndAspect.xyz - parameters.cameraPositionAndFov.xyz);
-    float3 right = normalize(cross(forward, parameters.cameraUp.xyz));
-    float3 up = normalize(cross(right, forward));
     float tanHalfFov = tan(parameters.cameraPositionAndFov.w * 0.5);
 
     uint linearIndex = launchIndex.y * parameters.outputSize.x + launchIndex.x;
@@ -798,14 +831,35 @@ void RayGen(LaunchParameters parameters)
     for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
     {
         uint seed = linearIndex * 9781u + (parameters.frameIndex * sampleCount + sampleIndex) * 6271u;
+        float shutterSample = random01(seed ^ 0x27d4eb2fu) *
+                              parameters.previousCameraPositionAndShutter.w;
+        float cameraInterpolation = 1.0 - shutterSample;
+        float3 cameraPosition = lerp(parameters.previousCameraPositionAndShutter.xyz,
+                                     parameters.cameraPositionAndFov.xyz, cameraInterpolation);
+        float3 cameraTarget = lerp(parameters.previousCameraTargetAndAperture.xyz,
+                                   parameters.cameraTargetAndAspect.xyz, cameraInterpolation);
+        float3 cameraUp = normalize(lerp(parameters.previousCameraUpAndFocus.xyz,
+                                         parameters.cameraUp.xyz, cameraInterpolation));
+        float3 forward = normalize(cameraTarget - cameraPosition);
+        float3 right = normalize(cross(forward, cameraUp));
+        float3 up = normalize(cross(right, forward));
         float2 jitter = float2(random01(seed), random01(seed ^ 0x68bc21ebu));
         float2 pixel = (float2(launchIndex.xy) + jitter) / float2(parameters.outputSize);
         float2 screen = pixel * 2.0 - 1.0;
 
         RayDesc ray;
-        ray.Origin = parameters.cameraPositionAndFov.xyz;
-        ray.Direction = normalize(forward + right * screen.x * parameters.cameraTargetAndAspect.w * tanHalfFov -
-                                  up * screen.y * tanHalfFov);
+        float3 pinholeDirection = normalize(forward + right * screen.x *
+                                            parameters.cameraTargetAndAspect.w * tanHalfFov -
+                                            up * screen.y * tanHalfFov);
+        float apertureRadius = parameters.previousCameraTargetAndAperture.w;
+        float lensRadius = sqrt(random01(seed ^ 0x85ebca6bu)) * apertureRadius;
+        float lensAngle = random01(seed ^ 0xc2b2ae35u) * (2.0 * PI);
+        float2 lensSample = float2(cos(lensAngle), sin(lensAngle)) * lensRadius;
+        float focusDistance = parameters.previousCameraUpAndFocus.w;
+        float focusT = focusDistance / max(dot(pinholeDirection, forward), 1e-4);
+        float3 focusPoint = cameraPosition + pinholeDirection * focusT;
+        ray.Origin = cameraPosition + right * lensSample.x + up * lensSample.y;
+        ray.Direction = normalize(focusPoint - ray.Origin);
         ray.TMin = 0.001;
         ray.TMax = 10000.0;
 
@@ -851,13 +905,17 @@ void RayGen(LaunchParameters parameters)
                 payload.barycentrics = float2(0.0);
                 payload.hitDistance = 0.0;
                 payload.hit = 0;
-                TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, traversalRay, payload);
+                if (parameters.motionTransformCount != 0u)
+                    traceOptixMotionRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0,
+                                        traversalRay, cameraInterpolation, payload);
+                else
+                    TraceRay(parameters.scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, traversalRay, payload);
                 if (payload.hit == 0)
                     break;
                 accumulatedDistance += payload.hitDistance;
                 float textureFootprint = rayConeWidth + accumulatedDistance * rayConeSpread;
                 float textureLod = log2(max(textureFootprint * 1024.0, 1.0));
-                resolvedHit = resolveHit(parameters, payload, traversalRay, textureLod);
+                resolvedHit = resolveHit(parameters, payload, traversalRay, textureLod, cameraInterpolation);
                 float coverageSample = random01(seed ^ ((bounce + 1u) * 0x8da6b343u) ^
                                                 ((transparencyLayer + 1u) * 0xd8163841u));
                 if (!skipCameraPathHit(resolvedHit, traversalRay.Direction, coverageSample))
@@ -998,7 +1056,8 @@ void RayGen(LaunchParameters parameters)
                             volumeShadowRay.TMin = 0.00005;
                             volumeShadowRay.TMax = max(volumeLightDistance - 0.0001, 0.00005);
                             float3 volumeVisibility = parameters.rayTracedShadows != 0
-                                                          ? traceVisibility(parameters, volumeShadowRay)
+                                                          ? traceVisibility(parameters, volumeShadowRay,
+                                                                            cameraInterpolation)
                                                           : float3(1.0);
                             if (max(volumeVisibility.x, max(volumeVisibility.y, volumeVisibility.z)) > 0.0)
                             {
@@ -1146,7 +1205,7 @@ void RayGen(LaunchParameters parameters)
                 shadowRay.TMin = rayBias * 0.5;
                 shadowRay.TMax = max(sampledLightDistance - rayBias, rayBias);
 
-                visibility = traceVisibility(parameters, shadowRay);
+                visibility = traceVisibility(parameters, shadowRay, cameraInterpolation);
             }
             float nDotLight = abs(signedNDotLight);
             if (max(visibility.x, max(visibility.y, visibility.z)) > 0.0 &&

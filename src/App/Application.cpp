@@ -340,6 +340,9 @@ bool Application::initialize()
         settings_.rayTracedReflections = std::strcmp(requestedReflections, "0") != 0;
     if (const char* requestedIndirect = std::getenv("VOR_INDIRECT_LIGHTING"); requestedIndirect)
         settings_.indirectLighting = std::strcmp(requestedIndirect, "0") != 0;
+    if (const char* textureBudget = std::getenv("VOR_TEXTURE_BUDGET_MIB"); textureBudget && *textureBudget)
+        settings_.textureBudgetMiB = std::clamp(static_cast<std::uint32_t>(std::strtoul(textureBudget, nullptr, 10)),
+                                                1u, 16384u);
     if (const char* requestedDebugView = std::getenv("VOR_DEBUG_VIEW"); requestedDebugView && *requestedDebugView)
     {
         const unsigned long value = std::strtoul(requestedDebugView, nullptr, 10);
@@ -471,6 +474,8 @@ bool Application::initialize()
         }
     }
     AssetLoader::setDefaultPlasticOverride(scene_, defaultPlasticEnabled_);
+    vulkanRenderer_.setTextureStreamingOptions(settings_.textureStreaming, settings_.textureBudgetMiB);
+    optixRenderer_.setTextureStreamingOptions(settings_.textureStreaming, settings_.textureBudgetMiB);
     vulkanRenderer_.setScene(&scene_);
     optixRenderer_.setScene(&scene_);
     return true;
@@ -811,6 +816,22 @@ void Application::drawRenderPanel()
         ImGui::SetTooltip("Vulkan: one inline Ray Query reflection.\nOptiX: rough PBR reflection paths up to Max bounces.");
     if (ImGui::Checkbox("Indirect lighting", &settings_.indirectLighting))
         resetRenderHistory();
+    if (settings_.backend != BackendKind::VulkanHybrid)
+        ImGui::BeginDisabled();
+    bool probeGiChanged = ImGui::Checkbox("DDGI probe volume", &settings_.probeGlobalIllumination);
+    probeGiChanged |= ImGui::SliderInt("Probe rays/frame",
+                                       reinterpret_cast<int*>(&settings_.probeRaysPerFrame), 1, 32);
+    probeGiChanged |= ImGui::SliderFloat("Probe intensity", &settings_.probeIntensity,
+                                         0.0f, 4.0f, "%.2f");
+    probeGiChanged |= ImGui::SliderFloat("Probe hysteresis", &settings_.probeHysteresis,
+                                         0.0f, 0.99f, "%.2f");
+    if (settings_.backend != BackendKind::VulkanHybrid)
+        ImGui::EndDisabled();
+    if (probeGiChanged)
+        resetRenderHistory();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Bounded 8x4x8 world-space irradiance probes. Vulkan remains non-progressive;\n"
+                          "each frame refreshes a fixed ray budget and temporally filters probe lighting.");
     if (settings_.backend != BackendKind::VulkanHybrid || !optixRenderer_.available())
         ImGui::BeginDisabled();
     if (ImGui::Checkbox("Vulkan post-render denoiser", &settings_.denoiser))
@@ -833,6 +854,22 @@ void Application::drawRenderPanel()
         ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Shows every Vulkan meshlet with a stable pseudo-random color.");
+    ImGui::SeparatorText("Texture residency");
+    bool textureResidencyChanged = ImGui::Checkbox("Budgeted mip residency", &settings_.textureStreaming);
+    textureResidencyChanged |= ImGui::SliderInt("Texture budget (MiB)",
+                                                 reinterpret_cast<int*>(&settings_.textureBudgetMiB),
+                                                 16, 4096, "%d", ImGuiSliderFlags_Logarithmic);
+    if (textureResidencyChanged)
+    {
+        vulkanRenderer_.setTextureStreamingOptions(settings_.textureStreaming, settings_.textureBudgetMiB);
+        optixRenderer_.setTextureStreamingOptions(settings_.textureStreaming, settings_.textureBudgetMiB);
+        vulkanRenderer_.setScene(&scene_);
+        optixRenderer_.setScene(&scene_);
+        resetRenderHistory();
+        statusMessage_ = "Rebuilt GPU texture residency within the selected mip budget";
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Drops the largest top mip levels first when compressed material textures exceed the budget.");
     static constexpr const char* debugViewNames[] = {
         "Beauty", "Base color", "Metallic", "Roughness", "Shading normal", "Geometric normal",
         "Tangent", "Bitangent", "AO", "Emissive", "Diffuse lobe", "Specular lobe", "Clearcoat lobe",
@@ -914,6 +951,19 @@ void Application::drawRenderPanel()
     bool cameraChanged = ImGui::DragFloat3("Position", &scene_.camera.position.x, 0.02f);
     cameraChanged |= ImGui::DragFloat3("Target", &scene_.camera.target.x, 0.02f);
     cameraChanged |= ImGui::SliderFloat("Vertical FOV", &scene_.camera.verticalFovDegrees, 20.0f, 100.0f);
+    if (settings_.backend != BackendKind::Optix)
+        ImGui::BeginDisabled();
+    bool opticsChanged = ImGui::DragFloat("Aperture radius", &scene_.camera.apertureRadius,
+                                          0.001f, 0.0f, 10.0f, "%.3f");
+    opticsChanged |= ImGui::DragFloat("Focus distance", &scene_.camera.focusDistance,
+                                      0.02f, 0.001f, 100000.0f, "%.3f");
+    opticsChanged |= ImGui::SliderFloat("Shutter interval", &scene_.camera.shutterInterval,
+                                        0.0f, 1.0f, "%.2f");
+    if (settings_.backend != BackendKind::Optix)
+        ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("OptiX thin-lens depth of field and previous/current camera motion blur.");
+    cameraChanged |= opticsChanged;
     if (ImGui::Button("Frame model"))
     {
         frameCameraToScene();
@@ -1146,6 +1196,7 @@ void Application::frameCameraToScene()
     scene_.camera.position = center + viewDirection * distance;
     scene_.camera.nearPlane = std::max(radius * 0.001f, 0.0001f);
     scene_.camera.farPlane = std::max(distance + radius * 4.0f, radius * 20.0f);
+    scene_.camera.focusDistance = distance;
 
     if (scene_.lights.empty())
         scene_.lights.push_back(Light{.name = "Sun", .type = LightType::Directional});

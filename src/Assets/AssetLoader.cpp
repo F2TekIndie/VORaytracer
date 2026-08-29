@@ -1,6 +1,7 @@
 #include "Assets/AssetLoader.h"
 
 #include "Core/Log.h"
+#include "Core/TextureCompression.h"
 
 #include <assimp/Importer.hpp>
 #include <assimp/GltfMaterial.h>
@@ -354,6 +355,7 @@ void generateTextureMips(TextureReference& texture, std::vector<std::uint8_t> ba
         height = nextHeight;
     }
     texture.mipCount = static_cast<std::uint32_t>(texture.mipOffsets.size());
+    compressTextureBc3(texture);
 }
 
 bool decodeTexture(const aiScene* imported, const std::filesystem::path& resolved,
